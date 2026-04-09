@@ -1,0 +1,30 @@
+[package]
+name = "psrp-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+psrp-rs = { path = ".." }
+
+[[bin]]
+name = "fragment_reassembler"
+path = "fuzz_targets/fragment_reassembler.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "clixml_decoder"
+path = "fuzz_targets/clixml_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "message_decode"
+path = "fuzz_targets/message_decode.rs"
+test = false
+doc = false

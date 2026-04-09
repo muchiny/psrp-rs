@@ -1,0 +1,26 @@
+# Build
+/target/
+
+# Mutation testing
+/mutants.out/
+/mutants.out.old/
+
+# Vagrant
+.vagrant/
+
+# Claude Code
+.claude/
+CLAUDE.md
+BRIEFING.md
+IMPLEMENTATION_PLAN.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

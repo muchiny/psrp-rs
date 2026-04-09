@@ -1,0 +1,74 @@
+[package]
+name = "psrp-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+description = "Async PowerShell Remoting Protocol (MS-PSRP) client for Rust, built on winrm-rs."
+repository = "https://github.com/muchini/psrp-rs"
+keywords = ["powershell", "psrp", "winrm", "remoting", "windows"]
+categories = ["network-programming", "api-bindings"]
+readme = "README.md"
+
+[dependencies]
+winrm-rs = { path = "../winrm-rs" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror = "2"
+tracing = "0.1"
+quick-xml = "0.36"
+uuid = { version = "1", features = ["v4"] }
+indexmap = { version = "2" }
+async-trait = "0.1"
+rsa = { version = "0.9", default-features = false, features = ["sha1"] }
+aes = "0.8"
+sha1 = { version = "0.10", default-features = false }
+rand = "0.8"
+serde = { version = "1", features = ["derive"], optional = true }
+russh = { version = "0.49", optional = true }
+russh-keys = { version = "0.49", optional = true }
+ssh-key = { version = "0.6", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = []
+ssh = ["dep:russh", "dep:russh-keys", "dep:ssh-key"]
+serde = ["dep:serde", "uuid/serde", "indexmap/serde"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+doc_markdown = "allow"
+match_same_arms = "allow"
+needless_continue = "allow"
+needless_pass_by_value = "allow"
+unnecessary_wraps = "allow"
+format_push_string = "allow"
+single_match_else = "allow"
+ptr_as_ptr = "allow"
+ref_as_ptr = "allow"
+manual_let_else = "allow"
+too_many_lines = "allow"
+manual_div_ceil = "allow"
+redundant_closure = "allow"
+manual_is_multiple_of = "allow"
+collapsible_if = "allow"
+needless_lifetimes = "allow"
+match_wildcard_for_single_variants = "allow"
+missing_fields_in_debug = "allow"
+unused_async = "allow"
+no_effect_underscore_binding = "allow"
