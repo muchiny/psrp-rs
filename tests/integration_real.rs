@@ -2,8 +2,8 @@
 //!
 //! Every test in this file is `#[ignore]`-d by default. They only run
 //! when the caller explicitly passes `--ignored` **and** provides the
-//! required env vars. See [Vagrantfile](../Vagrantfile) and
-//! [CLAUDE.md](../CLAUDE.md) for how to spin up a disposable VM.
+//! required env vars. See [Vagrantfile](../Vagrantfile) for how to
+//! spin up a disposable VM.
 //!
 //! ```bash
 //! vagrant.exe up --provider=hyperv

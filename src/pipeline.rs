@@ -229,7 +229,7 @@ impl Pipeline {
         }
     }
 
-    /// Create an empty pipeline (use [`add_command`] to populate).
+    /// Create an empty pipeline (use [`Pipeline::add_command`] to populate).
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -646,7 +646,7 @@ impl<T: PsrpTransport> PipelineHandle<'_, T> {
     /// Send one input object to the pipeline.
     ///
     /// Errors if the pipeline was configured with `no_input = true`
-    /// (the default) — use [`Pipeline::with_input(true)`] before
+    /// (the default) — use [`Pipeline::with_input`] with `true` before
     /// calling `start` to enable streaming.
     pub async fn write_input(&mut self, value: PsValue) -> Result<()> {
         if self.input_closed {

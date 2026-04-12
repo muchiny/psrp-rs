@@ -74,8 +74,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   (`1+1`, `Get-Date`, `Get-Process`, pipeline builder, Error stream,
   Warning stream, multi-pipeline) against the Vagrant box. All gated
   by `PSRP_INTEGRATION_HOST` env var.
-- **`.claude/` directory**: editor hooks, layer-scoped rules, agents,
-  and skills mirroring the `winrm-rs` setup.
 
 ### Changed
 
@@ -97,5 +95,4 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 ## [0.1.0] — Initial skeleton
 
 - Fragment layer, message header, basic CLIXML primitives, runspace
-  pool, pipeline builder, transport trait, live Vagrant integration,
-  `.claude` project config.
+  pool, pipeline builder, transport trait, live Vagrant integration.

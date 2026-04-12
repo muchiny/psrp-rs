@@ -8,12 +8,6 @@
 # Vagrant
 .vagrant/
 
-# Claude Code
-.claude/
-CLAUDE.md
-BRIEFING.md
-IMPLEMENTATION_PLAN.md
-
 # IDE
 .idea/
 .vscode/

@@ -339,4 +339,12 @@ mod tests {
         let pt = sk.decrypt_secure_string(&ct).unwrap();
         assert_eq!(pt, "s3cret");
     }
+
+    #[test]
+    fn client_session_key_debug_redacts_private() {
+        let key = ClientSessionKey::generate().unwrap();
+        let dbg = format!("{key:?}");
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("BEGIN"));
+    }
 }

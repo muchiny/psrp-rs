@@ -39,7 +39,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// `InitRunspacePool` messages are sent via `send_fragment` on the
     /// existing transport. For real transports (e.g.
     /// [`WinrmPsrpTransport`](crate::transport::WinrmPsrpTransport)),
-    /// use [`open`](Self::open) instead — it embeds the creation
+    /// use [`open_with_transport`](Self::open_with_transport) instead — it embeds the creation
     /// fragments in the WS-Man `<creationXml>`.
     pub async fn open_with_transport(transport: T) -> Result<Self> {
         Self::open_with_options(transport, 1, 1).await
@@ -207,7 +207,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// can be reconnected later via [`DisconnectedPool::reconnect`].
     ///
     /// Sends `CloseRunspacePool` is **not** called — the runspace stays
-    /// alive on the server. To tear it down for good, call [`close`]
+    /// alive on the server. To tear it down for good, call [`RunspacePool::close`]
     /// instead.
     pub async fn disconnect(mut self) -> Result<DisconnectedPool> {
         if self.closed {
@@ -1043,6 +1043,52 @@ mod tests {
         );
         assert!(hex_decode("ABC").is_err()); // odd length
         assert!(hex_decode("GG").is_err()); // bad digit
+    }
+
+    #[test]
+    fn build_creation_fragments_produces_nonempty_bytes() {
+        let (rpid, bytes) = RunspacePool::<MockTransport>::build_creation_fragments(1, 1).unwrap();
+        assert!(!rpid.is_nil());
+        // Must contain at least the fragment headers for SessionCapability + InitRunspacePool
+        assert!(bytes.len() > 42); // 21-byte header × 2 at minimum
+    }
+
+    #[test]
+    fn build_creation_fragments_rejects_bad_bounds() {
+        let err = RunspacePool::<MockTransport>::build_creation_fragments(0, 0);
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn open_from_transport_reaches_opened() {
+        let t = MockTransport::new();
+        let (rpid, _bytes) = RunspacePool::<MockTransport>::build_creation_fragments(1, 1).unwrap();
+        t.push_incoming(wire(100, &state_message_bytes(RunspacePoolState::Opened)));
+        let pool = RunspacePool::open_from_transport(t.clone(), rpid, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(pool.state(), RunspacePoolState::Opened);
+        pool.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_already_closed_is_noop() {
+        let t = MockTransport::new();
+        t.push_incoming(wire(100, &state_message_bytes(RunspacePoolState::Opened)));
+        let mut pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
+        // Mark as closed internally by calling close once
+        pool.closed = true;
+        pool.close().await.unwrap(); // should early-return Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_already_closed_errors() {
+        let t = MockTransport::new();
+        t.push_incoming(wire(100, &state_message_bytes(RunspacePoolState::Opened)));
+        let mut pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
+        pool.closed = true;
+        let err = pool.disconnect().await.unwrap_err();
+        assert!(err.to_string().contains("already closed"));
     }
 
     #[tokio::test]
