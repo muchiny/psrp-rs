@@ -4,9 +4,9 @@ All notable changes to `psrp-rs` are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.0] — 2026-04-12
 
-### Added — full feature sweep
+### Added
 
 - **CLIXML primitives**: `<DT>`, `<TS>`, `<G>`, `<BA>`, `<C>`, `<By>`,
   `<SB>`, `<I16>`, `<U16>`, `<U32>`, `<U64>`, `<Sg>`, `<D>`, `<URI>`,

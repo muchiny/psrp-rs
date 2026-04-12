@@ -8,6 +8,12 @@
 # Vagrant
 .vagrant/
 
+# Editor config
+.claude/
+CLAUDE.md
+BRIEFING.md
+IMPLEMENTATION_PLAN.md
+
 # IDE
 .idea/
 .vscode/
