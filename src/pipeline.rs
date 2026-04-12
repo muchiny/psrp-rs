@@ -429,184 +429,34 @@ impl Pipeline {
     }
 
     fn create_pipeline_xml(&self) -> String {
-        // TEMPORARY HACK: use pypsrp's exact CLIXML to prove the transport works
-        if self.commands.len() == 1
-            && self.commands[0].is_script
-            && self.commands[0].arguments.is_empty()
-        {
-            return self.create_pipeline_xml_pypsrp_compat();
-        }
-        // Match pypsrp's exact structure:
-        // ROOT: NoInput, ApartmentState, RemoteStreamOptions, AddToHistory,
-        //       HostInfo, PowerShell, IsNested
-        // PowerShell: IsNested, ExtraCmds, Cmds[...], History, RedirectShellErrorOutputPipe
-        // Each Cmd: Cmd, IsScript, UseLocalScope, MergeMyResult..MergeInformation, Args
-        let a = crate::clixml::encode::RefIdAllocator::new();
-        let esc = crate::clixml::encode::escape;
-        let mut o = format!("<Obj RefId=\"{}\"><MS>", a.next());
+        use crate::clixml::encode::{PipelineArgSpec, PipelineCommandSpec, build_create_pipeline_xml};
 
-        // ROOT: NoInput
-        o.push_str(&format!(
-            "<B N=\"NoInput\">{}</B>",
-            if self.no_input { "true" } else { "false" }
-        ));
-        // ROOT: ApartmentState
-        crate::clixml::encode::write_value_with(
-            &mut o,
-            &crate::clixml::encode::ps_enum(
-                "System.Management.Automation.Runspaces.ApartmentState",
-                "UNKNOWN",
-                2,
-            ),
-            Some("ApartmentState"),
-            &a,
-        );
-        // ROOT: RemoteStreamOptions
-        let (so_name, so_val) = if self.add_invocation_info {
-            ("AddInvocationInfo", 15)
-        } else {
-            ("None", 0)
-        };
-        crate::clixml::encode::write_value_with(
-            &mut o,
-            &crate::clixml::encode::ps_enum(
-                "System.Management.Automation.Runspaces.RemoteStreamOptions",
-                so_name,
-                so_val,
-            ),
-            Some("RemoteStreamOptions"),
-            &a,
-        );
-        // ROOT: AddToHistory
-        o.push_str(&format!(
-            "<B N=\"AddToHistory\">{}</B>",
-            if self.add_to_history { "true" } else { "false" }
-        ));
-        // ROOT: HostInfo
-        crate::clixml::encode::write_value_with(
-            &mut o,
-            &crate::clixml::encode::ps_host_info_null(),
-            Some("HostInfo"),
-            &a,
-        );
-        // ROOT: PowerShell sub-object
-        o.push_str(&format!(
-            "<Obj RefId=\"{}\" N=\"PowerShell\"><MS>",
-            a.next()
-        ));
-        o.push_str("<B N=\"IsNested\">false</B>");
-        o.push_str("<Nil N=\"ExtraCmds\"/>");
-        // Cmds list with TN
-        let cmds_tn = a.next();
-        o.push_str(&format!(
-            "<Obj RefId=\"{}\" N=\"Cmds\"><TN RefId=\"{cmds_tn}\"><T>System.Collections.Generic.List`1[[System.Management.Automation.PSObject, System.Management.Automation, Version=1.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35]]</T><T>System.Object</T></TN><LST>",
-            a.next()
-        ));
-        let prt = "System.Management.Automation.Runspaces.PipelineResultTypes";
-        let mut first_prt_tn: Option<u32> = None;
-        for c in &self.commands {
-            o.push_str(&format!("<Obj RefId=\"{}\"><MS>", a.next()));
-            o.push_str(&format!("<S N=\"Cmd\">{}</S>", esc(&c.name)));
-            o.push_str(&format!(
-                "<B N=\"IsScript\">{}</B>",
-                if c.is_script { "true" } else { "false" }
-            ));
-            o.push_str("<Nil N=\"UseLocalScope\"/>");
-            // Merge fields — first one gets TN, rest get TNRef
-            let (merge_my_name, merge_my_val) = if c.merge_errors_to_output {
-                ("Error", 2)
-            } else {
-                ("None", 0)
-            };
-            let (merge_to_name, merge_to_val) = if c.merge_errors_to_output {
-                ("Output", 1)
-            } else {
-                ("None", 0)
-            };
-            for (name, label, val) in [
-                ("MergeMyResult", merge_my_name, merge_my_val),
-                ("MergeToResult", merge_to_name, merge_to_val),
-                ("MergePreviousResults", "None", 0i32),
-            ] {
-                let rid = a.next();
-                if let Some(tn_ref) = first_prt_tn {
-                    o.push_str(&format!(
-                        "<Obj RefId=\"{rid}\" N=\"{name}\"><TNRef RefId=\"{tn_ref}\" /><ToString>{label}</ToString><I32>{val}</I32></Obj>"
-                    ));
-                } else {
-                    let tn_id = a.next();
-                    first_prt_tn = Some(tn_id);
-                    o.push_str(&format!(
-                        "<Obj RefId=\"{rid}\" N=\"{name}\"><TN RefId=\"{tn_id}\"><T>{prt}</T><T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN><ToString>{label}</ToString><I32>{val}</I32></Obj>"
-                    ));
-                }
-            }
-            // Args (uses TNRef to cmds_tn)
-            o.push_str(&format!(
-                "<Obj RefId=\"{}\" N=\"Args\"><TNRef RefId=\"{cmds_tn}\" /><LST>",
-                a.next()
-            ));
-            for arg in &c.arguments {
-                o.push_str(&format!("<Obj RefId=\"{}\"><MS>", a.next()));
-                match arg {
-                    Argument::Named { name, value } => {
-                        o.push_str(&format!("<S N=\"N\">{}</S>", esc(name)));
-                        let mut inner = String::new();
-                        crate::clixml::encode::write_value_with(&mut inner, value, Some("V"), &a);
-                        o.push_str(&inner);
-                    }
-                    Argument::Positional(value) => {
-                        o.push_str("<Nil N=\"N\"/>");
-                        let mut inner = String::new();
-                        crate::clixml::encode::write_value_with(&mut inner, value, Some("V"), &a);
-                        o.push_str(&inner);
-                    }
-                    Argument::Switch(name) => {
-                        o.push_str(&format!("<S N=\"N\">{}</S>", esc(name)));
-                        o.push_str("<B N=\"V\">true</B>");
-                    }
-                }
-                o.push_str("</MS></Obj>");
-            }
-            o.push_str("</LST></Obj>"); // close Args
-            // Remaining Merge fields (MergeError..MergeInformation)
-            let tn_ref = first_prt_tn.unwrap();
-            for name in [
-                "MergeError",
-                "MergeWarning",
-                "MergeVerbose",
-                "MergeDebug",
-                "MergeInformation",
-            ] {
-                let rid = a.next();
-                o.push_str(&format!(
-                    "<Obj RefId=\"{rid}\" N=\"{name}\"><TNRef RefId=\"{tn_ref}\" /><ToString>None</ToString><I32>0</I32></Obj>"
-                ));
-            }
-            o.push_str("</MS></Obj>"); // close Cmd
-        }
-        o.push_str("</LST></Obj>"); // close Cmds
-        o.push_str("<Nil N=\"History\"/>");
-        o.push_str("<B N=\"RedirectShellErrorOutputPipe\">false</B>");
-        o.push_str("</MS></Obj>"); // close PowerShell
-        // ROOT: IsNested (at root level too)
-        o.push_str("<B N=\"IsNested\">false</B>");
-        o.push_str("</MS></Obj>"); // close root
-        o
-    }
+        let specs: Vec<PipelineCommandSpec<'_>> = self
+            .commands
+            .iter()
+            .map(|c| PipelineCommandSpec {
+                name: &c.name,
+                is_script: c.is_script,
+                merge_errors_to_output: c.merge_errors_to_output,
+                args: c
+                    .arguments
+                    .iter()
+                    .map(|a| match a {
+                        Argument::Named { name, value } => {
+                            PipelineArgSpec::Named { name, value }
+                        }
+                        Argument::Positional(v) => PipelineArgSpec::Positional(v),
+                        Argument::Switch(name) => PipelineArgSpec::Switch(name),
+                    })
+                    .collect(),
+            })
+            .collect();
 
-    /// pypsrp-compatible CreatePipeline CLIXML for simple script commands.
-    fn create_pipeline_xml_pypsrp_compat(&self) -> String {
-        let script = crate::clixml::encode::escape(&self.commands[0].name);
-        let no_input = if self.no_input { "true" } else { "false" };
-        let add_to_history = if self.add_to_history { "true" } else { "false" };
-        let (so_name, so_val) = if self.add_invocation_info {
-            ("AddInvocationInfo", "15")
-        } else {
-            ("None", "0")
-        };
-        format!(
-            r#"<Obj RefId="0"><MS><B N="NoInput">{no_input}</B><Obj RefId="1" N="ApartmentState"><TN RefId="0"><T>System.Management.Automation.Runspaces.ApartmentState</T><T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN><ToString>UNKNOWN</ToString><I32>2</I32></Obj><Obj RefId="2" N="RemoteStreamOptions"><TN RefId="1"><T>System.Management.Automation.Runspaces.RemoteStreamOptions</T><T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN><ToString>{so_name}</ToString><I32>{so_val}</I32></Obj><B N="AddToHistory">{add_to_history}</B><Obj RefId="3" N="HostInfo"><MS><B N="_isHostNull">true</B><B N="_isHostUINull">true</B><B N="_isHostRawUINull">true</B><B N="_useRunspaceHost">true</B></MS></Obj><Obj RefId="4" N="PowerShell"><MS><B N="IsNested">false</B><Nil N="ExtraCmds" /><Obj RefId="5" N="Cmds"><TN RefId="2"><T>System.Collections.Generic.List`1[[System.Management.Automation.PSObject, System.Management.Automation, Version=1.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35]]</T><T>System.Object</T></TN><LST><Obj RefId="6"><MS><S N="Cmd">{script}</S><B N="IsScript">true</B><Nil N="UseLocalScope" /><Obj RefId="7" N="MergeMyResult"><TN RefId="3"><T>System.Management.Automation.Runspaces.PipelineResultTypes</T><T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN><ToString>None</ToString><I32>0</I32></Obj><Obj RefId="8" N="MergeToResult"><TNRef RefId="3" /><ToString>None</ToString><I32>0</I32></Obj><Obj RefId="9" N="MergePreviousResults"><TNRef RefId="3" /><ToString>None</ToString><I32>0</I32></Obj><Obj RefId="10" N="Args"><TNRef RefId="2" /><LST /></Obj><Obj RefId="11" N="MergeError"><TNRef RefId="3" /><ToString>None</ToString><I32>0</I32></Obj><Obj RefId="12" N="MergeWarning"><TNRef RefId="3" /><ToString>None</ToString><I32>0</I32></Obj><Obj RefId="13" N="MergeVerbose"><TNRef RefId="3" /><ToString>None</ToString><I32>0</I32></Obj><Obj RefId="14" N="MergeDebug"><TNRef RefId="3" /><ToString>None</ToString><I32>0</I32></Obj><Obj RefId="15" N="MergeInformation"><TNRef RefId="3" /><ToString>None</ToString><I32>0</I32></Obj></MS></Obj></LST></Obj><Nil N="History" /><B N="RedirectShellErrorOutputPipe">false</B></MS></Obj><B N="IsNested">false</B></MS></Obj>"#
+        build_create_pipeline_xml(
+            self.no_input,
+            self.add_to_history,
+            self.add_invocation_info,
+            &specs,
         )
     }
 

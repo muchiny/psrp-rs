@@ -327,6 +327,248 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline CreatePipeline XML builder (MS-PSRP §2.2.2.12)
+// ---------------------------------------------------------------------------
+
+/// Describes one argument inside a [`PipelineCommandSpec`].
+pub(crate) enum PipelineArgSpec<'a> {
+    Named { name: &'a str, value: &'a PsValue },
+    Positional(&'a PsValue),
+    Switch(&'a str),
+}
+
+/// Describes one command inside a pipeline, decoupled from
+/// `crate::pipeline::Command` so `clixml/` never imports `pipeline`.
+pub(crate) struct PipelineCommandSpec<'a> {
+    pub name: &'a str,
+    pub is_script: bool,
+    pub merge_errors_to_output: bool,
+    pub args: Vec<PipelineArgSpec<'a>>,
+}
+
+/// Write a .NET enum `<Obj>` with a full `<TN>` type-name block.
+///
+/// Returns the `RefId` allocated for the `<TN>` element so subsequent
+/// siblings can emit `<TNRef RefId="…"/>` instead.
+fn write_enum_first_in_group(
+    out: &mut String,
+    name: Option<&str>,
+    enum_type: &str,
+    to_string: &str,
+    value: i32,
+    alloc: &RefIdAllocator,
+) -> u32 {
+    open_obj(out, name, alloc);
+    let tn_id = alloc.next();
+    out.push_str(&format!("<TN RefId=\"{tn_id}\">"));
+    out.push_str("<T>");
+    out.push_str(&escape(enum_type));
+    out.push_str("</T><T>System.Enum</T><T>System.ValueType</T><T>System.Object</T>");
+    out.push_str("</TN>");
+    out.push_str("<ToString>");
+    out.push_str(&escape(to_string));
+    out.push_str("</ToString>");
+    out.push_str(&format!("<I32>{value}</I32>"));
+    out.push_str("</Obj>");
+    tn_id
+}
+
+/// Write a .NET enum `<Obj>` with a `<TNRef>` back-reference to an
+/// already-emitted `<TN>`.
+fn write_enum_with_tnref(
+    out: &mut String,
+    name: Option<&str>,
+    tn_ref_id: u32,
+    to_string: &str,
+    value: i32,
+    alloc: &RefIdAllocator,
+) {
+    open_obj(out, name, alloc);
+    out.push_str(&format!("<TNRef RefId=\"{tn_ref_id}\"/>"));
+    out.push_str("<ToString>");
+    out.push_str(&escape(to_string));
+    out.push_str("</ToString>");
+    out.push_str(&format!("<I32>{value}</I32>"));
+    out.push_str("</Obj>");
+}
+
+/// Build the CLIXML body for a `CreatePipeline` message (MS-PSRP §2.2.2.12).
+///
+/// Produces exactly the same XML structure that `pypsrp` (Python) and older
+/// hand-rolled Rust code emitted — including `TN`/`TNRef` sharing for
+/// `PipelineResultTypes` enums and the `Cmds`/`Args` list type.
+pub(crate) fn build_create_pipeline_xml(
+    no_input: bool,
+    add_to_history: bool,
+    add_invocation_info: bool,
+    commands: &[PipelineCommandSpec<'_>],
+) -> String {
+    let a = RefIdAllocator::new();
+    let mut o = format!("<Obj RefId=\"{}\"><MS>", a.next());
+
+    // ── ROOT: NoInput ───────────────────────────────────────────────
+    write_value_with(&mut o, &PsValue::Bool(no_input), Some("NoInput"), &a);
+
+    // ── ROOT: ApartmentState ────────────────────────────────────────
+    write_value_with(
+        &mut o,
+        &ps_enum(
+            "System.Management.Automation.Runspaces.ApartmentState",
+            "UNKNOWN",
+            2,
+        ),
+        Some("ApartmentState"),
+        &a,
+    );
+
+    // ── ROOT: RemoteStreamOptions ───────────────────────────────────
+    let (so_name, so_val) = if add_invocation_info {
+        ("AddInvocationInfo", 15)
+    } else {
+        ("None", 0)
+    };
+    write_value_with(
+        &mut o,
+        &ps_enum(
+            "System.Management.Automation.Runspaces.RemoteStreamOptions",
+            so_name,
+            so_val,
+        ),
+        Some("RemoteStreamOptions"),
+        &a,
+    );
+
+    // ── ROOT: AddToHistory ──────────────────────────────────────────
+    write_value_with(
+        &mut o,
+        &PsValue::Bool(add_to_history),
+        Some("AddToHistory"),
+        &a,
+    );
+
+    // ── ROOT: HostInfo ──────────────────────────────────────────────
+    write_value_with(&mut o, &ps_host_info_null(), Some("HostInfo"), &a);
+
+    // ── ROOT: PowerShell sub-object ─────────────────────────────────
+    open_obj(&mut o, Some("PowerShell"), &a);
+    o.push_str("<MS>");
+    write_value_with(&mut o, &PsValue::Bool(false), Some("IsNested"), &a);
+    write_value_with(&mut o, &PsValue::Null, Some("ExtraCmds"), &a);
+
+    // Cmds list with TN
+    let cmds_tn = a.next();
+    o.push_str(&format!(
+        "<Obj RefId=\"{}\" N=\"Cmds\"><TN RefId=\"{cmds_tn}\"><T>System.Collections.Generic.List`1[[System.Management.Automation.PSObject, System.Management.Automation, Version=1.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35]]</T><T>System.Object</T></TN><LST>",
+        a.next()
+    ));
+
+    let prt = "System.Management.Automation.Runspaces.PipelineResultTypes";
+    let mut first_prt_tn: Option<u32> = None;
+
+    for c in commands {
+        open_obj(&mut o, None, &a);
+        o.push_str("<MS>");
+        write_value_with(
+            &mut o,
+            &PsValue::String(c.name.to_string()),
+            Some("Cmd"),
+            &a,
+        );
+        write_value_with(&mut o, &PsValue::Bool(c.is_script), Some("IsScript"), &a);
+        write_value_with(&mut o, &PsValue::Null, Some("UseLocalScope"), &a);
+
+        // Merge fields — first one gets TN, rest get TNRef
+        let (merge_my_name, merge_my_val) = if c.merge_errors_to_output {
+            ("Error", 2)
+        } else {
+            ("None", 0)
+        };
+        let (merge_to_name, merge_to_val) = if c.merge_errors_to_output {
+            ("Output", 1)
+        } else {
+            ("None", 0)
+        };
+        for (name, label, val) in [
+            ("MergeMyResult", merge_my_name, merge_my_val),
+            ("MergeToResult", merge_to_name, merge_to_val),
+            ("MergePreviousResults", "None", 0i32),
+        ] {
+            if let Some(tn_ref) = first_prt_tn {
+                write_enum_with_tnref(&mut o, Some(name), tn_ref, label, val, &a);
+            } else {
+                let tn_id =
+                    write_enum_first_in_group(&mut o, Some(name), prt, label, val, &a);
+                first_prt_tn = Some(tn_id);
+            }
+        }
+
+        // Args (uses TNRef to cmds_tn)
+        o.push_str(&format!(
+            "<Obj RefId=\"{}\" N=\"Args\"><TNRef RefId=\"{cmds_tn}\"/><LST>",
+            a.next()
+        ));
+        for arg in &c.args {
+            open_obj(&mut o, None, &a);
+            o.push_str("<MS>");
+            match arg {
+                PipelineArgSpec::Named { name, value } => {
+                    write_value_with(
+                        &mut o,
+                        &PsValue::String((*name).to_string()),
+                        Some("N"),
+                        &a,
+                    );
+                    write_value_with(&mut o, value, Some("V"), &a);
+                }
+                PipelineArgSpec::Positional(value) => {
+                    write_value_with(&mut o, &PsValue::Null, Some("N"), &a);
+                    write_value_with(&mut o, value, Some("V"), &a);
+                }
+                PipelineArgSpec::Switch(name) => {
+                    write_value_with(
+                        &mut o,
+                        &PsValue::String((*name).to_string()),
+                        Some("N"),
+                        &a,
+                    );
+                    write_value_with(&mut o, &PsValue::Bool(true), Some("V"), &a);
+                }
+            }
+            o.push_str("</MS></Obj>");
+        }
+        o.push_str("</LST></Obj>"); // close Args
+
+        // Remaining Merge fields (MergeError..MergeInformation)
+        let tn_ref = first_prt_tn.expect("at least one merge field emitted");
+        for name in [
+            "MergeError",
+            "MergeWarning",
+            "MergeVerbose",
+            "MergeDebug",
+            "MergeInformation",
+        ] {
+            write_enum_with_tnref(&mut o, Some(name), tn_ref, "None", 0, &a);
+        }
+        o.push_str("</MS></Obj>"); // close Cmd
+    }
+
+    o.push_str("</LST></Obj>"); // close Cmds
+    write_value_with(&mut o, &PsValue::Null, Some("History"), &a);
+    write_value_with(
+        &mut o,
+        &PsValue::Bool(false),
+        Some("RedirectShellErrorOutputPipe"),
+        &a,
+    );
+    o.push_str("</MS></Obj>"); // close PowerShell
+
+    // ROOT: IsNested (at root level too)
+    write_value_with(&mut o, &PsValue::Bool(false), Some("IsNested"), &a);
+    o.push_str("</MS></Obj>"); // close root
+    o
+}
+
 /// Decode a base64 string, ignoring whitespace.
 pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
@@ -529,5 +771,96 @@ mod tests {
         assert_eq!(b.next(), 42);
         assert_eq!(b.next(), 43);
         let _ = RefIdAllocator::default();
+    }
+
+    #[test]
+    fn pipeline_xml_single_script_has_one_tn_and_seven_tnref_for_prt() {
+        let xml = build_create_pipeline_xml(true, false, true, &[PipelineCommandSpec {
+            name: "1+1",
+            is_script: true,
+            merge_errors_to_output: false,
+            args: vec![],
+        }]);
+        // Exactly one <TN> for PipelineResultTypes
+        let prt = "System.Management.Automation.Runspaces.PipelineResultTypes";
+        assert_eq!(xml.matches(prt).count(), 1, "PRT type string should appear once (in <TN>)");
+        // The first merge field uses <TN>, remaining 7 use <TNRef>
+        assert_eq!(
+            xml.matches("<TNRef").count(),
+            8, // 2 MergeToResult+MergePreviousResults + 5 MergeError..MergeInformation + 1 Args
+            "expected 8 TNRef total (7 for PRT enums + 1 for Args list)"
+        );
+    }
+
+    #[test]
+    fn pipeline_xml_args_uses_tnref_to_cmds_list() {
+        let xml = build_create_pipeline_xml(true, false, false, &[PipelineCommandSpec {
+            name: "Get-Process",
+            is_script: false,
+            merge_errors_to_output: false,
+            args: vec![PipelineArgSpec::Named {
+                name: "Name",
+                value: &PsValue::String("svchost".into()),
+            }],
+        }]);
+        assert!(xml.contains("N=\"Args\""), "Args field must be present");
+        // Args Obj should use <TNRef>, not <TN>
+        let args_pos = xml.find("N=\"Args\"").unwrap();
+        let after_args = &xml[args_pos..];
+        assert!(
+            after_args.starts_with("N=\"Args\"><TNRef"),
+            "Args should use TNRef to reference the Cmds list TN"
+        );
+    }
+
+    #[test]
+    fn pipeline_xml_two_commands_share_prt_tnref() {
+        let xml = build_create_pipeline_xml(true, false, true, &[
+            PipelineCommandSpec {
+                name: "Get-Process",
+                is_script: false,
+                merge_errors_to_output: false,
+                args: vec![],
+            },
+            PipelineCommandSpec {
+                name: "Select-Object",
+                is_script: false,
+                merge_errors_to_output: false,
+                args: vec![PipelineArgSpec::Named {
+                    name: "First",
+                    value: &PsValue::I32(5),
+                }],
+            },
+        ]);
+        let prt = "System.Management.Automation.Runspaces.PipelineResultTypes";
+        // Still only one TN definition for PRT across both commands
+        assert_eq!(xml.matches(prt).count(), 1);
+        // 2 commands × 8 merge fields each = 16, minus the first = 15 TNRef for PRT
+        // Plus 2 TNRef for Args = 17 total
+        assert_eq!(xml.matches("<TNRef").count(), 17);
+    }
+
+    #[test]
+    fn pipeline_xml_switch_emits_bool_true() {
+        let xml = build_create_pipeline_xml(true, false, false, &[PipelineCommandSpec {
+            name: "Get-Process",
+            is_script: false,
+            merge_errors_to_output: false,
+            args: vec![PipelineArgSpec::Switch("FileVersionInfo")],
+        }]);
+        assert!(xml.contains("<S N=\"N\">FileVersionInfo</S>"));
+        assert!(xml.contains("<B N=\"V\">true</B>"));
+    }
+
+    #[test]
+    fn pipeline_xml_positional_has_nil_name() {
+        let xml = build_create_pipeline_xml(true, false, false, &[PipelineCommandSpec {
+            name: "Get-Process",
+            is_script: false,
+            merge_errors_to_output: false,
+            args: vec![PipelineArgSpec::Positional(&PsValue::String("svchost".into()))],
+        }]);
+        assert!(xml.contains("<Nil N=\"N\"/>"));
+        assert!(xml.contains("<S N=\"V\">svchost</S>"));
     }
 }
