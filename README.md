@@ -1,12 +1,36 @@
 # psrp-rs
 
-Async [PowerShell Remoting Protocol (MS-PSRP)](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-psrp/)
-client for Rust, built on top of [`winrm-rs`](https://crates.io/crates/winrm-rs).
+Async [PowerShell Remoting Protocol (MS-PSRP)](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-psrp/) client for Rust.
 
-`psrp-rs` layers PSRP fragments, CLIXML serialization and a runspace pool
-state machine on top of `winrm-rs`, so Rust code can run PowerShell
-pipelines against Windows hosts and receive **typed** results with
-isolated streams.
+[![Crates.io](https://img.shields.io/crates/v/psrp-rs.svg)](https://crates.io/crates/psrp-rs)
+[![docs.rs](https://img.shields.io/docsrs/psrp-rs)](https://docs.rs/psrp-rs)
+[![License](https://img.shields.io/crates/l/psrp-rs.svg)](LICENSE-MIT)
+[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2026/03/20/Rust-1.94.0.html)
+
+```rust
+use psrp_rs::{RunspacePool, WinrmPsrpTransport};
+use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = WinrmClient::new(
+        WinrmConfig::default(),
+        WinrmCredentials::new("administrator", "secret", ""),
+    )?;
+
+    let (rpid, creation) = RunspacePool::<WinrmPsrpTransport>::build_creation_fragments(1, 1)?;
+    let transport = WinrmPsrpTransport::open(&client, "win-server", &creation).await?;
+    let mut pool = RunspacePool::open_from_transport(transport, rpid, 1, 1).await?;
+
+    let objects = pool.run_script("Get-Process | Select-Object -First 5 Name, Id").await?;
+    for obj in objects {
+        println!("{obj:?}");
+    }
+
+    pool.close().await?;
+    Ok(())
+}
+```
 
 ## Features
 
@@ -25,7 +49,7 @@ isolated streams.
 
 ## Installation
 
-```bash
+```sh
 cargo add psrp-rs
 
 # For SSH transport:
@@ -39,43 +63,38 @@ cargo add psrp-rs --features serde
 
 ### Run a script and collect output
 
-```rust,no_run
+```rust
 use psrp_rs::{RunspacePool, WinrmPsrpTransport};
 use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = WinrmClient::new(
-        WinrmConfig {
-            auth_method: AuthMethod::Ntlm,
-            ..Default::default()
-        },
-        WinrmCredentials::new("administrator", "Passw0rd!", ""),
-    )?;
+let client = WinrmClient::new(
+    WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        ..Default::default()
+    },
+    WinrmCredentials::new("administrator", "Passw0rd!", "MYDOMAIN"),
+)?;
 
-    let transport = WinrmPsrpTransport::open(&client, "win-host.lab", &creation).await?;
-    let mut pool = RunspacePool::open_with_transport(transport).await?;
+let (rpid, creation) = RunspacePool::<WinrmPsrpTransport>::build_creation_fragments(1, 1)?;
+let transport = WinrmPsrpTransport::open(&client, "win-server", &creation).await?;
+let mut pool = RunspacePool::open_from_transport(transport, rpid, 1, 1).await?;
 
-    let objects = pool
-        .run_script("Get-Process | Select-Object -First 5 Name, Id")
-        .await?;
+let objects = pool
+    .run_script("Get-Process | Select-Object -First 5 Name, Id")
+    .await?;
 
-    for obj in objects {
-        println!("{obj:?}");
-    }
-
-    pool.close().await?;
-    Ok(())
+for obj in objects {
+    println!("{obj:?}");
 }
+
+pool.close().await?;
 ```
 
 ### Pipeline builder with parameters
 
-```rust,no_run
+```rust
 use psrp_rs::{Command, Pipeline, PsValue};
-# use psrp_rs::{RunspacePool, WinrmPsrpTransport};
 
-# async fn example(pool: &mut RunspacePool<WinrmPsrpTransport<'_>>) -> psrp_rs::Result<()> {
 let result = Pipeline::empty()
     .add_command(
         Command::new("Get-Service")
@@ -85,7 +104,7 @@ let result = Pipeline::empty()
         Command::new("Select-Object")
             .with_parameter("Property", PsValue::String("Status,Name,DisplayName".into()))
     )
-    .run_all_streams(pool)
+    .run_all_streams(&mut pool)
     .await?;
 
 for obj in &result.output {
@@ -97,17 +116,15 @@ for err in result.typed_errors() {
 for warn in result.typed_warnings() {
     eprintln!("WARN: {}", warn.message);
 }
-# Ok(())
-# }
 ```
 
 ### Capture all streams
 
-```rust,no_run
-# use psrp_rs::{Pipeline, RunspacePool, WinrmPsrpTransport};
-# async fn example(pool: &mut RunspacePool<WinrmPsrpTransport<'_>>) -> psrp_rs::Result<()> {
+```rust
+use psrp_rs::Pipeline;
+
 let result = Pipeline::new("Write-Warning 'careful'; Write-Output 42")
-    .run_all_streams(pool)
+    .run_all_streams(&mut pool)
     .await?;
 
 println!("Output:   {:?}", result.output);
@@ -117,17 +134,14 @@ println!("Verbose:  {:?}", result.verbose);
 println!("Debug:    {:?}", result.debug);
 println!("Info:     {:?}", result.information);
 println!("Progress: {:?}", result.progress);
-# Ok(())
-# }
 ```
 
 ### Cancel a long-running script
 
-```rust,no_run
+```rust
 use tokio_util::sync::CancellationToken;
-# use psrp_rs::{RunspacePool, WinrmPsrpTransport, PsrpError};
+use psrp_rs::PsrpError;
 
-# async fn example(pool: &mut RunspacePool<WinrmPsrpTransport<'_>>) -> psrp_rs::Result<()> {
 let cancel = CancellationToken::new();
 let token = cancel.clone();
 
@@ -140,13 +154,11 @@ match pool.run_script_with_cancel("Start-Sleep -Seconds 300", cancel).await {
     Err(PsrpError::Cancelled) => println!("Script was cancelled"),
     other => println!("{other:?}"),
 }
-# Ok(())
-# }
 ```
 
-### Blocking API (no async runtime needed)
+### Blocking API
 
-```rust,no_run
+```rust
 use psrp_rs::blocking;
 use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
 
@@ -155,20 +167,18 @@ let client = WinrmClient::new(
     WinrmCredentials::new("admin", "password", ""),
 )?;
 
-let objects = blocking::run_script(&client, "win-host.lab", "hostname")?;
+let objects = blocking::run_script(&client, "win-server", "hostname")?;
 println!("{objects:?}");
-# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### SSH transport
 
-```rust,no_run,ignore
+```rust
 // Requires: cargo add psrp-rs --features ssh
 use psrp_rs::{RunspacePool, SshConfig, SshAuth, SshPsrpTransport};
 
-# async fn example() -> psrp_rs::Result<()> {
 let transport = SshPsrpTransport::connect(SshConfig {
-    host: "win-host.lab".into(),
+    host: "win-server".into(),
     port: 22,
     username: "admin".into(),
     auth: SshAuth::Password("Passw0rd!".into()),
@@ -178,64 +188,110 @@ let transport = SshPsrpTransport::connect(SshConfig {
 let mut pool = RunspacePool::open_with_transport(transport).await?;
 let result = pool.run_script("$PSVersionTable").await?;
 pool.close().await?;
-# Ok(())
-# }
 ```
 
 ### Shared pool for concurrent tasks
 
-```rust,no_run
+```rust
 use psrp_rs::SharedRunspacePool;
-# use psrp_rs::{RunspacePool, WinrmPsrpTransport};
 
-# async fn example(pool: RunspacePool<WinrmPsrpTransport<'_>>) -> psrp_rs::Result<()> {
 let shared = SharedRunspacePool::new(pool);
 
 let s1 = shared.clone();
-let t1 = tokio::spawn(async move {
-    s1.run_script("Get-Date").await
-});
+let t1 = tokio::spawn(async move { s1.run_script("Get-Date").await });
 
 let s2 = shared.clone();
-let t2 = tokio::spawn(async move {
-    s2.run_script("hostname").await
-});
+let t2 = tokio::spawn(async move { s2.run_script("hostname").await });
 
 let (r1, r2) = tokio::join!(t1, t2);
 shared.close().await?;
-# Ok(())
-# }
 ```
 
-## Scope
+## Configuration
 
-| Feature                              | Status     |
-|--------------------------------------|------------|
-| Fragment encode / reassemble         | done       |
-| CLIXML primitives + `<Obj>` + collections | done  |
-| Runspace pool open / close           | done       |
-| Pipeline builder with parameters     | done       |
-| All 7 PSRP streams                   | done       |
-| Typed record accessors               | done       |
-| Host call dispatch                   | done       |
-| Session-key cryptography             | done       |
-| Command metadata (`Get-Command`)     | done       |
-| Async and blocking API               | done       |
-| SSH transport                        | done       |
-| Shared pool (multi-task)             | done       |
-| Cancellation support                 | done       |
-| Pipeline input streaming             | partial    |
-| Reconnect / disconnect pool          | placeholder |
-| CLIXML `<Ref>` round-tripping       | read-only  |
+`psrp-rs` reuses [`WinrmConfig`](https://docs.rs/winrm-rs/latest/winrm_rs/struct.WinrmConfig.html)
+from `winrm-rs` for transport-level settings (auth method, TLS, timeouts, proxy).
+See the [winrm-rs documentation](https://docs.rs/winrm-rs) for the full list of config fields.
+
+Pool-level parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `min_runspaces` | `1` | Minimum number of runspaces the server should maintain |
+| `max_runspaces` | `1` | Maximum concurrent runspaces (controls server-side parallelism) |
+
+Set via `RunspacePool::open_with_options(transport, min, max)` or
+`build_creation_fragments(min, max)` + `open_from_transport(...)`.
+
+## Roadmap
+
+| Version | Milestone | Status |
+|---|---|---|
+| **v1.0** | Full PSRP: CLIXML, fragments, runspace pool, pipeline builder, all 7 streams, typed records, host calls, session-key crypto, SSH transport, blocking API, shared pool, cancellation | **Current** |
+| **v1.x** | Pipeline input streaming, disconnect/reconnect pool, CLIXML `<Ref>` round-tripping | Planned |
+
+## Comparison
+
+| | **psrp-rs** | **pypsrp** (Python) | **PowerShell SDK** (.NET) |
+|---|---|---|---|
+| Language | Rust | Python | C# |
+| Async | native async/await | no | `Task`-based |
+| Typed output | `PsValue` / `PsObject` | dict-based | `PSObject` |
+| All 7 streams | yes | yes | yes |
+| Pipeline builder | yes | yes | yes |
+| Host callbacks | pluggable `PsHost` trait | no | `PSHost` |
+| Session-key crypto | RSA + AES (pure Rust) | yes | built-in |
+| SSH transport | `russh` (feature-gated) | yes | built-in |
+| Auth methods | NTLMv2, Basic, Kerberos, Certificate (via winrm-rs) | NTLM, Basic, Kerberos, CredSSP | all |
+| TLS backend | rustls (pure Rust) | OpenSSL | SChannel / OpenSSL |
+| Binary size | single static binary | interpreter | runtime |
+| C dependencies | none | OpenSSL | CLR |
+
+## Contributing
+
+Contributions are welcome. Please open an issue to discuss larger changes before submitting a PR.
+
+```sh
+cargo test --lib         # run unit tests
+cargo clippy --all-targets  # lint
+cargo fmt --check        # format check
+```
+
+## Integration tests
+
+Unit tests and end-to-end tests run against a mock transport and need no
+external setup. The file [`tests/integration_real.rs`](tests/integration_real.rs)
+targets a real Windows host and is ignored by default. To run it, set the
+following environment variables and use `--ignored`:
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `PSRP_INTEGRATION_HOST` | yes | -- | Hostname or IP of the target Windows box |
+| `PSRP_INTEGRATION_USER` | no | `vagrant` | Username |
+| `PSRP_INTEGRATION_PASS` | no | `vagrant` | Password |
+
+A [`Vagrantfile`](Vagrantfile) is provided to spin up a disposable Windows
+Server 2025 Hyper-V VM with WinRM + PSRP pre-configured:
+
+```sh
+vagrant.exe up --provider=hyperv
+vagrant.exe ssh -c "ipconfig"     # grab the VM IP
+
+PSRP_INTEGRATION_HOST=<ip> \
+PSRP_INTEGRATION_USER=vagrant \
+PSRP_INTEGRATION_PASS=vagrant \
+  cargo test --test integration_real -- --ignored
+```
 
 ## Cargo features
 
-| Feature   | Default | Description                                        |
-|-----------|---------|----------------------------------------------------|
-| (default) | --      | WinRM transport with NTLMv2/Basic/Kerberos auth    |
-| `ssh`     | no      | SSH transport via `russh`                           |
-| `serde`   | no      | `Serialize`/`Deserialize` on `PsValue` / `PsObject`|
+| Feature | Default | Description |
+|---|---|---|
+| *(default)* | -- | WinRM transport with NTLMv2/Basic/Kerberos/Certificate auth (via winrm-rs) |
+| `ssh` | no | SSH transport via `russh` |
+| `serde` | no | `Serialize`/`Deserialize` derives on `PsValue` / `PsObject` |
 
 ## License
 
-Dual-licensed under **MIT** or **Apache-2.0**.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT License](LICENSE-MIT) at your option.
