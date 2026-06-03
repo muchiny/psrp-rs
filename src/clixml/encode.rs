@@ -497,8 +497,7 @@ pub(crate) fn build_create_pipeline_xml(
             if let Some(tn_ref) = first_prt_tn {
                 write_enum_with_tnref(&mut o, Some(name), tn_ref, label, val, &a);
             } else {
-                let tn_id =
-                    write_enum_first_in_group(&mut o, Some(name), prt, label, val, &a);
+                let tn_id = write_enum_first_in_group(&mut o, Some(name), prt, label, val, &a);
                 first_prt_tn = Some(tn_id);
             }
         }
@@ -513,12 +512,7 @@ pub(crate) fn build_create_pipeline_xml(
             o.push_str("<MS>");
             match arg {
                 PipelineArgSpec::Named { name, value } => {
-                    write_value_with(
-                        &mut o,
-                        &PsValue::String((*name).to_string()),
-                        Some("N"),
-                        &a,
-                    );
+                    write_value_with(&mut o, &PsValue::String((*name).to_string()), Some("N"), &a);
                     write_value_with(&mut o, value, Some("V"), &a);
                 }
                 PipelineArgSpec::Positional(value) => {
@@ -526,12 +520,7 @@ pub(crate) fn build_create_pipeline_xml(
                     write_value_with(&mut o, value, Some("V"), &a);
                 }
                 PipelineArgSpec::Switch(name) => {
-                    write_value_with(
-                        &mut o,
-                        &PsValue::String((*name).to_string()),
-                        Some("N"),
-                        &a,
-                    );
+                    write_value_with(&mut o, &PsValue::String((*name).to_string()), Some("N"), &a);
                     write_value_with(&mut o, &PsValue::Bool(true), Some("V"), &a);
                 }
             }
@@ -775,15 +764,24 @@ mod tests {
 
     #[test]
     fn pipeline_xml_single_script_has_one_tn_and_seven_tnref_for_prt() {
-        let xml = build_create_pipeline_xml(true, false, true, &[PipelineCommandSpec {
-            name: "1+1",
-            is_script: true,
-            merge_errors_to_output: false,
-            args: vec![],
-        }]);
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            true,
+            &[PipelineCommandSpec {
+                name: "1+1",
+                is_script: true,
+                merge_errors_to_output: false,
+                args: vec![],
+            }],
+        );
         // Exactly one <TN> for PipelineResultTypes
         let prt = "System.Management.Automation.Runspaces.PipelineResultTypes";
-        assert_eq!(xml.matches(prt).count(), 1, "PRT type string should appear once (in <TN>)");
+        assert_eq!(
+            xml.matches(prt).count(),
+            1,
+            "PRT type string should appear once (in <TN>)"
+        );
         // The first merge field uses <TN>, remaining 7 use <TNRef>
         assert_eq!(
             xml.matches("<TNRef").count(),
@@ -794,15 +792,20 @@ mod tests {
 
     #[test]
     fn pipeline_xml_args_uses_tnref_to_cmds_list() {
-        let xml = build_create_pipeline_xml(true, false, false, &[PipelineCommandSpec {
-            name: "Get-Process",
-            is_script: false,
-            merge_errors_to_output: false,
-            args: vec![PipelineArgSpec::Named {
-                name: "Name",
-                value: &PsValue::String("svchost".into()),
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            false,
+            &[PipelineCommandSpec {
+                name: "Get-Process",
+                is_script: false,
+                merge_errors_to_output: false,
+                args: vec![PipelineArgSpec::Named {
+                    name: "Name",
+                    value: &PsValue::String("svchost".into()),
+                }],
             }],
-        }]);
+        );
         assert!(xml.contains("N=\"Args\""), "Args field must be present");
         // Args Obj should use <TNRef>, not <TN>
         let args_pos = xml.find("N=\"Args\"").unwrap();
@@ -815,23 +818,28 @@ mod tests {
 
     #[test]
     fn pipeline_xml_two_commands_share_prt_tnref() {
-        let xml = build_create_pipeline_xml(true, false, true, &[
-            PipelineCommandSpec {
-                name: "Get-Process",
-                is_script: false,
-                merge_errors_to_output: false,
-                args: vec![],
-            },
-            PipelineCommandSpec {
-                name: "Select-Object",
-                is_script: false,
-                merge_errors_to_output: false,
-                args: vec![PipelineArgSpec::Named {
-                    name: "First",
-                    value: &PsValue::I32(5),
-                }],
-            },
-        ]);
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            true,
+            &[
+                PipelineCommandSpec {
+                    name: "Get-Process",
+                    is_script: false,
+                    merge_errors_to_output: false,
+                    args: vec![],
+                },
+                PipelineCommandSpec {
+                    name: "Select-Object",
+                    is_script: false,
+                    merge_errors_to_output: false,
+                    args: vec![PipelineArgSpec::Named {
+                        name: "First",
+                        value: &PsValue::I32(5),
+                    }],
+                },
+            ],
+        );
         let prt = "System.Management.Automation.Runspaces.PipelineResultTypes";
         // Still only one TN definition for PRT across both commands
         assert_eq!(xml.matches(prt).count(), 1);
@@ -842,24 +850,36 @@ mod tests {
 
     #[test]
     fn pipeline_xml_switch_emits_bool_true() {
-        let xml = build_create_pipeline_xml(true, false, false, &[PipelineCommandSpec {
-            name: "Get-Process",
-            is_script: false,
-            merge_errors_to_output: false,
-            args: vec![PipelineArgSpec::Switch("FileVersionInfo")],
-        }]);
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            false,
+            &[PipelineCommandSpec {
+                name: "Get-Process",
+                is_script: false,
+                merge_errors_to_output: false,
+                args: vec![PipelineArgSpec::Switch("FileVersionInfo")],
+            }],
+        );
         assert!(xml.contains("<S N=\"N\">FileVersionInfo</S>"));
         assert!(xml.contains("<B N=\"V\">true</B>"));
     }
 
     #[test]
     fn pipeline_xml_positional_has_nil_name() {
-        let xml = build_create_pipeline_xml(true, false, false, &[PipelineCommandSpec {
-            name: "Get-Process",
-            is_script: false,
-            merge_errors_to_output: false,
-            args: vec![PipelineArgSpec::Positional(&PsValue::String("svchost".into()))],
-        }]);
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            false,
+            &[PipelineCommandSpec {
+                name: "Get-Process",
+                is_script: false,
+                merge_errors_to_output: false,
+                args: vec![PipelineArgSpec::Positional(&PsValue::String(
+                    "svchost".into(),
+                ))],
+            }],
+        );
         assert!(xml.contains("<Nil N=\"N\"/>"));
         assert!(xml.contains("<S N=\"V\">svchost</S>"));
     }

@@ -1,6 +1,6 @@
 [package]
 name = "psrp-rs"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
@@ -37,10 +37,12 @@ rsa = { version = "0.9", default-features = false, features = ["sha1"] }
 aes = "0.8"
 sha1 = { version = "0.10", default-features = false }
 rand = "0.8"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 serde = { version = "1", features = ["derive"], optional = true }
 russh = { version = "0.49", optional = true }
 russh-keys = { version = "0.49", optional = true }
 ssh-key = { version = "0.6", optional = true }
+hmac = { version = "0.12", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
@@ -49,7 +51,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [features]
 default = []
-ssh = ["dep:russh", "dep:russh-keys", "dep:ssh-key"]
+ssh = ["dep:russh", "dep:russh-keys", "dep:ssh-key", "dep:hmac"]
 serde = ["dep:serde", "uuid/serde", "indexmap/serde"]
 
 [lints.rust]

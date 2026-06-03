@@ -69,11 +69,15 @@ impl PsrpTransport for VecTransport {
 }
 
 fn wire_msg(mt: MessageType, data: String) -> Vec<u8> {
+    wire_msg_with(mt, data, Uuid::nil(), Uuid::nil())
+}
+
+fn wire_msg_with(mt: MessageType, data: String, rpid: Uuid, pid: Uuid) -> Vec<u8> {
     let msg = PsrpMessage {
         destination: Destination::Client,
         message_type: mt,
-        rpid: Uuid::nil(),
-        pid: Uuid::nil(),
+        rpid,
+        pid,
         data,
     };
     msg.encode()
@@ -87,37 +91,52 @@ fn opened_state_message() -> Vec<u8> {
     wire_msg(MessageType::RunspacePoolState, body)
 }
 
-fn pipeline_state_message(state: PipelineState) -> Vec<u8> {
+fn pipeline_state_message(state: PipelineState, rpid: Uuid, pid: Uuid) -> Vec<u8> {
     let body = to_clixml(&PsValue::Object(
         PsObject::new().with("PipelineState", PsValue::I32(state as i32)),
     ));
-    wire_msg(MessageType::PipelineState, body)
+    wire_msg_with(MessageType::PipelineState, body, rpid, pid)
 }
 
 #[tokio::test]
 async fn open_pool_and_run_script() {
     let transport = VecTransport::new();
-    // open handshake
+    // Open handshake first; pipeline messages get pushed once we know the
+    // pool's RPID (and we can force a known PID on the pipeline).
     transport.push(encode_message(1, &opened_state_message()));
-    // pipeline output
-    transport.push(encode_message(
-        10,
-        &wire_msg(MessageType::PipelineOutput, "<S>hello</S>".into()),
-    ));
-    transport.push(encode_message(
-        11,
-        &wire_msg(MessageType::PipelineOutput, "<I32>42</I32>".into()),
-    ));
-    transport.push(encode_message(
-        12,
-        &pipeline_state_message(PipelineState::Completed),
-    ));
-
     let mut pool = RunspacePool::open_with_transport(transport.clone())
         .await
         .unwrap();
     assert_eq!(pool.state(), RunspacePoolState::Opened);
-    let out = pool.run_script("whatever").await.unwrap();
+    let rpid = pool.id();
+    let pid = Uuid::new_v4();
+    transport.push(encode_message(
+        10,
+        &wire_msg_with(
+            MessageType::PipelineOutput,
+            "<S>hello</S>".into(),
+            rpid,
+            pid,
+        ),
+    ));
+    transport.push(encode_message(
+        11,
+        &wire_msg_with(
+            MessageType::PipelineOutput,
+            "<I32>42</I32>".into(),
+            rpid,
+            pid,
+        ),
+    ));
+    transport.push(encode_message(
+        12,
+        &pipeline_state_message(PipelineState::Completed, rpid, pid),
+    ));
+    let out = Pipeline::new("whatever")
+        .__with_forced_pid_for_test(pid)
+        .run(&mut pool)
+        .await
+        .unwrap();
     assert_eq!(out, vec![PsValue::String("hello".into()), PsValue::I32(42)]);
     pool.close().await.unwrap();
     assert!(*transport.closed.lock().unwrap());
@@ -128,31 +147,35 @@ async fn open_pool_and_run_script() {
 async fn pipeline_with_command_builder() {
     let transport = VecTransport::new();
     transport.push(encode_message(1, &opened_state_message()));
+    let mut pool = RunspacePool::open_with_transport(transport.clone())
+        .await
+        .unwrap();
+    let rpid = pool.id();
+    let pid = Uuid::new_v4();
     transport.push(encode_message(
         2,
-        &wire_msg(
+        &wire_msg_with(
             MessageType::PipelineOutput,
             to_clixml(&PsValue::Object(
                 PsObject::new()
                     .with("Name", PsValue::String("svchost".into()))
                     .with("Id", PsValue::I32(1234)),
             )),
+            rpid,
+            pid,
         ),
     ));
     transport.push(encode_message(
         3,
-        &pipeline_state_message(PipelineState::Completed),
+        &pipeline_state_message(PipelineState::Completed, rpid, pid),
     ));
-
-    let mut pool = RunspacePool::open_with_transport(transport.clone())
-        .await
-        .unwrap();
 
     let pipeline = Pipeline::empty()
         .add_command(
             Command::new("Get-Process").with_parameter("Name", PsValue::String("svchost".into())),
         )
-        .add_command(Command::new("Select-Object").with_parameter("First", PsValue::I32(1)));
+        .add_command(Command::new("Select-Object").with_parameter("First", PsValue::I32(1)))
+        .__with_forced_pid_for_test(pid);
 
     let result = pipeline.run_all_streams(&mut pool).await.unwrap();
     assert_eq!(result.state, PipelineState::Completed);

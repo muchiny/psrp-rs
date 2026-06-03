@@ -4,6 +4,36 @@ All notable changes to `psrp-rs` are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-06-03
+
+### Added
+
+- **SSH transport host-key verification**: new `HostKeyPolicy` enum on
+  `SshConfig` with three modes — `KnownHosts` (default, consults
+  `~/.ssh/known_hosts`), `Pinned` (accept only a key matching a given
+  SHA-256 fingerprint), and `AcceptAny` (disables verification,
+  opt-in only). Includes a `known_hosts` parser with glob host-pattern
+  matching, hashed-host support, and constant-time key comparison.
+- **Runspace pool state-machine validation**: `is_legal_server_transition`
+  rejects illegal server-driven `RunspacePoolState` transitions
+  (skipping negotiation, resurrecting a closed pool, etc.).
+
+### Changed
+
+- **CreatePipeline CLIXML construction** moved out of `pipeline.rs` into
+  `clixml/encode.rs`, consolidating CLIXML fragment building in one place.
+
+### Security
+
+- Key material in `crypto` and `shared` is now wrapped with
+  `ZeroizeOnDrop` and explicitly `zeroize()`d after use, so session and
+  exchange keys are scrubbed from memory on drop.
+
+### Dependencies
+
+- Added `zeroize` (with `zeroize_derive`); added `hmac` under the `ssh`
+  feature for hashed `known_hosts` entry matching.
+
 ## [1.0.0] — 2026-04-12
 
 ### Added

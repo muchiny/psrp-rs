@@ -784,6 +784,10 @@ mod tests {
     // ---------- Phase D coverage tests ----------
 
     fn host_call_bytes(ci: i64, mi: i64, mp: PsValue) -> Vec<u8> {
+        host_call_bytes_with(ci, mi, mp, Uuid::nil(), Uuid::nil())
+    }
+
+    fn host_call_bytes_with(ci: i64, mi: i64, mp: PsValue, rpid: Uuid, pid: Uuid) -> Vec<u8> {
         let obj = PsObject::new()
             .with("ci", PsValue::I64(ci))
             .with("mi", PsValue::I64(mi))
@@ -792,8 +796,8 @@ mod tests {
         PsrpMessage {
             destination: Destination::Client,
             message_type: MessageType::RunspacePoolHostCall,
-            rpid: Uuid::nil(),
-            pid: Uuid::nil(),
+            rpid,
+            pid,
             data: body,
         }
         .encode()
@@ -816,13 +820,11 @@ mod tests {
     async fn host_call_dispatches_write_line_and_swallows_message() {
         let t = MockTransport::new();
         let host = crate::host::BufferedHost::new();
-        // Queue: host call (write_line), then RunspacePoolState=Opened so
-        // the opening handshake has something to latch onto.
-        // Actually: opened_pool_with_host pushes Opened at the FRONT so
-        // it's consumed by the handshake; after that, any queued host
-        // call will be surfaced by the first `run_script` call. Instead
-        // we call `next_message` directly via run_script + pipeline
-        // completion.
+        let mut pool = opened_pool_with_host(&t, Arc::new(host.clone())).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
+        // Host call (RunspacePoolHostCall): pool intercepts it before the
+        // pipeline filter, so the embedded pid does not need to match.
         t.push_incoming(wire(
             2,
             &host_call_bytes(
@@ -831,15 +833,15 @@ mod tests {
                 PsValue::List(vec![PsValue::String("hello from host".into())]),
             ),
         ));
-        // Pipeline output + state so that run_script returns cleanly
-        // after the host call has been intercepted.
+        // Pipeline output + state must carry our pipeline's rpid/pid so
+        // they pass the pipeline-level pid filter.
         t.push_incoming(wire(
             3,
             &PsrpMessage {
                 destination: Destination::Client,
                 message_type: MessageType::PipelineOutput,
-                rpid: Uuid::nil(),
-                pid: Uuid::nil(),
+                rpid,
+                pid,
                 data: "<I32>1</I32>".into(),
             }
             .encode(),
@@ -849,8 +851,8 @@ mod tests {
             &PsrpMessage {
                 destination: Destination::Client,
                 message_type: MessageType::PipelineState,
-                rpid: Uuid::nil(),
-                pid: Uuid::nil(),
+                rpid,
+                pid,
                 data: to_clixml(&PsValue::Object(PsObject::new().with(
                     "PipelineState",
                     PsValue::I32(crate::pipeline::PipelineState::Completed as i32),
@@ -858,9 +860,11 @@ mod tests {
             }
             .encode(),
         ));
-
-        let mut pool = opened_pool_with_host(&t, Arc::new(host.clone())).await;
-        let out = pool.run_script("irrelevant").await.unwrap();
+        let out = crate::pipeline::Pipeline::new("irrelevant")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await
+            .unwrap();
         assert_eq!(out, vec![PsValue::I32(1)]);
         // The host received the WriteLine.
         assert_eq!(host.lines(), vec!["hello from host".to_string()]);
@@ -873,6 +877,9 @@ mod tests {
     #[tokio::test]
     async fn host_call_read_line_sends_error_response() {
         let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(crate::host::NoInteractionHost)).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         // ReadLine with NoInteractionHost will be rejected and the pool
         // should ship an error response so the server doesn't hang.
         t.push_incoming(wire(
@@ -888,8 +895,8 @@ mod tests {
             &PsrpMessage {
                 destination: Destination::Client,
                 message_type: MessageType::PipelineState,
-                rpid: Uuid::nil(),
-                pid: Uuid::nil(),
+                rpid,
+                pid,
                 data: to_clixml(&PsValue::Object(PsObject::new().with(
                     "PipelineState",
                     PsValue::I32(crate::pipeline::PipelineState::Completed as i32),
@@ -897,9 +904,10 @@ mod tests {
             }
             .encode(),
         ));
-
-        let mut pool = opened_pool_with_host(&t, Arc::new(crate::host::NoInteractionHost)).await;
-        let _ = pool.run_script("irrelevant").await;
+        let _ = crate::pipeline::Pipeline::new("irrelevant")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await;
         // open (2) + CreatePipeline (1) + HostResponse error (1) = 4
         assert_eq!(t.sent().len(), 4);
         let _ = pool.close().await;
@@ -918,6 +926,9 @@ mod tests {
         }
 
         let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(YesHost)).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         t.push_incoming(wire(
             2,
             &host_call_bytes(
@@ -931,8 +942,8 @@ mod tests {
             &PsrpMessage {
                 destination: Destination::Client,
                 message_type: MessageType::PipelineState,
-                rpid: Uuid::nil(),
-                pid: Uuid::nil(),
+                rpid,
+                pid,
                 data: to_clixml(&PsValue::Object(PsObject::new().with(
                     "PipelineState",
                     PsValue::I32(crate::pipeline::PipelineState::Completed as i32),
@@ -940,8 +951,10 @@ mod tests {
             }
             .encode(),
         ));
-        let mut pool = opened_pool_with_host(&t, Arc::new(YesHost)).await;
-        let _ = pool.run_script("irrelevant").await;
+        let _ = crate::pipeline::Pipeline::new("irrelevant")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await;
         // open + CreatePipeline + HostResponse success = 4
         assert_eq!(t.sent().len(), 4);
         let _ = pool.close().await;
@@ -1102,5 +1115,26 @@ mod tests {
         assert!(err.contains("<I64 N=\"ci\">3</I64>"));
         assert!(err.contains("<I64 N=\"mi\">51</I64>"));
         assert!(err.contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn request_session_key_is_idempotent_when_key_already_set() {
+        // Once a session key is in place, request_session_key must
+        // short-circuit: no PublicKey message is sent, and the function
+        // does not block waiting for an EncryptedSessionKey reply (which
+        // would deadlock the test against an empty mock inbox).
+        let t = MockTransport::new();
+        t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Opened)));
+        let mut pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
+        pool.set_session_key(crate::crypto::SessionKey::from_bytes([9u8; 32]));
+        let sent_before = t.sent().len();
+        // Must return Ok promptly. If the early-return check were
+        // missing, this would hang trying to recv from the empty inbox
+        // (or, more precisely, return a synthetic completion message
+        // and loop). The test would then time out.
+        pool.request_session_key().await.unwrap();
+        // No new outgoing PublicKey fragment.
+        assert_eq!(t.sent().len(), sent_before);
+        let _ = pool.close().await;
     }
 }

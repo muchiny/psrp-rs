@@ -167,10 +167,19 @@ impl RunspacePoolStateMachine {
     /// Returns `Ok(())` on a valid transition. Unknown message types are
     /// silently ignored. A `RunspacePoolState=Broken/Closed` received
     /// during the opening handshake is reported as a protocol error.
+    /// Server-driven transitions that violate the MS-PSRP §2.2.3.4
+    /// lifecycle are rejected with `PsrpError::Protocol` so a malicious
+    /// or buggy server cannot push the client into an arbitrary state.
     pub fn on_message(&mut self, msg: &PsrpMessage) -> Result<()> {
         match msg.message_type {
             MessageType::RunspacePoolState => {
                 let new_state = extract_runspace_state(&msg.data)?;
+                if !is_legal_server_transition(self.state, new_state) {
+                    return Err(PsrpError::protocol(format!(
+                        "illegal RunspacePool transition {:?} -> {:?}",
+                        self.state, new_state
+                    )));
+                }
                 self.state = new_state;
                 match new_state {
                     RunspacePoolState::Broken | RunspacePoolState::Closed => {
@@ -211,6 +220,45 @@ impl RunspacePoolStateMachine {
     pub fn mark_closed(&mut self) {
         self.state = RunspacePoolState::Closed;
     }
+}
+
+/// Whether the server is allowed to drive the pool from `from` into `to`.
+///
+/// Mirrors MS-PSRP §2.2.3.4. The client never accepts a server-asserted
+/// transition that skips negotiation steps or jumps from a closed pool
+/// back to an open one — a malicious server attempting that gets a
+/// protocol error rather than a silently-mutated state machine.
+fn is_legal_server_transition(from: RunspacePoolState, to: RunspacePoolState) -> bool {
+    use RunspacePoolState::{
+        BeforeOpen, Broken, Closed, Closing, Connecting, Disconnected, Disconnecting,
+        NegotiationSent, NegotiationSucceeded, Opened, Opening,
+    };
+    if from == to {
+        return true;
+    }
+    // Broken is reachable from any non-terminal state — the server can
+    // always inform us that the runspace died.
+    if to == Broken && !matches!(from, Closed) {
+        return true;
+    }
+    matches!(
+        (from, to),
+        (BeforeOpen, Opening | NegotiationSent)
+            | (Opening, NegotiationSent | NegotiationSucceeded | Opened)
+            | (
+                NegotiationSent,
+                NegotiationSucceeded | Opened | Closed | Disconnected
+            )
+            | (NegotiationSucceeded, Opened | Closed | Disconnected)
+            | (Opened, Closing | Closed | Disconnecting | Disconnected)
+            | (Closing, Closed)
+            | (Disconnecting, Disconnected)
+            | (Disconnected, Connecting)
+            | (
+                Connecting,
+                NegotiationSent | NegotiationSucceeded | Opened | Disconnected
+            )
+    )
 }
 
 pub(crate) fn session_capability_xml() -> String {
@@ -494,5 +542,72 @@ mod tests {
         assert!(xml.contains("<Version N=\"protocolversion\">"));
         assert!(xml.contains("<Version N=\"SerializationVersion\">"));
         assert!(!xml.contains("<S N=\"PSVersion\">"));
+    }
+
+    #[test]
+    fn rejects_server_skipping_negotiation_to_opened() {
+        // Fresh machine, no `open()` call: state is BeforeOpen. Server
+        // pushing Opened directly should be rejected, not silently
+        // accepted as it was previously.
+        let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+        let err = m
+            .on_message(&state_msg(RunspacePoolState::Opened))
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)));
+        assert_eq!(m.state(), RunspacePoolState::BeforeOpen);
+    }
+
+    #[test]
+    fn rejects_server_resurrecting_closed_pool() {
+        let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+        m.mark_closed();
+        let err = m
+            .on_message(&state_msg(RunspacePoolState::Opened))
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)));
+        assert_eq!(m.state(), RunspacePoolState::Closed);
+    }
+
+    #[test]
+    fn rejects_server_jumping_opened_to_negotiation() {
+        let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+        m.open();
+        m.on_message(&state_msg(RunspacePoolState::Opened)).unwrap();
+        let err = m
+            .on_message(&state_msg(RunspacePoolState::NegotiationSent))
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)));
+        assert_eq!(m.state(), RunspacePoolState::Opened);
+    }
+
+    #[test]
+    fn legal_negotiation_then_opened_path() {
+        let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+        m.open();
+        m.on_message(&state_msg(RunspacePoolState::NegotiationSucceeded))
+            .unwrap();
+        m.on_message(&state_msg(RunspacePoolState::Opened)).unwrap();
+        assert!(m.is_opened());
+    }
+
+    #[test]
+    fn broken_always_reachable_from_non_closed() {
+        for from in [
+            RunspacePoolState::BeforeOpen,
+            RunspacePoolState::NegotiationSent,
+            RunspacePoolState::NegotiationSucceeded,
+            RunspacePoolState::Opened,
+            RunspacePoolState::Disconnected,
+            RunspacePoolState::Connecting,
+        ] {
+            assert!(
+                is_legal_server_transition(from, RunspacePoolState::Broken),
+                "broken should be reachable from {from:?}"
+            );
+        }
+        assert!(!is_legal_server_transition(
+            RunspacePoolState::Closed,
+            RunspacePoolState::Broken
+        ));
     }
 }

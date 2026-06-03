@@ -29,6 +29,7 @@ use rand::RngCore;
 use rsa::traits::PublicKeyParts;
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{PsrpError, Result};
 
@@ -109,11 +110,12 @@ impl ClientSessionKey {
     /// 32-byte AES key.
     pub fn decrypt_session_key(&self, ciphertext: &[u8]) -> Result<[u8; 32]> {
         let padding = Oaep::new::<Sha1>();
-        let decrypted = self
+        let mut decrypted = self
             .private
             .decrypt(padding, ciphertext)
             .map_err(|e| PsrpError::protocol(format!("session key unwrap: {e}")))?;
         if decrypted.len() != 32 {
+            decrypted.zeroize();
             return Err(PsrpError::protocol(format!(
                 "session key: expected 32 bytes, got {}",
                 decrypted.len()
@@ -121,15 +123,26 @@ impl ClientSessionKey {
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(&decrypted);
+        decrypted.zeroize();
         Ok(out)
     }
 }
 
 /// A negotiated AES-256-CBC session key ready for `SecureString`
 /// encryption / decryption.
-#[derive(Debug, Clone)]
+///
+/// Key bytes are zeroized when the value is dropped.
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct SessionKey {
     key: [u8; 32],
+}
+
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionKey")
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SessionKey {
