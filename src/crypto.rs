@@ -23,8 +23,8 @@
 //! [`crate::runspace::RunspacePool::request_session_key`].
 
 use aes::Aes256;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::Array;
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use rand::RngCore;
 use rsa::traits::PublicKeyParts;
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
@@ -176,7 +176,7 @@ impl SessionKey {
 
         let mut iv = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut iv);
-        let cipher = Aes256::new(GenericArray::from_slice(&self.key));
+        let cipher = Aes256::new(&Array::from(self.key));
 
         // CBC: for each block, XOR with previous ciphertext (or IV for
         // the first block) then encrypt.
@@ -188,9 +188,9 @@ impl SessionKey {
             for i in 0..16 {
                 block[i] = chunk[i] ^ prev[i];
             }
-            let mut ga = GenericArray::clone_from_slice(&block);
+            let mut ga = Array::from(block);
             cipher.encrypt_block(&mut ga);
-            prev.copy_from_slice(ga.as_slice());
+            prev.copy_from_slice(ga.as_ref());
             out.extend_from_slice(&prev);
         }
         out
@@ -202,12 +202,13 @@ impl SessionKey {
             return Err(PsrpError::protocol("secure string payload malformed"));
         }
         let (iv, ct) = payload.split_at(16);
-        let cipher = Aes256::new(GenericArray::from_slice(&self.key));
+        let cipher = Aes256::new(&Array::from(self.key));
 
         let mut prev: [u8; 16] = iv.try_into().unwrap();
         let mut pt = Vec::with_capacity(ct.len());
         for chunk in ct.chunks_exact(16) {
-            let mut ga = GenericArray::clone_from_slice(chunk);
+            let block: [u8; 16] = chunk.try_into().unwrap();
+            let mut ga = Array::from(block);
             cipher.decrypt_block(&mut ga);
             let mut block = [0u8; 16];
             for i in 0..16 {

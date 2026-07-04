@@ -34,7 +34,7 @@ uuid = { version = "1", features = ["v4"] }
 indexmap = { version = "2" }
 async-trait = "0.1"
 rsa = { version = "0.9", default-features = false, features = ["sha1"] }
-aes = "0.8"
+aes = "0.9"
 sha1 = { version = "0.10", default-features = false }
 rand = "0.8"
 zeroize = { version = "1", features = ["zeroize_derive"] }
