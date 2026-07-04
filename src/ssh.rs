@@ -51,9 +51,11 @@ use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use russh::ChannelMsg;
 use russh::keys::key::PrivateKeyWithHashAlg;
+use russh::keys::ssh_key::{
+    self, HashAlg,
+    known_hosts::{Entry, HostPatterns, KnownHosts, Marker},
+};
 use sha1::Sha1;
-use ssh_key::HashAlg;
-use ssh_key::known_hosts::{Entry, HostPatterns, KnownHosts, Marker};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -149,7 +151,6 @@ struct ClientHandler {
     policy: HostKeyPolicy,
 }
 
-#[async_trait]
 impl russh::client::Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -218,10 +219,9 @@ impl SshPsrpTransport {
                 .await
                 .map_err(|e| PsrpError::protocol(format!("SSH password auth: {e}")))?,
             SshAuth::PrivateKey { path, passphrase } => {
-                let private_key = russh_keys::load_secret_key(path, passphrase.as_deref())
+                let private_key = russh::keys::load_secret_key(path, passphrase.as_deref())
                     .map_err(|e| PsrpError::protocol(format!("SSH key load: {e}")))?;
-                let key = PrivateKeyWithHashAlg::new(Arc::new(private_key), None)
-                    .map_err(|e| PsrpError::protocol(format!("SSH key prep: {e}")))?;
+                let key = PrivateKeyWithHashAlg::new(Arc::new(private_key), None);
                 handle
                     .authenticate_publickey(&config.username, key)
                     .await
@@ -234,7 +234,7 @@ impl SshPsrpTransport {
             }
         };
 
-        if !authenticated {
+        if !authenticated.success() {
             return Err(PsrpError::protocol("SSH authentication failed"));
         }
         debug!("SSH: authenticated");
