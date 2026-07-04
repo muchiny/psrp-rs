@@ -511,7 +511,25 @@ fn read_text(reader: &mut Reader<&[u8]>, closing: &str) -> Result<String> {
             .map_err(|e| PsrpError::clixml(e.to_string()))?
         {
             Event::Text(t) => {
-                out.push_str(&t.unescape().map_err(|e| PsrpError::clixml(e.to_string()))?);
+                out.push_str(&t.decode().map_err(|e| PsrpError::clixml(e.to_string()))?);
+            }
+            Event::GeneralRef(r) => {
+                if let Some(c) = r
+                    .resolve_char_ref()
+                    .map_err(|e| PsrpError::clixml(e.to_string()))?
+                {
+                    out.push(c);
+                } else {
+                    let name = r.decode().map_err(|e| PsrpError::clixml(e.to_string()))?;
+                    match quick_xml::escape::resolve_predefined_entity(&name) {
+                        Some(s) => out.push_str(s),
+                        None => {
+                            return Err(PsrpError::clixml(format!(
+                                "unknown entity reference &{name};"
+                            )));
+                        }
+                    }
+                }
             }
             Event::CData(c) => {
                 out.push_str(
