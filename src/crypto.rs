@@ -183,7 +183,7 @@ impl SessionKey {
         let mut out = Vec::with_capacity(16 + padded.len());
         out.extend_from_slice(&iv);
         let mut prev: [u8; 16] = iv;
-        for chunk in padded.chunks_exact(16) {
+        for chunk in padded.as_chunks::<16>().0 {
             let mut block = [0u8; 16];
             for i in 0..16 {
                 block[i] = chunk[i] ^ prev[i];
@@ -206,9 +206,8 @@ impl SessionKey {
 
         let mut prev: [u8; 16] = iv.try_into().unwrap();
         let mut pt = Vec::with_capacity(ct.len());
-        for chunk in ct.chunks_exact(16) {
-            let block: [u8; 16] = chunk.try_into().unwrap();
-            let mut ga = Array::from(block);
+        for chunk in ct.as_chunks::<16>().0 {
+            let mut ga = Array::from(*chunk);
             cipher.decrypt_block(&mut ga);
             let mut block = [0u8; 16];
             for i in 0..16 {
@@ -238,8 +237,10 @@ impl SessionKey {
             ));
         }
         let units: Vec<u16> = pt
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         String::from_utf16(&units)
             .map_err(|e| PsrpError::protocol(format!("secure string UTF-16: {e}")))

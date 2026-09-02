@@ -600,7 +600,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
         return Err(PsrpError::protocol("hex: odd length"));
     }
     let mut out = Vec::with_capacity(clean.len() / 2);
-    for pair in clean.as_bytes().chunks_exact(2) {
+    for pair in clean.as_bytes().as_chunks::<2>().0 {
         let hi = hex_digit(pair[0])?;
         let lo = hex_digit(pair[1])?;
         out.push((hi << 4) | lo);

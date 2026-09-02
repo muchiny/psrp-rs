@@ -4,6 +4,30 @@ All notable changes to `psrp-rs` are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **MSRV raised to 1.98** (`rust-version = "1.98"`), plus a
+  `rust-toolchain.toml` pinning the `stable` channel with `clippy` and
+  `rustfmt` for day-to-day work.
+- **`quick-xml` 0.41 → 0.42.** The 0.42 event API is `str`-based instead
+  of `[u8]`-based: `QName::as_ref`, `Attribute::key`/`value`,
+  `BytesText`, `BytesCData` and `BytesRef` all yield `str` now.
+  `clixml/decode.rs` was ported accordingly — behaviour is unchanged.
+- **`russh` 0.62 → 0.63** (`ssh` feature). `Handler::check_server_key`
+  now receives a `PublicKeyOrCertificate`. OpenSSH host *certificates*
+  are refused (fail-closed) under every policy except
+  `HostKeyPolicy::AcceptAny`, because the crate has no CA trust store.
+- Routine bumps: `tokio` 1.53, `tokio-util` 0.7.19, `uuid` 1.26,
+  `thiserror` 2.0.20, `indexmap` 2.14.1, `serde` 1.0.229, `aes` 0.9.3,
+  `async-trait` 0.1.92.
+- `hmac`, `rand` and `sha1` deliberately stay on the pre-`digest 0.11`
+  generation (0.12 / 0.8 / 0.10): `rsa` 0.9 — the only stable release —
+  pins `digest 0.10` and `rand_core 0.6`. Moving them would require
+  `rsa 0.10.0-rc`, a pre-release that carries the *same* open advisory
+  (RUSTSEC-2023-0071) and therefore buys no security.
+
 ## [1.1.0] — 2026-06-03
 
 ### Added

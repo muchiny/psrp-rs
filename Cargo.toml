@@ -2,7 +2,7 @@
 name = "psrp-rs"
 version = "1.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 authors = ["Wernert Loïc <45450136+muchiny@users.noreply.github.com>"]
 description = "Async PowerShell Remoting Protocol (MS-PSRP) client for Rust, built on winrm-rs."
@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 tracing = "0.1"
-quick-xml = "0.41"
+quick-xml = "0.42"
 uuid = { version = "1", features = ["v4"] }
 indexmap = { version = "2" }
 async-trait = "0.1"
@@ -39,7 +39,7 @@ sha1 = { version = "0.10", default-features = false }
 rand = "0.8"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 serde = { version = "1", features = ["derive"], optional = true }
-russh = { version = "0.62", optional = true }
+russh = { version = "0.63", optional = true }
 hmac = { version = "0.12", optional = true }
 
 [dev-dependencies]

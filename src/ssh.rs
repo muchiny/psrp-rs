@@ -50,6 +50,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use russh::ChannelMsg;
+use russh::keys::PublicKeyOrCertificate;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::ssh_key::{
     self, HashAlg,
@@ -154,11 +155,34 @@ struct ClientHandler {
 impl russh::client::Handler for ClientHandler {
     type Error = russh::Error;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "signature is fixed by russh::client::Handler"
+    )]
     async fn check_server_key(
         &mut self,
-        server_public_key: &ssh_key::PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> std::result::Result<bool, Self::Error> {
-        match verify_host_key(&self.policy, &self.host, self.port, server_public_key) {
+        // russh >= 0.63 hands us either a bare host key or an OpenSSH
+        // host certificate. We have no CA trust store, so a certificate
+        // cannot be validated and is refused unless the caller has
+        // explicitly opted out of host-key checking altogether.
+        let key = match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            PublicKeyOrCertificate::Certificate(cert) => {
+                if matches!(self.policy, HostKeyPolicy::AcceptAny) {
+                    return Ok(true);
+                }
+                warn!(
+                    host = %self.host,
+                    port = self.port,
+                    issuer = %cert.key_id(),
+                    "SSH host certificate rejected: certificate authorities are not supported"
+                );
+                return Ok(false);
+            }
+        };
+        match verify_host_key(&self.policy, &self.host, self.port, key) {
             Ok(()) => Ok(true),
             Err(reason) => {
                 warn!(host = %self.host, port = self.port, %reason, "SSH host-key rejected");

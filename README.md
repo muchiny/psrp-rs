@@ -5,7 +5,7 @@ Async [PowerShell Remoting Protocol (MS-PSRP)](https://learn.microsoft.com/en-us
 [![Crates.io](https://img.shields.io/crates/v/psrp-rs.svg)](https://crates.io/crates/psrp-rs)
 [![docs.rs](https://img.shields.io/docsrs/psrp-rs)](https://docs.rs/psrp-rs)
 [![License](https://img.shields.io/crates/l/psrp-rs.svg)](LICENSE-MIT)
-[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2026/03/20/Rust-1.94.0.html)
+[![MSRV](https://img.shields.io/badge/MSRV-1.98-blue.svg)](https://blog.rust-lang.org/)
 
 ```rust
 use psrp_rs::{RunspacePool, WinrmPsrpTransport};
