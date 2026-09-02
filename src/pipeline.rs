@@ -682,7 +682,7 @@ impl<T: PsrpTransport> PipelineHandle<'_, T> {
     }
 }
 
-fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
+pub(crate) fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
     let parsed = parse_clixml(xml)?;
     for v in parsed {
         if let PsValue::Object(obj) = v
@@ -694,7 +694,7 @@ fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
     Err(PsrpError::protocol("missing PipelineState property"))
 }
 
-fn describe_errors(errors: &[PsValue]) -> String {
+pub(crate) fn describe_errors(errors: &[PsValue]) -> String {
     if errors.is_empty() {
         return "unknown error".into();
     }

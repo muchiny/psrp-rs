@@ -594,7 +594,7 @@ impl DisconnectedPool {
     }
 }
 
-fn hex_decode(s: &str) -> Result<Vec<u8>> {
+pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>> {
     let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     if clean.len() % 2 != 0 {
         return Err(PsrpError::protocol("hex: odd length"));
@@ -617,7 +617,7 @@ fn hex_digit(b: u8) -> Result<u8> {
     }
 }
 
-fn build_host_response_body(ci: i64, mi: i64, value: &PsValue) -> String {
+pub(crate) fn build_host_response_body(ci: i64, mi: i64, value: &PsValue) -> String {
     let obj = PsObject::new()
         .with("ci", PsValue::I64(ci))
         .with("mi", PsValue::I64(mi))
@@ -625,7 +625,7 @@ fn build_host_response_body(ci: i64, mi: i64, value: &PsValue) -> String {
     to_clixml(&PsValue::Object(obj))
 }
 
-fn build_host_response_error_body(ci: i64, mi: i64, message: &str) -> String {
+pub(crate) fn build_host_response_error_body(ci: i64, mi: i64, message: &str) -> String {
     let exception = PsObject::new()
         .with("Message", PsValue::String(message.to_string()))
         .with_type_names(["System.Exception"]);

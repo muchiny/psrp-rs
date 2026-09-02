@@ -51,6 +51,10 @@ uuid = { version = "1", features = ["v4"] }
 default = []
 ssh = ["dep:russh", "dep:hmac"]
 serde = ["dep:serde", "uuid/serde", "indexmap/serde"]
+# Internal-only. Re-exports crate internals needed by `fuzz/` targets
+# through the `internal` module. NOT part of the public API — any item
+# behind this feature may change or disappear without a SemVer bump.
+__internal = []
 
 [lints.rust]
 unsafe_code = "forbid"

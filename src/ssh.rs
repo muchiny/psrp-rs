@@ -443,7 +443,7 @@ fn host_matches_entry(entry: &Entry, host: &str, port: u16) -> bool {
 /// * `[host]:port` syntax for non-default ports
 /// * `!pattern` negation — a single negation wins over any positive
 ///   match on the same line, mirroring ssh(1) behaviour
-fn host_matches_patterns(patterns: &[String], host: &str, port: u16) -> bool {
+pub(crate) fn host_matches_patterns(patterns: &[String], host: &str, port: u16) -> bool {
     let mut positive = false;
     for raw in patterns {
         let (negate, pattern) = match raw.strip_prefix('!') {
@@ -470,7 +470,7 @@ fn host_matches_patterns(patterns: &[String], host: &str, port: u16) -> bool {
     positive
 }
 
-fn parse_pattern_host_port(pattern: &str) -> (&str, Option<u16>) {
+pub(crate) fn parse_pattern_host_port(pattern: &str) -> (&str, Option<u16>) {
     if let Some(rest) = pattern.strip_prefix('[') {
         if let Some((host, port_str)) = rest.split_once("]:") {
             if let Ok(p) = port_str.parse::<u16>() {
@@ -481,33 +481,67 @@ fn parse_pattern_host_port(pattern: &str) -> (&str, Option<u16>) {
     (pattern, None)
 }
 
-fn glob_match(pattern: &str, target: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, target: &str) -> bool {
     glob_match_bytes(pattern.as_bytes(), target.as_bytes())
 }
 
+/// Iterative wildcard match with a single backtrack point.
+///
+/// The obvious recursive formulation ("on `*`, try every split") is
+/// exponential: `*a*a*a*a*b` against a long run of `a`s explores every
+/// way of distributing the target across the stars, and it recurses once
+/// per target byte on top of that. Since patterns come from a
+/// `known_hosts` file and the host name comes from the connection being
+/// validated, that turns host-key verification into a denial of service
+/// — the connection hangs instead of being accepted or refused.
+///
+/// This version keeps one backtrack position (the most recent `*` and
+/// how much of the target it had consumed), which is enough for a
+/// pattern language with only `*` and `?`. Worst case is `O(n * m)`
+/// with no recursion at all.
 fn glob_match_bytes(pattern: &[u8], target: &[u8]) -> bool {
-    match (pattern.first(), target.first()) {
-        (None, None) => true,
-        (None, Some(_)) => false,
-        (Some(b'*'), _) => {
-            // Greedy: try every split.
-            if glob_match_bytes(&pattern[1..], target) {
-                return true;
+    let mut p = 0usize;
+    let mut t = 0usize;
+    // Position just past the last `*` seen, and how far the target had
+    // advanced when we saw it.
+    let mut star: Option<usize> = None;
+    let mut star_target = 0usize;
+
+    while t < target.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                p += 1;
+                star = Some(p);
+                star_target = t;
             }
-            if target.is_empty() {
-                return false;
+            Some(b'?') => {
+                p += 1;
+                t += 1;
             }
-            glob_match_bytes(pattern, &target[1..])
+            Some(c) if c.eq_ignore_ascii_case(&target[t]) => {
+                p += 1;
+                t += 1;
+            }
+            // Mismatch: let the last `*` swallow one more target byte.
+            _ => match star {
+                Some(resume) => {
+                    p = resume;
+                    star_target += 1;
+                    t = star_target;
+                }
+                None => return false,
+            },
         }
-        (Some(b'?'), Some(_)) => glob_match_bytes(&pattern[1..], &target[1..]),
-        (Some(p), Some(t)) if p.eq_ignore_ascii_case(t) => {
-            glob_match_bytes(&pattern[1..], &target[1..])
-        }
-        _ => false,
     }
+
+    // The target is exhausted; only trailing `*`s may remain.
+    while pattern.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
-fn host_matches_hashed(salt: &[u8], expected: &[u8; 20], host: &str) -> bool {
+pub(crate) fn host_matches_hashed(salt: &[u8], expected: &[u8; 20], host: &str) -> bool {
     let mut mac = match Hmac::<Sha1>::new_from_slice(salt) {
         Ok(m) => m,
         Err(_) => return false,
@@ -517,7 +551,7 @@ fn host_matches_hashed(salt: &[u8], expected: &[u8; 20], host: &str) -> bool {
     constant_time_eq(computed.as_slice(), expected)
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -572,6 +606,40 @@ mod tests {
         assert!(!glob_match("*.example.com", "example.com"));
         assert!(glob_match("h?st", "host"));
         assert!(!glob_match("h?st", "hoost"));
+    }
+
+    #[test]
+    fn glob_matches_star_edge_cases() {
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("**", "anything"));
+        assert!(glob_match("a*", "a"));
+        assert!(glob_match("*a", "a"));
+        assert!(glob_match("a*b*c", "abc"));
+        assert!(glob_match("a*b*c", "axxbyyc"));
+        assert!(!glob_match("a*b*c", "axxbyy"));
+        assert!(!glob_match("*?", ""));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+        // A `*` must still be able to consume nothing at the very end.
+        assert!(glob_match("host*", "host"));
+    }
+
+    /// Regression: the previous recursive matcher explored every way of
+    /// splitting the target across the stars, so this pattern took
+    /// exponential time and hung host-key verification. Found by the
+    /// `known_hosts_match` fuzz target.
+    #[test]
+    fn glob_match_is_not_exponential() {
+        let pattern = "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+        let target = "a".repeat(256);
+        let start = std::time::Instant::now();
+        assert!(!glob_match(pattern, &target));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "glob_match took {:?} — backtracking blew up again",
+            start.elapsed()
+        );
     }
 
     #[test]

@@ -57,38 +57,63 @@ pub fn parse_clixml(xml: &str) -> Result<Vec<PsValue>> {
     Ok(out)
 }
 
+/// Maximum `<Obj>` / `<LST>` / `<DCT>` nesting accepted from the wire.
+///
+/// The parser is recursive, and the document comes from the remote host:
+/// without a cap, ~10 KiB of `<Obj><MS>` repeated is enough to overflow
+/// the stack and **abort the process** — a stack overflow is not a
+/// catchable panic, so `forbid(unsafe_code)` buys nothing here.
+///
+/// 64 was measured as the deepest level that still fits comfortably in
+/// the 2 MiB stack of a Tokio worker thread in a debug build, and it is
+/// an order of magnitude more than PowerShell's own serializer ever
+/// emits (`Serialization.MaximumDepth` defaults to 1).
+pub const MAX_NESTING_DEPTH: u32 = 64;
+
 #[derive(Default)]
 struct DecoderState {
     refs: HashMap<String, PsValue>,
     type_names: HashMap<String, Vec<String>>,
+    /// Current nesting level, maintained by [`parse_element`].
+    depth: u32,
 }
 
+/// Read the `N="…"` property-name attribute.
+///
+/// The value is XML-unescaped and then run through the PowerShell
+/// `_xHHHH_` decoder, mirroring exactly what `encode::escape` did on the
+/// way out. Skipping either step corrupts any property name containing
+/// `&`, `<`, `>`, `"`, `'` or a control character — and because the
+/// re-encoder escapes the result again, the damage compounds on every
+/// hop (`&lt;` becomes `&amp;lt;` becomes `&amp;amp;lt;` …).
 fn name_attr(e: &BytesStart) -> Result<Option<String>> {
     for attr in e.attributes().flatten() {
         if attr.key.as_ref() == "N" {
-            return Ok(Some(attr.value.into_owned()));
+            let unescaped = attr
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(|err| PsrpError::clixml(err.to_string()))?;
+            return Ok(Some(decode_pwsh_escapes(&unescaped)));
         }
     }
     Ok(None)
 }
 
+/// Read the `RefId="…"` attribute of an `<Obj>` / `<TN>`.
 fn ref_id_attr(e: &BytesStart) -> Result<Option<String>> {
     for attr in e.attributes().flatten() {
         if attr.key.as_ref() == "RefId" {
-            return Ok(Some(attr.value.into_owned()));
+            let unescaped = attr
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(|err| PsrpError::clixml(err.to_string()))?;
+            return Ok(Some(unescaped.into_owned()));
         }
     }
     Ok(None)
 }
 
+/// Read the `RefId="…"` attribute of a `<Ref>` / `<TNRef>`.
 fn ref_ref_id_attr(e: &BytesStart) -> Result<Option<String>> {
-    // `<Ref RefId="…"/>`
-    for attr in e.attributes().flatten() {
-        if attr.key.as_ref() == "RefId" {
-            return Ok(Some(attr.value.into_owned()));
-        }
-    }
-    Ok(None)
+    ref_id_attr(e)
 }
 
 fn parse_empty(e: &BytesStart, _state: &mut DecoderState) -> Result<Option<PsValue>> {
@@ -120,7 +145,29 @@ fn parse_float(s: &str) -> std::result::Result<f64, String> {
     }
 }
 
+/// Depth-guarded entry point for element parsing.
+///
+/// Every recursion cycle in this module passes through here
+/// (`parse_element` → `parse_obj_body` → `parse_member_set` /
+/// `parse_list` / `parse_dict` → `parse_element`), so one counter is
+/// enough to bound them all.
 fn parse_element(
+    reader: &mut Reader<&[u8]>,
+    e: &BytesStart,
+    state: &mut DecoderState,
+) -> Result<Option<PsValue>> {
+    if state.depth >= MAX_NESTING_DEPTH {
+        return Err(PsrpError::clixml(format!(
+            "CLIXML nested deeper than {MAX_NESTING_DEPTH} levels"
+        )));
+    }
+    state.depth += 1;
+    let result = parse_element_inner(reader, e, state);
+    state.depth -= 1;
+    result
+}
+
+fn parse_element_inner(
     reader: &mut Reader<&[u8]>,
     e: &BytesStart,
     state: &mut DecoderState,
@@ -590,6 +637,68 @@ fn decode_pwsh_escapes(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Regression (found while fuzzing `clixml_decoder`): the parser is
+    /// recursive and the document is attacker-controlled, so ~10 KiB of
+    /// `<Obj><MS>` used to overflow the stack and abort the process.
+    #[test]
+    fn deep_nesting_is_rejected_not_fatal() {
+        use super::super::parse_clixml;
+        use super::MAX_NESTING_DEPTH;
+
+        let deep = |n: usize| "<Obj><MS>".repeat(n) + "<Nil/>" + &"</MS></Obj>".repeat(n);
+
+        // Comfortably inside the limit: still parses.
+        parse_clixml(&deep(MAX_NESTING_DEPTH as usize / 2)).expect("shallow document");
+
+        // Past it: a structured error, never a crash.
+        let err = parse_clixml(&deep(MAX_NESTING_DEPTH as usize + 5))
+            .expect_err("over-deep document must be rejected");
+        assert!(
+            err.to_string().contains("nested deeper"),
+            "unexpected error: {err}"
+        );
+
+        // And the pathological case that used to abort the process.
+        assert!(parse_clixml(&deep(20_000)).is_err());
+    }
+
+    // Regression (found by the `clixml_encode_decode` fuzz target):
+    // attribute values used to be taken raw, so a property name holding
+    // an XML metacharacter came back still escaped — and the encoder
+    // then escaped it again on the next hop.
+    #[test]
+    fn property_names_are_xml_unescaped() {
+        use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
+
+        let value = PsValue::Object(
+            PsObject::new()
+                .with("a<b", PsValue::I32(1))
+                .with("x&y", PsValue::I32(2))
+                .with("q\"r", PsValue::I32(3)),
+        );
+
+        let xml = to_clixml(&value);
+        let decoded = parse_clixml(&xml).expect("decodes");
+        assert_eq!(decoded[0], value, "property names were mangled");
+
+        // And the damage must not compound across hops.
+        let again = parse_clixml(&to_clixml(&decoded[0])).expect("decodes");
+        assert_eq!(again[0], value);
+    }
+
+    #[test]
+    fn property_names_decode_pwsh_escapes() {
+        use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
+
+        // `escape` turns control characters in a name into `_xHHHH_`;
+        // the decoder has to turn them back.
+        let value = PsValue::Object(PsObject::new().with("a\u{1}b", PsValue::Null));
+        let xml = to_clixml(&value);
+        assert!(xml.contains("_x0001_"), "encoder did not escape: {xml}");
+        let decoded = parse_clixml(&xml).expect("decodes");
+        assert_eq!(decoded[0], value);
+    }
+
     use super::super::encode::to_clixml;
     use super::*;
 

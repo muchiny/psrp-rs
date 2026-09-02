@@ -64,6 +64,8 @@ pub mod crypto;
 pub mod error;
 pub mod fragment;
 pub mod host;
+#[cfg(feature = "__internal")]
+pub mod internal;
 pub mod message;
 pub mod metadata;
 pub mod pipeline;
@@ -76,7 +78,7 @@ pub mod ssh;
 pub use ssh::{SshAuth, SshConfig, SshPsrpTransport};
 pub mod transport;
 
-pub use clixml::{PsObject, PsValue, RefIdAllocator, parse_clixml, to_clixml};
+pub use clixml::{MAX_NESTING_DEPTH, PsObject, PsValue, RefIdAllocator, parse_clixml, to_clixml};
 pub use crypto::{ClientSessionKey, SessionKey};
 pub use error::{PsrpError, Result};
 pub use host::{BufferedHost, HostCallKind, HostMethodId, NoInteractionHost, PsHost};

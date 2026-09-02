@@ -92,17 +92,34 @@ pub(crate) fn write_value_with(
         PsValue::Xml(s) => write_simple(out, "XD", &escape(s), name, false),
         PsValue::ScriptBlock(s) => write_simple(out, "SCT", &escape(s), name, false),
         PsValue::SecureString(s) => write_simple(out, "SS", &escape(s), name, false),
-        PsValue::List(items) => {
+        PsValue::List(_) | PsValue::Dict(_) => {
             open_obj(out, name, alloc);
+            write_container_body(out, value, alloc);
+            out.push_str("</Obj>");
+        }
+        PsValue::Object(obj) => write_object(out, obj, name, alloc),
+    }
+}
+
+/// Write the bare `<LST>` / `<DCT>` body of a container, without the
+/// enclosing `<Obj>`.
+///
+/// Split out of [`write_value_with`] because a container stored under an
+/// object's synthetic `_value` property is written *inside* that
+/// object's `<Obj>`, not wrapped in a second one — which is how the
+/// decoder spells it, and therefore the only spelling that round-trips.
+/// Returns `false` if `value` is not a container.
+fn write_container_body(out: &mut String, value: &PsValue, alloc: &RefIdAllocator) -> bool {
+    match value {
+        PsValue::List(items) => {
             out.push_str("<LST>");
             for item in items {
                 write_value_with(out, item, None, alloc);
             }
             out.push_str("</LST>");
-            out.push_str("</Obj>");
+            true
         }
         PsValue::Dict(entries) => {
-            open_obj(out, name, alloc);
             out.push_str("<DCT>");
             for (k, v) in entries {
                 out.push_str("<En>");
@@ -111,9 +128,9 @@ pub(crate) fn write_value_with(
                 out.push_str("</En>");
             }
             out.push_str("</DCT>");
-            out.push_str("</Obj>");
+            true
         }
-        PsValue::Object(obj) => write_object(out, obj, name, alloc),
+        _ => false,
     }
 }
 
@@ -137,7 +154,7 @@ fn write_simple(out: &mut String, tag: &str, body: &str, name: Option<&str>, sel
             out.push('<');
             out.push_str(tag);
             out.push_str(" N=\"");
-            out.push_str(&escape(n));
+            out.push_str(&escape_attr(n));
             out.push_str("\"/>");
         } else {
             out.push('<');
@@ -151,7 +168,7 @@ fn write_simple(out: &mut String, tag: &str, body: &str, name: Option<&str>, sel
             out.push('<');
             out.push_str(tag);
             out.push_str(" N=\"");
-            out.push_str(&escape(n));
+            out.push_str(&escape_attr(n));
             out.push_str("\">");
             out.push_str(body);
             out.push_str("</");
@@ -175,7 +192,7 @@ fn open_obj(out: &mut String, name: Option<&str>, alloc: &RefIdAllocator) {
     match name {
         Some(n) => {
             out.push_str("<Obj N=\"");
-            out.push_str(&escape(n));
+            out.push_str(&escape_attr(n));
             out.push_str(&format!("\" RefId=\"{id}\">"));
         }
         None => out.push_str(&format!("<Obj RefId=\"{id}\">")),
@@ -207,7 +224,13 @@ fn write_object(out: &mut String, obj: &PsObject, name: Option<&str>, alloc: &Re
         .filter(|(k, _)| k.as_str() != "_value")
         .collect();
     if let Some(v) = &value_prop {
-        write_value_with(out, v, None, alloc);
+        // A container under `_value` is emitted as a bare `<LST>` /
+        // `<DCT>` child. Routing it through `write_value_with` would wrap
+        // it in a second `<Obj>`, which the decoder skips as an unknown
+        // element — silently dropping the whole container.
+        if !write_container_body(out, v, alloc) {
+            write_value_with(out, v, None, alloc);
+        }
     }
     if !other_props.is_empty() {
         out.push_str("<MS>");
@@ -266,12 +289,28 @@ pub fn ps_host_info_null() -> PsValue {
     )
 }
 
-/// Escape a string for XML attribute / text content.
+/// Escape a string for XML **text** content.
 ///
-/// Control characters below 0x20 (except `\t`, `\n`, `\r`) are emitted as
-/// PowerShell's `_xHHHH_` escapes.
+/// Control characters below 0x20 (except `\t`, `\n`, `\r`, which XML
+/// text preserves verbatim) are emitted as PowerShell's `_xHHHH_`
+/// escapes.
 #[must_use]
 pub fn escape(s: &str) -> String {
+    escape_inner(s, false)
+}
+
+/// Escape a string for an XML **attribute value** (`N="…"`, `RefId="…"`).
+///
+/// Same as [`escape`] plus `\t`, `\n` and `\r`, which a conforming XML
+/// parser replaces with a space during attribute-value normalisation
+/// (XML 1.0 §3.3.3). Emitting them literally would therefore silently
+/// turn a tab in a property name into a space on the way back.
+#[must_use]
+pub fn escape_attr(s: &str) -> String {
+    escape_inner(s, true)
+}
+
+fn escape_inner(s: &str, attribute: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -280,6 +319,9 @@ pub fn escape(s: &str) -> String {
             '&' => out.push_str("&amp;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            '\t' | '\n' | '\r' if attribute => {
+                out.push_str(&format!("_x{:04X}_", c as u32));
+            }
             c if (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r' => {
                 out.push_str(&format!("_x{:04X}_", c as u32));
             }
@@ -589,6 +631,66 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    // Regression (found by the `clixml_encode_decode` fuzz target): a
+    // container stored under the synthetic `_value` property used to be
+    // written as `<Obj><Obj><LST/></Obj></Obj>`. The decoder skips the
+    // inner `<Obj>` as an unknown element, so the list was silently lost
+    // on the way back.
+    #[test]
+    fn value_property_container_is_written_bare() {
+        use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
+
+        let mut obj = PsObject::new();
+        obj.properties.insert(
+            "_value".into(),
+            PsValue::List(vec![PsValue::U8(0), PsValue::String("x".into())]),
+        );
+        let value = PsValue::Object(obj);
+
+        let xml = to_clixml(&value);
+        assert_eq!(xml, r#"<Obj RefId="0"><LST><By>0</By><S>x</S></LST></Obj>"#);
+
+        let decoded = parse_clixml(&xml).expect("decodes");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0], value,
+            "container under `_value` did not round-trip"
+        );
+    }
+
+    /// XML attribute-value normalisation turns a literal tab, CR or LF
+    /// into a space, so those have to leave as `_xHHHH_` escapes when
+    /// they sit inside `N="…"` — but stay literal in element text.
+    #[test]
+    fn attribute_names_escape_whitespace_but_text_does_not() {
+        use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
+
+        let value =
+            PsValue::Object(PsObject::new().with("a\tb\nc", PsValue::String("x\ty\nz".into())));
+        let xml = to_clixml(&value);
+        assert!(xml.contains("_x0009_"), "tab not escaped in name: {xml}");
+        assert!(xml.contains("x\ty\nz"), "text was escaped: {xml}");
+
+        let decoded = parse_clixml(&xml).expect("decodes");
+        assert_eq!(decoded[0], value);
+    }
+
+    #[test]
+    fn value_property_dict_is_written_bare() {
+        use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
+
+        let mut obj = PsObject::new();
+        obj.properties.insert(
+            "_value".into(),
+            PsValue::Dict(vec![(PsValue::String("k".into()), PsValue::I32(7))]),
+        );
+        let value = PsValue::Object(obj);
+
+        let xml = to_clixml(&value);
+        let decoded = parse_clixml(&xml).expect("decodes");
+        assert_eq!(decoded[0], value, "dict under `_value` did not round-trip");
+    }
+
     use super::*;
     use uuid::Uuid;
 
