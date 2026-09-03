@@ -1,0 +1,12 @@
+# Pin the toolchain used for day-to-day work on `psrp-rs`.
+#
+# The crate's MSRV is declared in `Cargo.toml` (`rust-version`) and is
+# verified separately by the `msrv` CI job, which builds with exactly
+# that version. This file only makes sure that `cargo build` in a fresh
+# checkout picks up a toolchain that has `clippy` and `rustfmt`.
+#
+# `cargo +nightly fuzz ...` overrides this file, so the fuzz targets keep
+# building on nightly as required by `cargo-fuzz`.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

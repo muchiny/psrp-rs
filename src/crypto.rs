@@ -23,12 +23,13 @@
 //! [`crate::runspace::RunspacePool::request_session_key`].
 
 use aes::Aes256;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::Array;
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use rand::RngCore;
 use rsa::traits::PublicKeyParts;
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{PsrpError, Result};
 
@@ -57,23 +58,23 @@ impl ClientSessionKey {
     /// Return the Windows `PUBLICKEYBLOB` representation of the public
     /// key that PSRP expects to transport via the `PublicKey` message.
     ///
-    /// Layout:
+    /// Layout — 276 bytes total, hex-encoded to 552 characters:
     /// ```text
-    /// BLOBHEADER (12 bytes):
-    ///   bType = 0x06   (PUBLICKEYBLOB)
-    ///   bVersion = 0x02
-    ///   reserved = 0x0000
-    ///   aiKeyAlg = 0xa400 (CALG_RSA_KEYX)
+    /// BLOBHEADER (8 bytes):
+    ///   bType    = 0x06    (PUBLICKEYBLOB)   1 byte
+    ///   bVersion = 0x02                      1 byte
+    ///   reserved = 0x0000                    2 bytes
+    ///   aiKeyAlg = 0xa400  (CALG_RSA_KEYX)   4 bytes, little-endian
     /// RSAPUBKEY (12 bytes):
-    ///   magic = "RSA1"
-    ///   bitlen = 2048
-    ///   pubexp = u32 little-endian
+    ///   magic    = "RSA1"                    4 bytes
+    ///   bitlen   = 2048                      4 bytes, little-endian
+    ///   pubexp   = public exponent           4 bytes, little-endian
     /// modulus (256 bytes, little-endian)
     /// ```
     #[must_use]
     pub fn public_blob_hex(&self) -> String {
         let public = RsaPublicKey::from(&self.private);
-        let mut blob = Vec::with_capacity(12 + 12 + 256);
+        let mut blob = Vec::with_capacity(8 + 12 + 256);
         // BLOBHEADER
         blob.push(0x06);
         blob.push(0x02);
@@ -109,11 +110,12 @@ impl ClientSessionKey {
     /// 32-byte AES key.
     pub fn decrypt_session_key(&self, ciphertext: &[u8]) -> Result<[u8; 32]> {
         let padding = Oaep::new::<Sha1>();
-        let decrypted = self
+        let mut decrypted = self
             .private
             .decrypt(padding, ciphertext)
             .map_err(|e| PsrpError::protocol(format!("session key unwrap: {e}")))?;
         if decrypted.len() != 32 {
+            decrypted.zeroize();
             return Err(PsrpError::protocol(format!(
                 "session key: expected 32 bytes, got {}",
                 decrypted.len()
@@ -121,15 +123,26 @@ impl ClientSessionKey {
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(&decrypted);
+        decrypted.zeroize();
         Ok(out)
     }
 }
 
 /// A negotiated AES-256-CBC session key ready for `SecureString`
 /// encryption / decryption.
-#[derive(Debug, Clone)]
+///
+/// Key bytes are zeroized when the value is dropped.
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct SessionKey {
     key: [u8; 32],
+}
+
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionKey")
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SessionKey {
@@ -163,21 +176,21 @@ impl SessionKey {
 
         let mut iv = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut iv);
-        let cipher = Aes256::new(GenericArray::from_slice(&self.key));
+        let cipher = Aes256::new(&Array::from(self.key));
 
         // CBC: for each block, XOR with previous ciphertext (or IV for
         // the first block) then encrypt.
         let mut out = Vec::with_capacity(16 + padded.len());
         out.extend_from_slice(&iv);
         let mut prev: [u8; 16] = iv;
-        for chunk in padded.chunks_exact(16) {
+        for chunk in padded.as_chunks::<16>().0 {
             let mut block = [0u8; 16];
             for i in 0..16 {
                 block[i] = chunk[i] ^ prev[i];
             }
-            let mut ga = GenericArray::clone_from_slice(&block);
+            let mut ga = Array::from(block);
             cipher.encrypt_block(&mut ga);
-            prev.copy_from_slice(ga.as_slice());
+            prev.copy_from_slice(ga.as_ref());
             out.extend_from_slice(&prev);
         }
         out
@@ -189,12 +202,12 @@ impl SessionKey {
             return Err(PsrpError::protocol("secure string payload malformed"));
         }
         let (iv, ct) = payload.split_at(16);
-        let cipher = Aes256::new(GenericArray::from_slice(&self.key));
+        let cipher = Aes256::new(&Array::from(self.key));
 
         let mut prev: [u8; 16] = iv.try_into().unwrap();
         let mut pt = Vec::with_capacity(ct.len());
-        for chunk in ct.chunks_exact(16) {
-            let mut ga = GenericArray::clone_from_slice(chunk);
+        for chunk in ct.as_chunks::<16>().0 {
+            let mut ga = Array::from(*chunk);
             cipher.decrypt_block(&mut ga);
             let mut block = [0u8; 16];
             for i in 0..16 {
@@ -224,8 +237,10 @@ impl SessionKey {
             ));
         }
         let units: Vec<u16> = pt
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         String::from_utf16(&units)
             .map_err(|e| PsrpError::protocol(format!("secure string UTF-16: {e}")))

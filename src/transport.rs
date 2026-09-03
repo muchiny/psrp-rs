@@ -231,14 +231,15 @@ impl Drop for WinrmPsrpTransport<'_> {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod mock {
-    use super::*;
+#[cfg(any(test, feature = "__internal"))]
+#[doc(hidden)]
+pub mod mock {
+    use super::{PsrpError, PsrpTransport, Result, async_trait};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     /// In-memory transport used by the test suite.
-    #[derive(Clone, Default)]
+    #[derive(Clone, Default, Debug)]
     pub struct MockTransport {
         pub inbox: Arc<Mutex<VecDeque<Vec<u8>>>>, // bytes to hand out of recv_chunk
         pub outbox: Arc<Mutex<Vec<Vec<u8>>>>,     // bytes captured from send_fragment

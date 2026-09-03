@@ -17,7 +17,7 @@
 pub(crate) mod decode;
 pub(crate) mod encode;
 
-pub use decode::parse_clixml;
+pub use decode::{MAX_NESTING_DEPTH, parse_clixml};
 pub use encode::{RefIdAllocator, escape, ps_enum, ps_host_info_null, to_clixml};
 
 use indexmap::IndexMap;

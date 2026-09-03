@@ -1,4 +1,9 @@
+# libFuzzer's own working directories.
 target
+coverage-target
 corpus
 artifacts
 coverage
+
+# Seeds (fuzz/seeds/) are version-controlled on purpose — see
+# examples/generate_fuzz_corpus.rs.

@@ -38,8 +38,7 @@ impl LiveConfig {
         let user = env::var("PSRP_INTEGRATION_USER").unwrap_or_else(|_| "vagrant".into());
         let pass = env::var("PSRP_INTEGRATION_PASS").unwrap_or_else(|_| "vagrant".into());
         let tls = env::var("PSRP_INTEGRATION_TLS")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let default_port = if tls { 5986 } else { 5985 };
         let port = env::var("PSRP_INTEGRATION_PORT")
             .ok()

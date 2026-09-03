@@ -152,47 +152,52 @@ mod tests {
         .encode()
     }
 
-    fn pipeline_state_message(state: PipelineState) -> Vec<u8> {
+    fn pipeline_state_message(state: PipelineState, rpid: Uuid, pid: Uuid) -> Vec<u8> {
         let body = to_clixml(&PsValue::Object(
             PsObject::new().with("PipelineState", PsValue::I32(state as i32)),
         ));
         PsrpMessage {
             destination: Destination::Client,
             message_type: MessageType::PipelineState,
-            rpid: Uuid::nil(),
-            pid: Uuid::nil(),
+            rpid,
+            pid,
             data: body,
         }
         .encode()
     }
 
-    async fn opened_shared() -> (MockTransport, SharedRunspacePool<MockTransport>) {
+    async fn opened_shared() -> (MockTransport, SharedRunspacePool<MockTransport>, Uuid) {
         let t = MockTransport::new();
         t.push_incoming(encode_message(1, &state_message(RunspacePoolState::Opened)));
         let pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
-        (t, SharedRunspacePool::new(pool))
+        let rpid = pool.id();
+        (t, SharedRunspacePool::new(pool), rpid)
     }
 
     #[tokio::test]
     async fn shared_run_script_serialises_access() {
-        let (t, shared) = opened_shared().await;
+        let (t, shared, rpid) = opened_shared().await;
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             10,
             &PsrpMessage {
                 destination: Destination::Client,
                 message_type: MessageType::PipelineOutput,
-                rpid: Uuid::nil(),
-                pid: Uuid::nil(),
+                rpid,
+                pid,
                 data: "<I32>42</I32>".into(),
             }
             .encode(),
         ));
         t.push_incoming(encode_message(
             11,
-            &pipeline_state_message(PipelineState::Completed),
+            &pipeline_state_message(PipelineState::Completed, rpid, pid),
         ));
-        let out = shared.run_script("whatever").await.unwrap();
-        assert_eq!(out, vec![PsValue::I32(42)]);
+        let out = shared
+            .run_pipeline(Pipeline::new("whatever").__with_forced_pid_for_test(pid))
+            .await
+            .unwrap();
+        assert_eq!(out.output, vec![PsValue::I32(42)]);
         // Count = 1, we can close.
         assert_eq!(shared.handle_count(), 1);
         shared.close().await.unwrap();
@@ -200,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_close_errors_with_outstanding_clones() {
-        let (_t, shared) = opened_shared().await;
+        let (_t, shared, _rpid) = opened_shared().await;
         let clone = shared.clone();
         assert_eq!(shared.handle_count(), 2);
         let err = shared.close().await.unwrap_err();
@@ -211,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_with_pool_direct_access() {
-        let (_t, shared) = opened_shared().await;
+        let (_t, shared, _rpid) = opened_shared().await;
         let state = shared
             .with_pool(|p| Box::pin(async move { p.state() }))
             .await;
@@ -221,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_debug_format_includes_strong_count() {
-        let (_t, shared) = opened_shared().await;
+        let (_t, shared, _rpid) = opened_shared().await;
         let s = format!("{shared:?}");
         assert!(s.contains("SharedRunspacePool"));
         assert!(s.contains("strong_count"));
@@ -232,24 +237,25 @@ mod tests {
 
     #[tokio::test]
     async fn shared_run_pipeline_with_builder() {
-        let (t, shared) = opened_shared().await;
+        let (t, shared, rpid) = opened_shared().await;
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             10,
             &PsrpMessage {
                 destination: Destination::Client,
                 message_type: MessageType::PipelineOutput,
-                rpid: Uuid::nil(),
-                pid: Uuid::nil(),
+                rpid,
+                pid,
                 data: "<S>ok</S>".into(),
             }
             .encode(),
         ));
         t.push_incoming(encode_message(
             11,
-            &pipeline_state_message(PipelineState::Completed),
+            &pipeline_state_message(PipelineState::Completed, rpid, pid),
         ));
         let result = shared
-            .run_pipeline(crate::pipeline::Pipeline::new("dummy"))
+            .run_pipeline(crate::pipeline::Pipeline::new("dummy").__with_forced_pid_for_test(pid))
             .await
             .unwrap();
         assert_eq!(result.output, vec![PsValue::String("ok".into())]);
@@ -258,24 +264,38 @@ mod tests {
 
     #[tokio::test]
     async fn shared_run_script_with_cancel_token() {
-        let (t, shared) = opened_shared().await;
+        let (t, shared, rpid) = opened_shared().await;
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             10,
             &PsrpMessage {
                 destination: Destination::Client,
                 message_type: MessageType::PipelineOutput,
-                rpid: Uuid::nil(),
-                pid: Uuid::nil(),
+                rpid,
+                pid,
                 data: "<I32>7</I32>".into(),
             }
             .encode(),
         ));
         t.push_incoming(encode_message(
             11,
-            &pipeline_state_message(PipelineState::Completed),
+            &pipeline_state_message(PipelineState::Completed, rpid, pid),
         ));
         let token = tokio_util::sync::CancellationToken::new();
-        let out = shared.run_script_with_cancel("x", token).await.unwrap();
+        // Drive via run_pipeline so we can pin the pid; the run_script
+        // wrapper itself is exercised separately.
+        let out = shared
+            .with_pool(|p| {
+                let token = token.clone();
+                Box::pin(async move {
+                    Pipeline::new("x")
+                        .__with_forced_pid_for_test(pid)
+                        .run_with_cancel(p, token)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
         assert_eq!(out, vec![PsValue::I32(7)]);
         shared.close().await.unwrap();
     }
@@ -287,7 +307,7 @@ mod tests {
         // path by pushing an EncryptedSessionKey response that will
         // fail to decrypt (random bytes) — the error path still
         // covers the code.
-        let (t, shared) = opened_shared().await;
+        let (t, shared, _rpid) = opened_shared().await;
         // Seed a fake EncryptedSessionKey with garbage hex — decryption
         // will fail but the delegation + parse paths run.
         t.push_incoming(encode_message(
@@ -310,7 +330,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_handle_count_scales() {
-        let (_t, shared) = opened_shared().await;
+        let (_t, shared, _rpid) = opened_shared().await;
         assert_eq!(shared.handle_count(), 1);
         let h2 = shared.clone();
         let h3 = shared.clone();

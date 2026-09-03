@@ -216,6 +216,11 @@ pub struct Pipeline {
     pub(crate) add_invocation_info: bool,
     /// When `true`, the command is added to the server's session history.
     pub(crate) add_to_history: bool,
+    /// Test-only override for the pipeline PID. `None` in production (a
+    /// fresh v4 UUID is generated). Set via the doc-hidden
+    /// `__with_forced_pid_for_test` to allow unit tests to seed mock
+    /// inboxes with messages targeting a known PID.
+    pub(crate) forced_pid: Option<Uuid>,
 }
 
 impl Pipeline {
@@ -226,6 +231,7 @@ impl Pipeline {
             no_input: true,
             add_invocation_info: true,
             add_to_history: false,
+            forced_pid: None,
         }
     }
 
@@ -237,7 +243,19 @@ impl Pipeline {
             no_input: true,
             add_invocation_info: true,
             add_to_history: false,
+            forced_pid: None,
         }
+    }
+
+    /// Test-only: pin the pipeline's PID to a known value so unit tests
+    /// can seed mock inboxes with matching messages. Never call from
+    /// production code — the security check that filters incoming
+    /// messages by PID relies on the PID being unguessable.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __with_forced_pid_for_test(mut self, pid: Uuid) -> Self {
+        self.forced_pid = Some(pid);
+        self
     }
 
     /// Enable client-to-server input streaming for this pipeline.
@@ -320,13 +338,15 @@ impl Pipeline {
         if self.commands.is_empty() {
             return Err(PsrpError::protocol("pipeline is empty"));
         }
-        let pid = Uuid::new_v4();
+        let pid = self.forced_pid.unwrap_or_else(Uuid::new_v4);
+        let rpid = pool.id();
         let body = self.create_pipeline_xml();
         pool.send_pipeline_message(MessageType::CreatePipeline, pid, body)
             .await?;
         Ok(PipelineHandle {
             pool,
             pid,
+            rpid,
             input_closed: self.no_input,
         })
     }
@@ -343,7 +363,8 @@ impl Pipeline {
         if self.commands.is_empty() {
             return Err(PsrpError::protocol("pipeline is empty"));
         }
-        let pid = Uuid::new_v4();
+        let pid = self.forced_pid.unwrap_or_else(Uuid::new_v4);
+        let rpid = pool.id();
         let body = self.create_pipeline_xml();
         pool.send_pipeline_message(MessageType::CreatePipeline, pid, body)
             .await?;
@@ -371,6 +392,21 @@ impl Pipeline {
                 }
                 msg = pool.next_message() => msg?,
             };
+            // Drop messages that don't belong to this pipeline. A
+            // malicious or buggy server can otherwise smuggle output,
+            // errors, or terminal-state ACKs from a different pipeline
+            // (or a forged PID) into this pipeline's result.
+            if msg.pid != pid || msg.rpid != rpid {
+                tracing::debug!(
+                    expected_pid = %pid,
+                    got_pid = %msg.pid,
+                    expected_rpid = %rpid,
+                    got_rpid = %msg.rpid,
+                    mt = ?msg.message_type,
+                    "dropping pipeline message with mismatched pid/rpid",
+                );
+                continue;
+            }
             match msg.message_type {
                 MessageType::PipelineOutput => {
                     for v in parse_clixml(&msg.data)? {
@@ -429,7 +465,9 @@ impl Pipeline {
     }
 
     fn create_pipeline_xml(&self) -> String {
-        use crate::clixml::encode::{PipelineArgSpec, PipelineCommandSpec, build_create_pipeline_xml};
+        use crate::clixml::encode::{
+            PipelineArgSpec, PipelineCommandSpec, build_create_pipeline_xml,
+        };
 
         let specs: Vec<PipelineCommandSpec<'_>> = self
             .commands
@@ -442,9 +480,7 @@ impl Pipeline {
                     .arguments
                     .iter()
                     .map(|a| match a {
-                        Argument::Named { name, value } => {
-                            PipelineArgSpec::Named { name, value }
-                        }
+                        Argument::Named { name, value } => PipelineArgSpec::Named { name, value },
                         Argument::Positional(v) => PipelineArgSpec::Positional(v),
                         Argument::Switch(name) => PipelineArgSpec::Switch(name),
                     })
@@ -480,6 +516,7 @@ impl Pipeline {
 pub struct PipelineHandle<'p, T: PsrpTransport> {
     pool: &'p mut RunspacePool<T>,
     pid: Uuid,
+    rpid: Uuid,
     input_closed: bool,
 }
 
@@ -487,6 +524,7 @@ impl<T: PsrpTransport> std::fmt::Debug for PipelineHandle<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipelineHandle")
             .field("pid", &self.pid)
+            .field("rpid", &self.rpid)
             .field("input_closed", &self.input_closed)
             .finish()
     }
@@ -575,6 +613,17 @@ impl<T: PsrpTransport> PipelineHandle<'_, T> {
                 }
                 msg = self.pool.next_message() => msg?,
             };
+            if msg.pid != self.pid || msg.rpid != self.rpid {
+                tracing::debug!(
+                    expected_pid = %self.pid,
+                    got_pid = %msg.pid,
+                    expected_rpid = %self.rpid,
+                    got_rpid = %msg.rpid,
+                    mt = ?msg.message_type,
+                    "dropping pipeline message with mismatched pid/rpid",
+                );
+                continue;
+            }
             match msg.message_type {
                 MessageType::PipelineOutput => {
                     for v in parse_clixml(&msg.data)? {
@@ -633,7 +682,7 @@ impl<T: PsrpTransport> PipelineHandle<'_, T> {
     }
 }
 
-fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
+pub(crate) fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
     let parsed = parse_clixml(xml)?;
     for v in parsed {
         if let PsValue::Object(obj) = v
@@ -645,7 +694,7 @@ fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
     Err(PsrpError::protocol("missing PipelineState property"))
 }
 
-fn describe_errors(errors: &[PsValue]) -> String {
+pub(crate) fn describe_errors(errors: &[PsValue]) -> String {
     if errors.is_empty() {
         return "unknown error".into();
     }
@@ -675,26 +724,32 @@ mod tests {
     use crate::runspace::RunspacePoolState;
     use crate::transport::mock::MockTransport;
 
-    fn make_state_message<T: Into<i32> + Copy>(mt: MessageType, prop: &str, code: T) -> Vec<u8> {
+    fn make_state_message<T: Into<i32> + Copy>(
+        mt: MessageType,
+        prop: &str,
+        code: T,
+        rpid: Uuid,
+        pid: Uuid,
+    ) -> Vec<u8> {
         let body = to_clixml(&PsValue::Object(
             PsObject::new().with(prop, PsValue::I32(code.into())),
         ));
         PsrpMessage {
             destination: Destination::Client,
             message_type: mt,
-            rpid: Uuid::nil(),
-            pid: Uuid::nil(),
+            rpid,
+            pid,
             data: body,
         }
         .encode()
     }
 
-    fn make_data_message(mt: MessageType, data: String) -> Vec<u8> {
+    fn make_data_message(mt: MessageType, data: String, rpid: Uuid, pid: Uuid) -> Vec<u8> {
         PsrpMessage {
             destination: Destination::Client,
             message_type: mt,
-            rpid: Uuid::nil(),
-            pid: Uuid::nil(),
+            rpid,
+            pid,
             data,
         }
         .encode()
@@ -708,6 +763,8 @@ mod tests {
             MessageType::RunspacePoolState,
             "RunspaceState",
             RunspacePoolState::Opened as i32,
+            Uuid::nil(),
+            Uuid::nil(),
         );
         // Push Opened at the FRONT so open consumes it first regardless of
         // messages queued by the test before this call.
@@ -738,19 +795,36 @@ mod tests {
     #[tokio::test]
     async fn run_script_collects_output() {
         let t = MockTransport::new();
-        let out1 = make_data_message(MessageType::PipelineOutput, "<I32>1</I32>".into());
-        let out2 = make_data_message(MessageType::PipelineOutput, "<I32>2</I32>".into());
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
+        let out1 = make_data_message(
+            MessageType::PipelineOutput,
+            "<I32>1</I32>".into(),
+            rpid,
+            pid,
+        );
+        let out2 = make_data_message(
+            MessageType::PipelineOutput,
+            "<I32>2</I32>".into(),
+            rpid,
+            pid,
+        );
         let done = make_state_message(
             MessageType::PipelineState,
             "PipelineState",
             PipelineState::Completed as i32,
+            rpid,
+            pid,
         );
         t.push_incoming(encode_message(10, &out1));
         t.push_incoming(encode_message(11, &out2));
         t.push_incoming(encode_message(12, &done));
-
-        let mut pool = opened_pool_with(&t).await;
-        let result = pool.run_script("1..2").await.unwrap();
+        let result = Pipeline::new("1..2")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await
+            .unwrap();
         assert_eq!(result, vec![PsValue::I32(1), PsValue::I32(2)]);
         let _ = pool.close().await;
     }
@@ -758,33 +832,46 @@ mod tests {
     #[tokio::test]
     async fn run_all_streams_collects_every_stream() {
         let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             1,
-            &make_data_message(MessageType::PipelineOutput, "<S>out</S>".into()),
+            &make_data_message(MessageType::PipelineOutput, "<S>out</S>".into(), rpid, pid),
         ));
         t.push_incoming(encode_message(
             2,
-            &make_data_message(MessageType::WarningRecord, "<S>warn</S>".into()),
+            &make_data_message(MessageType::WarningRecord, "<S>warn</S>".into(), rpid, pid),
         ));
         t.push_incoming(encode_message(
             3,
-            &make_data_message(MessageType::VerboseRecord, "<S>verbose</S>".into()),
+            &make_data_message(
+                MessageType::VerboseRecord,
+                "<S>verbose</S>".into(),
+                rpid,
+                pid,
+            ),
         ));
         t.push_incoming(encode_message(
             4,
-            &make_data_message(MessageType::DebugRecord, "<S>debug</S>".into()),
+            &make_data_message(MessageType::DebugRecord, "<S>debug</S>".into(), rpid, pid),
         ));
         t.push_incoming(encode_message(
             5,
-            &make_data_message(MessageType::InformationRecord, "<S>info</S>".into()),
+            &make_data_message(
+                MessageType::InformationRecord,
+                "<S>info</S>".into(),
+                rpid,
+                pid,
+            ),
         ));
         t.push_incoming(encode_message(
             6,
-            &make_data_message(MessageType::ProgressRecord, "<S>prog</S>".into()),
+            &make_data_message(MessageType::ProgressRecord, "<S>prog</S>".into(), rpid, pid),
         ));
         t.push_incoming(encode_message(
             7,
-            &make_data_message(MessageType::ErrorRecord, "<S>err</S>".into()),
+            &make_data_message(MessageType::ErrorRecord, "<S>err</S>".into(), rpid, pid),
         ));
         t.push_incoming(encode_message(
             8,
@@ -792,11 +879,12 @@ mod tests {
                 MessageType::PipelineState,
                 "PipelineState",
                 PipelineState::Completed as i32,
+                rpid,
+                pid,
             ),
         ));
-
-        let mut pool = opened_pool_with(&t).await;
         let result = Pipeline::new("whatever")
+            .__with_forced_pid_for_test(pid)
             .run_all_streams(&mut pool)
             .await
             .unwrap();
@@ -814,9 +902,12 @@ mod tests {
     #[tokio::test]
     async fn failed_pipeline_produces_error() {
         let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             1,
-            &make_data_message(MessageType::ErrorRecord, "<S>boom</S>".into()),
+            &make_data_message(MessageType::ErrorRecord, "<S>boom</S>".into(), rpid, pid),
         ));
         t.push_incoming(encode_message(
             2,
@@ -824,10 +915,15 @@ mod tests {
                 MessageType::PipelineState,
                 "PipelineState",
                 PipelineState::Failed as i32,
+                rpid,
+                pid,
             ),
         ));
-        let mut pool = opened_pool_with(&t).await;
-        let err = Pipeline::new("fail").run(&mut pool).await.unwrap_err();
+        let err = Pipeline::new("fail")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await
+            .unwrap_err();
         assert!(matches!(err, PsrpError::PipelineFailed(_)));
         let _ = pool.close().await;
     }
@@ -835,17 +931,81 @@ mod tests {
     #[tokio::test]
     async fn stopped_pipeline_produces_stopped_error() {
         let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             1,
             &make_state_message(
                 MessageType::PipelineState,
                 "PipelineState",
                 PipelineState::Stopped as i32,
+                rpid,
+                pid,
             ),
         ));
-        let mut pool = opened_pool_with(&t).await;
-        let err = Pipeline::new("x").run(&mut pool).await.unwrap_err();
+        let err = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await
+            .unwrap_err();
         assert!(matches!(err, PsrpError::Stopped));
+        let _ = pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn pipeline_drops_messages_with_wrong_pid() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
+        let foreign_pid = Uuid::new_v4();
+        // Foreign-pid message must be dropped.
+        t.push_incoming(encode_message(
+            1,
+            &make_data_message(
+                MessageType::PipelineOutput,
+                "<I32>666</I32>".into(),
+                rpid,
+                foreign_pid,
+            ),
+        ));
+        // Wrong-rpid message must also be dropped.
+        t.push_incoming(encode_message(
+            2,
+            &make_data_message(
+                MessageType::PipelineOutput,
+                "<I32>777</I32>".into(),
+                Uuid::new_v4(),
+                pid,
+            ),
+        ));
+        // Real message for our pipeline.
+        t.push_incoming(encode_message(
+            3,
+            &make_data_message(
+                MessageType::PipelineOutput,
+                "<I32>42</I32>".into(),
+                rpid,
+                pid,
+            ),
+        ));
+        t.push_incoming(encode_message(
+            4,
+            &make_state_message(
+                MessageType::PipelineState,
+                "PipelineState",
+                PipelineState::Completed as i32,
+                rpid,
+                pid,
+            ),
+        ));
+        let result = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run_all_streams(&mut pool)
+            .await
+            .unwrap();
+        assert_eq!(result.output, vec![PsValue::I32(42)]);
         let _ = pool.close().await;
     }
 
@@ -854,9 +1014,17 @@ mod tests {
     #[tokio::test]
     async fn pipeline_handle_streams_input() {
         let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             10,
-            &make_data_message(MessageType::PipelineOutput, "<I32>99</I32>".into()),
+            &make_data_message(
+                MessageType::PipelineOutput,
+                "<I32>99</I32>".into(),
+                rpid,
+                pid,
+            ),
         ));
         t.push_incoming(encode_message(
             11,
@@ -864,11 +1032,12 @@ mod tests {
                 MessageType::PipelineState,
                 "PipelineState",
                 PipelineState::Completed as i32,
+                rpid,
+                pid,
             ),
         ));
-
-        let mut pool = opened_pool_with(&t).await;
         let mut handle = Pipeline::new("$input | Measure-Object -Sum")
+            .__with_forced_pid_for_test(pid)
             .with_input(true)
             .start(&mut pool)
             .await
@@ -891,16 +1060,24 @@ mod tests {
     #[tokio::test]
     async fn pipeline_handle_write_input_rejected_when_no_input_true() {
         let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             10,
             &make_state_message(
                 MessageType::PipelineState,
                 "PipelineState",
                 PipelineState::Completed as i32,
+                rpid,
+                pid,
             ),
         ));
-        let mut pool = opened_pool_with(&t).await;
-        let mut handle = Pipeline::new("whatever").start(&mut pool).await.unwrap();
+        let mut handle = Pipeline::new("whatever")
+            .__with_forced_pid_for_test(pid)
+            .start(&mut pool)
+            .await
+            .unwrap();
         let err = handle.write_input(PsValue::I32(1)).await.unwrap_err();
         assert!(matches!(err, PsrpError::Protocol(_)));
         // Pipeline identifier is exposed.
@@ -912,16 +1089,21 @@ mod tests {
     #[tokio::test]
     async fn pipeline_handle_cancel_during_collect() {
         let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             10,
             &make_state_message(
                 MessageType::PipelineState,
                 "PipelineState",
                 PipelineState::Stopped as i32,
+                rpid,
+                pid,
             ),
         ));
-        let mut pool = opened_pool_with(&t).await;
         let handle = Pipeline::new("long-running")
+            .__with_forced_pid_for_test(pid)
             .start(&mut pool)
             .await
             .unwrap();
@@ -936,16 +1118,24 @@ mod tests {
     #[tokio::test]
     async fn pipeline_handle_explicit_stop() {
         let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             10,
             &make_state_message(
                 MessageType::PipelineState,
                 "PipelineState",
                 PipelineState::Stopped as i32,
+                rpid,
+                pid,
             ),
         ));
-        let mut pool = opened_pool_with(&t).await;
-        let mut handle = Pipeline::new("whatever").start(&mut pool).await.unwrap();
+        let mut handle = Pipeline::new("whatever")
+            .__with_forced_pid_for_test(pid)
+            .start(&mut pool)
+            .await
+            .unwrap();
         handle.stop().await.unwrap();
         assert!(*t.stopped.lock().unwrap());
         let err = handle.collect().await.unwrap_err();
@@ -956,18 +1146,23 @@ mod tests {
     #[tokio::test]
     async fn pipeline_run_with_cancel_returns_cancelled() {
         let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
         t.push_incoming(encode_message(
             10,
             &make_state_message(
                 MessageType::PipelineState,
                 "PipelineState",
                 PipelineState::Stopped as i32,
+                rpid,
+                pid,
             ),
         ));
-        let mut pool = opened_pool_with(&t).await;
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
         let err = Pipeline::new("slow")
+            .__with_forced_pid_for_test(pid)
             .run_with_cancel(&mut pool, token)
             .await
             .unwrap_err();

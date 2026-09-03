@@ -1,0 +1,1 @@
+<Obj RefId="0"><MS><I64 N="SourceId">1</I64><Obj N="Record" RefId="1"><MS><S N="Activity">Copying</S><I32 N="ActivityId">0</I32><S N="StatusDescription">42%</S><I32 N="PercentComplete">42</I32><I32 N="SecondsRemaining">-1</I32><I32 N="RecordType">0</I32></MS></Obj></MS></Obj>

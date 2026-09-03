@@ -92,17 +92,34 @@ pub(crate) fn write_value_with(
         PsValue::Xml(s) => write_simple(out, "XD", &escape(s), name, false),
         PsValue::ScriptBlock(s) => write_simple(out, "SCT", &escape(s), name, false),
         PsValue::SecureString(s) => write_simple(out, "SS", &escape(s), name, false),
-        PsValue::List(items) => {
+        PsValue::List(_) | PsValue::Dict(_) => {
             open_obj(out, name, alloc);
+            write_container_body(out, value, alloc);
+            out.push_str("</Obj>");
+        }
+        PsValue::Object(obj) => write_object(out, obj, name, alloc),
+    }
+}
+
+/// Write the bare `<LST>` / `<DCT>` body of a container, without the
+/// enclosing `<Obj>`.
+///
+/// Split out of [`write_value_with`] because a container stored under an
+/// object's synthetic `_value` property is written *inside* that
+/// object's `<Obj>`, not wrapped in a second one — which is how the
+/// decoder spells it, and therefore the only spelling that round-trips.
+/// Returns `false` if `value` is not a container.
+fn write_container_body(out: &mut String, value: &PsValue, alloc: &RefIdAllocator) -> bool {
+    match value {
+        PsValue::List(items) => {
             out.push_str("<LST>");
             for item in items {
                 write_value_with(out, item, None, alloc);
             }
             out.push_str("</LST>");
-            out.push_str("</Obj>");
+            true
         }
         PsValue::Dict(entries) => {
-            open_obj(out, name, alloc);
             out.push_str("<DCT>");
             for (k, v) in entries {
                 out.push_str("<En>");
@@ -111,9 +128,9 @@ pub(crate) fn write_value_with(
                 out.push_str("</En>");
             }
             out.push_str("</DCT>");
-            out.push_str("</Obj>");
+            true
         }
-        PsValue::Object(obj) => write_object(out, obj, name, alloc),
+        _ => false,
     }
 }
 
@@ -137,7 +154,7 @@ fn write_simple(out: &mut String, tag: &str, body: &str, name: Option<&str>, sel
             out.push('<');
             out.push_str(tag);
             out.push_str(" N=\"");
-            out.push_str(&escape(n));
+            out.push_str(&escape_attr(n));
             out.push_str("\"/>");
         } else {
             out.push('<');
@@ -151,7 +168,7 @@ fn write_simple(out: &mut String, tag: &str, body: &str, name: Option<&str>, sel
             out.push('<');
             out.push_str(tag);
             out.push_str(" N=\"");
-            out.push_str(&escape(n));
+            out.push_str(&escape_attr(n));
             out.push_str("\">");
             out.push_str(body);
             out.push_str("</");
@@ -175,7 +192,7 @@ fn open_obj(out: &mut String, name: Option<&str>, alloc: &RefIdAllocator) {
     match name {
         Some(n) => {
             out.push_str("<Obj N=\"");
-            out.push_str(&escape(n));
+            out.push_str(&escape_attr(n));
             out.push_str(&format!("\" RefId=\"{id}\">"));
         }
         None => out.push_str(&format!("<Obj RefId=\"{id}\">")),
@@ -207,7 +224,13 @@ fn write_object(out: &mut String, obj: &PsObject, name: Option<&str>, alloc: &Re
         .filter(|(k, _)| k.as_str() != "_value")
         .collect();
     if let Some(v) = &value_prop {
-        write_value_with(out, v, None, alloc);
+        // A container under `_value` is emitted as a bare `<LST>` /
+        // `<DCT>` child. Routing it through `write_value_with` would wrap
+        // it in a second `<Obj>`, which the decoder skips as an unknown
+        // element — silently dropping the whole container.
+        if !write_container_body(out, v, alloc) {
+            write_value_with(out, v, None, alloc);
+        }
     }
     if !other_props.is_empty() {
         out.push_str("<MS>");
@@ -266,20 +289,45 @@ pub fn ps_host_info_null() -> PsValue {
     )
 }
 
-/// Escape a string for XML attribute / text content.
+/// Escape a string for XML **text** content.
 ///
-/// Control characters below 0x20 (except `\t`, `\n`, `\r`) are emitted as
-/// PowerShell's `_xHHHH_` escapes.
+/// Control characters below 0x20 (except `\t`, `\n`, `\r`, which XML
+/// text preserves verbatim) are emitted as PowerShell's `_xHHHH_`
+/// escapes.
 #[must_use]
 pub fn escape(s: &str) -> String {
+    escape_inner(s, false)
+}
+
+/// Escape a string for an XML **attribute value** (`N="…"`, `RefId="…"`).
+///
+/// Same as [`escape`] plus `\t`, `\n` and `\r`, which a conforming XML
+/// parser replaces with a space during attribute-value normalisation
+/// (XML 1.0 §3.3.3). Emitting them literally would therefore silently
+/// turn a tab in a property name into a space on the way back.
+#[must_use]
+pub fn escape_attr(s: &str) -> String {
+    escape_inner(s, true)
+}
+
+fn escape_inner(s: &str, attribute: bool) -> String {
+    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    for (i, c) in s.char_indices() {
         match c {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '&' => out.push_str("&amp;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            // A literal `_` that would open a `_xHHHH_` sequence has to
+            // be escaped itself, or the decoder reads the user's text as
+            // an escape: `"9+_x001F_"` would come back as `"9+\u{1f}"`.
+            // This is what PowerShell's own serializer does.
+            '_' if opens_pwsh_escape(bytes, i) => out.push_str("_x005F_"),
+            '\t' | '\n' | '\r' if attribute => {
+                out.push_str(&format!("_x{:04X}_", c as u32));
+            }
             c if (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r' => {
                 out.push_str(&format!("_x{:04X}_", c as u32));
             }
@@ -289,13 +337,25 @@ pub fn escape(s: &str) -> String {
     out
 }
 
+/// Does a `_xHHHH_` escape sequence start at byte offset `i`?
+///
+/// Mirrors the pattern `decode_pwsh_escapes` looks for, so the two stay
+/// exact inverses of each other.
+fn opens_pwsh_escape(bytes: &[u8], i: usize) -> bool {
+    i + 7 <= bytes.len()
+        && bytes[i] == b'_'
+        && bytes[i + 1] == b'x'
+        && bytes[i + 6] == b'_'
+        && bytes[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit)
+}
+
 /// Minimal, allocation-conscious base64 encoder (standard alphabet).
 #[must_use]
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in &mut chunks {
+    let (chunks, rem) = bytes.as_chunks::<3>();
+    for chunk in chunks {
         let b0 = chunk[0] as usize;
         let b1 = chunk[1] as usize;
         let b2 = chunk[2] as usize;
@@ -304,7 +364,6 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
         out.push(ALPHABET[((b1 & 0x0F) << 2) | (b2 >> 6)] as char);
         out.push(ALPHABET[b2 & 0x3F] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         0 => {}
         1 => {
@@ -497,8 +556,7 @@ pub(crate) fn build_create_pipeline_xml(
             if let Some(tn_ref) = first_prt_tn {
                 write_enum_with_tnref(&mut o, Some(name), tn_ref, label, val, &a);
             } else {
-                let tn_id =
-                    write_enum_first_in_group(&mut o, Some(name), prt, label, val, &a);
+                let tn_id = write_enum_first_in_group(&mut o, Some(name), prt, label, val, &a);
                 first_prt_tn = Some(tn_id);
             }
         }
@@ -513,12 +571,7 @@ pub(crate) fn build_create_pipeline_xml(
             o.push_str("<MS>");
             match arg {
                 PipelineArgSpec::Named { name, value } => {
-                    write_value_with(
-                        &mut o,
-                        &PsValue::String((*name).to_string()),
-                        Some("N"),
-                        &a,
-                    );
+                    write_value_with(&mut o, &PsValue::String((*name).to_string()), Some("N"), &a);
                     write_value_with(&mut o, value, Some("V"), &a);
                 }
                 PipelineArgSpec::Positional(value) => {
@@ -526,12 +579,7 @@ pub(crate) fn build_create_pipeline_xml(
                     write_value_with(&mut o, value, Some("V"), &a);
                 }
                 PipelineArgSpec::Switch(name) => {
-                    write_value_with(
-                        &mut o,
-                        &PsValue::String((*name).to_string()),
-                        Some("N"),
-                        &a,
-                    );
+                    write_value_with(&mut o, &PsValue::String((*name).to_string()), Some("N"), &a);
                     write_value_with(&mut o, &PsValue::Bool(true), Some("V"), &a);
                 }
             }
@@ -601,6 +649,85 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    // Regression (found by the `clixml_encode_decode` fuzz target): a
+    // container stored under the synthetic `_value` property used to be
+    // written as `<Obj><Obj><LST/></Obj></Obj>`. The decoder skips the
+    // inner `<Obj>` as an unknown element, so the list was silently lost
+    // on the way back.
+    #[test]
+    fn value_property_container_is_written_bare() {
+        use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
+
+        let mut obj = PsObject::new();
+        obj.properties.insert(
+            "_value".into(),
+            PsValue::List(vec![PsValue::U8(0), PsValue::String("x".into())]),
+        );
+        let value = PsValue::Object(obj);
+
+        let xml = to_clixml(&value);
+        assert_eq!(xml, r#"<Obj RefId="0"><LST><By>0</By><S>x</S></LST></Obj>"#);
+
+        let decoded = parse_clixml(&xml).expect("decodes");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0], value,
+            "container under `_value` did not round-trip"
+        );
+    }
+
+    /// Regression (found by the `clixml_encode_decode` fuzz target): a
+    /// string that already reads like a PowerShell escape used to be
+    /// decoded as one, so `"9+_x001F_"` came back as `"9+\u{1f}"`.
+    #[test]
+    fn literal_pwsh_escape_sequences_survive() {
+        use super::super::{PsValue, parse_clixml, to_clixml};
+
+        for text in ["9+_x001F_", "_x005F_", "a_x0041_b", "_x", "_", "__x0041__"] {
+            let value = PsValue::String(text.to_string());
+            let xml = to_clixml(&value);
+            let decoded = parse_clixml(&xml).expect("decodes");
+            assert_eq!(decoded[0], value, "{text:?} was mangled via {xml}");
+
+            // And it must be stable, not merely correct once.
+            let again = parse_clixml(&to_clixml(&decoded[0])).expect("decodes");
+            assert_eq!(again[0], value, "{text:?} drifted on the second hop");
+        }
+    }
+
+    /// XML attribute-value normalisation turns a literal tab, CR or LF
+    /// into a space, so those have to leave as `_xHHHH_` escapes when
+    /// they sit inside `N="…"` — but stay literal in element text.
+    #[test]
+    fn attribute_names_escape_whitespace_but_text_does_not() {
+        use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
+
+        let value =
+            PsValue::Object(PsObject::new().with("a\tb\nc", PsValue::String("x\ty\nz".into())));
+        let xml = to_clixml(&value);
+        assert!(xml.contains("_x0009_"), "tab not escaped in name: {xml}");
+        assert!(xml.contains("x\ty\nz"), "text was escaped: {xml}");
+
+        let decoded = parse_clixml(&xml).expect("decodes");
+        assert_eq!(decoded[0], value);
+    }
+
+    #[test]
+    fn value_property_dict_is_written_bare() {
+        use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
+
+        let mut obj = PsObject::new();
+        obj.properties.insert(
+            "_value".into(),
+            PsValue::Dict(vec![(PsValue::String("k".into()), PsValue::I32(7))]),
+        );
+        let value = PsValue::Object(obj);
+
+        let xml = to_clixml(&value);
+        let decoded = parse_clixml(&xml).expect("decodes");
+        assert_eq!(decoded[0], value, "dict under `_value` did not round-trip");
+    }
+
     use super::*;
     use uuid::Uuid;
 
@@ -775,15 +902,24 @@ mod tests {
 
     #[test]
     fn pipeline_xml_single_script_has_one_tn_and_seven_tnref_for_prt() {
-        let xml = build_create_pipeline_xml(true, false, true, &[PipelineCommandSpec {
-            name: "1+1",
-            is_script: true,
-            merge_errors_to_output: false,
-            args: vec![],
-        }]);
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            true,
+            &[PipelineCommandSpec {
+                name: "1+1",
+                is_script: true,
+                merge_errors_to_output: false,
+                args: vec![],
+            }],
+        );
         // Exactly one <TN> for PipelineResultTypes
         let prt = "System.Management.Automation.Runspaces.PipelineResultTypes";
-        assert_eq!(xml.matches(prt).count(), 1, "PRT type string should appear once (in <TN>)");
+        assert_eq!(
+            xml.matches(prt).count(),
+            1,
+            "PRT type string should appear once (in <TN>)"
+        );
         // The first merge field uses <TN>, remaining 7 use <TNRef>
         assert_eq!(
             xml.matches("<TNRef").count(),
@@ -794,15 +930,20 @@ mod tests {
 
     #[test]
     fn pipeline_xml_args_uses_tnref_to_cmds_list() {
-        let xml = build_create_pipeline_xml(true, false, false, &[PipelineCommandSpec {
-            name: "Get-Process",
-            is_script: false,
-            merge_errors_to_output: false,
-            args: vec![PipelineArgSpec::Named {
-                name: "Name",
-                value: &PsValue::String("svchost".into()),
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            false,
+            &[PipelineCommandSpec {
+                name: "Get-Process",
+                is_script: false,
+                merge_errors_to_output: false,
+                args: vec![PipelineArgSpec::Named {
+                    name: "Name",
+                    value: &PsValue::String("svchost".into()),
+                }],
             }],
-        }]);
+        );
         assert!(xml.contains("N=\"Args\""), "Args field must be present");
         // Args Obj should use <TNRef>, not <TN>
         let args_pos = xml.find("N=\"Args\"").unwrap();
@@ -815,23 +956,28 @@ mod tests {
 
     #[test]
     fn pipeline_xml_two_commands_share_prt_tnref() {
-        let xml = build_create_pipeline_xml(true, false, true, &[
-            PipelineCommandSpec {
-                name: "Get-Process",
-                is_script: false,
-                merge_errors_to_output: false,
-                args: vec![],
-            },
-            PipelineCommandSpec {
-                name: "Select-Object",
-                is_script: false,
-                merge_errors_to_output: false,
-                args: vec![PipelineArgSpec::Named {
-                    name: "First",
-                    value: &PsValue::I32(5),
-                }],
-            },
-        ]);
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            true,
+            &[
+                PipelineCommandSpec {
+                    name: "Get-Process",
+                    is_script: false,
+                    merge_errors_to_output: false,
+                    args: vec![],
+                },
+                PipelineCommandSpec {
+                    name: "Select-Object",
+                    is_script: false,
+                    merge_errors_to_output: false,
+                    args: vec![PipelineArgSpec::Named {
+                        name: "First",
+                        value: &PsValue::I32(5),
+                    }],
+                },
+            ],
+        );
         let prt = "System.Management.Automation.Runspaces.PipelineResultTypes";
         // Still only one TN definition for PRT across both commands
         assert_eq!(xml.matches(prt).count(), 1);
@@ -842,24 +988,36 @@ mod tests {
 
     #[test]
     fn pipeline_xml_switch_emits_bool_true() {
-        let xml = build_create_pipeline_xml(true, false, false, &[PipelineCommandSpec {
-            name: "Get-Process",
-            is_script: false,
-            merge_errors_to_output: false,
-            args: vec![PipelineArgSpec::Switch("FileVersionInfo")],
-        }]);
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            false,
+            &[PipelineCommandSpec {
+                name: "Get-Process",
+                is_script: false,
+                merge_errors_to_output: false,
+                args: vec![PipelineArgSpec::Switch("FileVersionInfo")],
+            }],
+        );
         assert!(xml.contains("<S N=\"N\">FileVersionInfo</S>"));
         assert!(xml.contains("<B N=\"V\">true</B>"));
     }
 
     #[test]
     fn pipeline_xml_positional_has_nil_name() {
-        let xml = build_create_pipeline_xml(true, false, false, &[PipelineCommandSpec {
-            name: "Get-Process",
-            is_script: false,
-            merge_errors_to_output: false,
-            args: vec![PipelineArgSpec::Positional(&PsValue::String("svchost".into()))],
-        }]);
+        let xml = build_create_pipeline_xml(
+            true,
+            false,
+            false,
+            &[PipelineCommandSpec {
+                name: "Get-Process",
+                is_script: false,
+                merge_errors_to_output: false,
+                args: vec![PipelineArgSpec::Positional(&PsValue::String(
+                    "svchost".into(),
+                ))],
+            }],
+        );
         assert!(xml.contains("<Nil N=\"N\"/>"));
         assert!(xml.contains("<S N=\"V\">svchost</S>"));
     }

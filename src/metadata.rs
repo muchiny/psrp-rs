@@ -80,7 +80,7 @@ pub struct ParameterMetadata {
 }
 
 impl CommandMetadata {
-    fn from_ps_object(value: &PsValue) -> Option<Self> {
+    pub(crate) fn from_ps_object(value: &PsValue) -> Option<Self> {
         let obj = value.properties()?;
         Some(Self {
             name: obj
@@ -106,7 +106,7 @@ impl CommandMetadata {
 }
 
 impl ParameterMetadata {
-    fn from_ps_value(value: &PsValue) -> Option<Self> {
+    pub(crate) fn from_ps_value(value: &PsValue) -> Option<Self> {
         let obj = value.properties()?;
         Some(Self {
             name: obj
@@ -169,7 +169,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
     }
 }
 
-fn state_from_xml(xml: &str) -> Option<PipelineState> {
+pub(crate) fn state_from_xml(xml: &str) -> Option<PipelineState> {
     parse_clixml(xml).ok().and_then(|values| {
         values.into_iter().find_map(|v| match v {
             PsValue::Object(obj) => obj

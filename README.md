@@ -5,7 +5,7 @@ Async [PowerShell Remoting Protocol (MS-PSRP)](https://learn.microsoft.com/en-us
 [![Crates.io](https://img.shields.io/crates/v/psrp-rs.svg)](https://crates.io/crates/psrp-rs)
 [![docs.rs](https://img.shields.io/docsrs/psrp-rs)](https://docs.rs/psrp-rs)
 [![License](https://img.shields.io/crates/l/psrp-rs.svg)](LICENSE-MIT)
-[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2026/03/20/Rust-1.94.0.html)
+[![MSRV](https://img.shields.io/badge/MSRV-1.98-blue.svg)](https://blog.rust-lang.org/)
 
 ```rust
 use psrp_rs::{RunspacePool, WinrmPsrpTransport};
@@ -252,9 +252,11 @@ Set via `RunspacePool::open_with_options(transport, min, max)` or
 Contributions are welcome. Please open an issue to discuss larger changes before submitting a PR.
 
 ```sh
-cargo test --lib         # run unit tests
-cargo clippy --all-targets  # lint
-cargo fmt --check        # format check
+cargo test --all-features      # unit + end-to-end tests (no network)
+cargo clippy --all-targets --all-features
+cargo fmt --all --check
+cargo deny check               # advisories + licences
+MODE=smoke ./fuzz/run.sh       # quick pass over every fuzz target
 ```
 
 ## Integration tests
@@ -282,6 +284,42 @@ PSRP_INTEGRATION_USER=vagrant \
 PSRP_INTEGRATION_PASS=vagrant \
   cargo test --test integration_real -- --ignored
 ```
+
+## Fuzzing
+
+Everything this crate parses comes from the remote host, so the decoders are
+fuzzed continuously. Sixteen [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
+targets live under [`fuzz/fuzz_targets/`](fuzz/fuzz_targets/), covering the
+fragment reassembler, the PSRP message header, the CLIXML parser and encoder,
+the typed record decoders, the host-call dispatcher, the session-key crypto,
+the runspace state machine, the async pool driven over a mock transport, and
+the SSH `known_hosts` matcher.
+
+```sh
+rustup toolchain install nightly
+cargo install cargo-fuzz
+
+./fuzz/run.sh                           # every target, 60s each
+DURATION=900 ./fuzz/run.sh              # 15 minutes per target
+TARGETS="clixml_decoder" ./fuzz/run.sh  # just one
+./fuzz/coverage.sh                      # what the corpora actually reach
+```
+
+Beyond "does not panic", the round-trip targets assert real protocol
+properties: reassembly must not depend on how the bytes were chunked, the
+.NET mixed-endian GUIDs must survive the header, the CLIXML codec must reach a
+fixed point, a closed or broken runspace pool must never return to `Opened`,
+and decrypting with the wrong session key must never yield the right
+plaintext.
+
+This work found and fixed seven defects, including two remote denials of
+service. The CLIXML parser was recursive with no depth limit, so about 10 KiB
+of nested `<Obj>` from a hostile server overflowed the stack and aborted the
+process — parsing depth is now capped by
+[`MAX_NESTING_DEPTH`](https://docs.rs/psrp-rs/latest/psrp_rs/constant.MAX_NESTING_DEPTH.html).
+And the SSH `known_hosts` glob matcher backtracked exponentially, so a pattern
+such as `*a*a*a*a*b` against a long hostname hung host-key verification
+itself; it is now an iterative `O(n*m)` matcher.
 
 ## Cargo features
 

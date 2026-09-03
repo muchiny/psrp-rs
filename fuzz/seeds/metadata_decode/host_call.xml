@@ -1,0 +1,1 @@
+<Obj RefId="0"><MS><I64 N="ci">1</I64><Obj N="mi" RefId="1"><TN RefId="0"><T>System.Management.Automation.Remoting.RemoteHostMethodId</T><T>System.Enum</T></TN><ToString>WriteLine2</ToString><I32>16</I32></Obj><Obj N="mp" RefId="2"><LST><S>hello from the host</S></LST></Obj></MS></Obj>
