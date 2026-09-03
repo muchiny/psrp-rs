@@ -1,0 +1,126 @@
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # Nightly deep run at 03:17 UTC.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Seconds per target"
+        required: false
+        default: "300"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # A fuzz target that no longer compiles is the most common way for
+    # fuzzing to quietly stop happening, so check that first and cheaply.
+    name: build targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> fuzz/target"
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz build
+      # The seed corpus is generated from the crate's own encoders, so a
+      # wire-format change must regenerate it.
+      - run: cargo run --example generate_fuzz_corpus
+      - run: git diff --exit-code fuzz/seeds
+        name: seeds are up to date
+
+  smoke:
+    # Short run on every pull request: catches a target broken by the
+    # change without holding the PR for half an hour.
+    name: smoke (${{ matrix.target }})
+    needs: build
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - clixml_decoder
+          - clixml_roundtrip
+          - clixml_encode_decode
+          - psrp_stream
+          - fragment_reassembler
+          - message_decode
+          - pool_receive
+          - known_hosts_match
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> fuzz/target"
+      - run: cargo install cargo-fuzz --locked
+      - run: MODE=smoke SMOKE_DURATION=60 TARGETS="${{ matrix.target }}" ./fuzz/run.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+
+  deep:
+    # Nightly: every target, long run, one job each so a single hang does
+    # not eat the whole budget.
+    name: deep (${{ matrix.target }})
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - clixml_decoder
+          - clixml_roundtrip
+          - clixml_encode_decode
+          - codecs
+          - crypto_secure_string
+          - fragment_reassembler
+          - fragment_roundtrip
+          - host_dispatch
+          - known_hosts_match
+          - message_decode
+          - message_roundtrip
+          - metadata_decode
+          - pool_receive
+          - psrp_stream
+          - records_decode
+          - runspace_state_machine
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> fuzz/target"
+      - run: cargo install cargo-fuzz --locked
+      # Carry the corpus across nightly runs so coverage compounds
+      # instead of restarting from the seeds every time.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - run: |
+          DURATION="${{ github.event.inputs.duration || '900' }}" \
+          JOBS=2 TARGETS="${{ matrix.target }}" ./fuzz/run.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/

@@ -6,6 +6,65 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Remote denial of service in the CLIXML parser.** `parse_clixml` is
+  recursive and the document comes from the remote host; with no depth
+  limit, roughly 10 KiB of nested `<Obj><MS>` overflowed the stack and
+  **aborted the process** (a stack overflow is not a catchable panic, so
+  `#![forbid(unsafe_code)]` offered no protection). Nesting is now capped
+  by the new public constant `MAX_NESTING_DEPTH` (64) and an over-deep
+  document returns a structured error. Found by fuzzing.
+- **Denial of service in SSH host-key verification.** The `known_hosts`
+  glob matcher was recursive and explored every way of distributing the
+  hostname across `*` wildcards, so a pattern such as `*a*a*a*a*b`
+  against a long hostname hung the trust decision itself. Replaced with
+  an iterative single-backtrack matcher: `O(n*m)`, no recursion, same
+  semantics. Found by the `known_hosts_match` fuzz target.
+- OpenSSH host **certificates** are now refused under every
+  `HostKeyPolicy` except `AcceptAny`, since the crate carries no CA
+  trust store. (russh 0.63 started surfacing them.)
+
+### Fixed
+
+- **CLIXML attribute values were never XML-unescaped.** A property name
+  containing `&`, `<`, `>`, `"` or `'` came back still escaped, and the
+  encoder escaped it again on the next hop, so `&lt;` grew into
+  `&amp;lt;` and onwards without bound. Attribute values are now
+  normalised and `_xHHHH_`-decoded, mirroring the encoder exactly.
+- **Tabs, CRs and LFs inside a property name were folded to spaces** by
+  XML attribute-value normalisation. The encoder now emits them as
+  `_xHHHH_` in attribute position (element text is unaffected).
+- **A list or dictionary stored under the synthetic `_value` property
+  did not round-trip.** The encoder wrote `<Obj><Obj><LST/></Obj></Obj>`;
+  the decoder skips the inner `<Obj>` as an unknown element, silently
+  dropping the container. The bare `<LST>` / `<DCT>` is now emitted.
+
+### Added
+
+- **Sixteen fuzz targets** (up from three), in five layers: raw wire
+  decoders, structure-aware round-trips, the typed record/metadata/host
+  decoders, the runspace state machine and the real async pool over a
+  mock transport, and the small hand-rolled codecs. Beyond panic-freedom
+  they assert protocol properties — reassembly is independent of byte
+  chunking, the .NET mixed-endian GUIDs survive the header, the CLIXML
+  codec reaches a fixed point, a closed or broken pool never returns to
+  `Opened`, and the wrong session key never yields the right plaintext.
+- Fuzzing infrastructure: `Arbitrary` value generators and round-trip
+  semantics in `fuzz/src/lib.rs`, libFuzzer dictionaries for CLIXML /
+  PSRP / `known_hosts`, a version-controlled seed corpus under
+  `fuzz/seeds/`, a rewritten `fuzz/run.sh` (target auto-discovery,
+  dictionaries, corpus seeding, `smoke` / `cmin` / `list` modes) and a
+  new `fuzz/coverage.sh`.
+- `MAX_NESTING_DEPTH` is re-exported at the crate root.
+- GitHub Actions: a `CI` workflow (test matrix over the feature flags,
+  fmt/clippy/docs, an **MSRV job that builds with exactly the declared
+  `rust-version`**, and `cargo-deny`) and a `Fuzz` workflow (target build
+  + seed-freshness check, a 60s smoke pass per target on pull requests,
+  and a nightly 15-minute deep run with a persistent corpus cache).
+- `deny.toml`, documenting why RUSTSEC-2023-0071 (`rsa`, no fixed
+  release upstream) is accepted and what the exposure actually is.
+
 ### Changed
 
 - **MSRV raised to 1.98** (`rust-version = "1.98"`), plus a

@@ -9,22 +9,161 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-psrp-rs = { path = ".." }
+arbitrary = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+
+[dependencies.psrp-rs]
+path = ".."
+features = ["__internal", "ssh"]
+
+# Shared helpers (`Arbitrary` mirrors of the crate's value types, PSRP
+# wire builders, comparison helpers) live in a real lib so every target
+# can use them without copy-pasting.
+[lib]
+name = "psrp_fuzz"
+path = "src/lib.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzzing is pointless without optimisation, and libFuzzer needs debug
+# assertions on to catch arithmetic overflow and slice invariants.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+incremental = false
+codegen-units = 1
+
+# ---------------------------------------------------------------------
+# Layer 1 — raw wire decoders (arbitrary attacker bytes)
+# ---------------------------------------------------------------------
 
 [[bin]]
 name = "fragment_reassembler"
 path = "fuzz_targets/fragment_reassembler.rs"
 test = false
 doc = false
-
-[[bin]]
-name = "clixml_decoder"
-path = "fuzz_targets/clixml_decoder.rs"
-test = false
-doc = false
+bench = false
 
 [[bin]]
 name = "message_decode"
 path = "fuzz_targets/message_decode.rs"
 test = false
 doc = false
+bench = false
+
+[[bin]]
+name = "clixml_decoder"
+path = "fuzz_targets/clixml_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "psrp_stream"
+path = "fuzz_targets/psrp_stream.rs"
+test = false
+doc = false
+bench = false
+
+# ---------------------------------------------------------------------
+# Layer 2 — structure-aware round-trips (encoder vs decoder)
+# ---------------------------------------------------------------------
+
+[[bin]]
+name = "fragment_roundtrip"
+path = "fuzz_targets/fragment_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_roundtrip"
+path = "fuzz_targets/message_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clixml_roundtrip"
+path = "fuzz_targets/clixml_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clixml_encode_decode"
+path = "fuzz_targets/clixml_encode_decode.rs"
+test = false
+doc = false
+bench = false
+
+# ---------------------------------------------------------------------
+# Layer 3 — typed views over decoded CLIXML
+# ---------------------------------------------------------------------
+
+[[bin]]
+name = "records_decode"
+path = "fuzz_targets/records_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_decode"
+path = "fuzz_targets/metadata_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_dispatch"
+path = "fuzz_targets/host_dispatch.rs"
+test = false
+doc = false
+bench = false
+
+# ---------------------------------------------------------------------
+# Layer 4 — protocol state and crypto
+# ---------------------------------------------------------------------
+
+[[bin]]
+name = "runspace_state_machine"
+path = "fuzz_targets/runspace_state_machine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pool_receive"
+path = "fuzz_targets/pool_receive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_secure_string"
+path = "fuzz_targets/crypto_secure_string.rs"
+test = false
+doc = false
+bench = false
+
+# ---------------------------------------------------------------------
+# Layer 5 — small codecs and the SSH known_hosts matcher
+# ---------------------------------------------------------------------
+
+[[bin]]
+name = "codecs"
+path = "fuzz_targets/codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "known_hosts_match"
+path = "fuzz_targets/known_hosts_match.rs"
+test = false
+doc = false
+bench = false

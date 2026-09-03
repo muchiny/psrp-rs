@@ -1,0 +1,1 @@
+<Obj RefId="0"><TN RefId="0"><T>System.Management.Automation.InformationRecord</T></TN><MS><S N="MessageData">hello</S><S N="Source">Write-Host</S><Obj N="Tags" RefId="1"><LST><S>PSHOST</S></LST></Obj><DT N="TimeGenerated">2026-01-01T00:00:00.0000000+00:00</DT></MS></Obj>

@@ -311,14 +311,20 @@ pub fn escape_attr(s: &str) -> String {
 }
 
 fn escape_inner(s: &str, attribute: bool) -> String {
+    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    for (i, c) in s.char_indices() {
         match c {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '&' => out.push_str("&amp;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            // A literal `_` that would open a `_xHHHH_` sequence has to
+            // be escaped itself, or the decoder reads the user's text as
+            // an escape: `"9+_x001F_"` would come back as `"9+\u{1f}"`.
+            // This is what PowerShell's own serializer does.
+            '_' if opens_pwsh_escape(bytes, i) => out.push_str("_x005F_"),
             '\t' | '\n' | '\r' if attribute => {
                 out.push_str(&format!("_x{:04X}_", c as u32));
             }
@@ -329,6 +335,18 @@ fn escape_inner(s: &str, attribute: bool) -> String {
         }
     }
     out
+}
+
+/// Does a `_xHHHH_` escape sequence start at byte offset `i`?
+///
+/// Mirrors the pattern `decode_pwsh_escapes` looks for, so the two stay
+/// exact inverses of each other.
+fn opens_pwsh_escape(bytes: &[u8], i: usize) -> bool {
+    i + 7 <= bytes.len()
+        && bytes[i] == b'_'
+        && bytes[i + 1] == b'x'
+        && bytes[i + 6] == b'_'
+        && bytes[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit)
 }
 
 /// Minimal, allocation-conscious base64 encoder (standard alphabet).
@@ -656,6 +674,25 @@ mod tests {
             decoded[0], value,
             "container under `_value` did not round-trip"
         );
+    }
+
+    /// Regression (found by the `clixml_encode_decode` fuzz target): a
+    /// string that already reads like a PowerShell escape used to be
+    /// decoded as one, so `"9+_x001F_"` came back as `"9+\u{1f}"`.
+    #[test]
+    fn literal_pwsh_escape_sequences_survive() {
+        use super::super::{PsValue, parse_clixml, to_clixml};
+
+        for text in ["9+_x001F_", "_x005F_", "a_x0041_b", "_x", "_", "__x0041__"] {
+            let value = PsValue::String(text.to_string());
+            let xml = to_clixml(&value);
+            let decoded = parse_clixml(&xml).expect("decodes");
+            assert_eq!(decoded[0], value, "{text:?} was mangled via {xml}");
+
+            // And it must be stable, not merely correct once.
+            let again = parse_clixml(&to_clixml(&decoded[0])).expect("decodes");
+            assert_eq!(again[0], value, "{text:?} drifted on the second hop");
+        }
     }
 
     /// XML attribute-value normalisation turns a literal tab, CR or LF

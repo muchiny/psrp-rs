@@ -19,3 +19,7 @@
 .DS_Store
 Thumbs.db
 .gitnexus
+
+# Static analysis / MCP tool scratch dirs
+.scannerwork/
+.serena/

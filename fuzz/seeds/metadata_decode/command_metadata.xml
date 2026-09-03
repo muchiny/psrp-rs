@@ -1,0 +1,1 @@
+<Obj RefId="0"><MS><S N="Name">Get-Process</S><I32 N="CommandType">8</I32><S N="Namespace">Microsoft.PowerShell.Management</S><Obj N="Parameters" RefId="1"><DCT><En><S N="Key">Name</S><Obj N="Value" RefId="2"><MS><S N="Name">Name</S><S N="ParameterType">System.String[]</S><B N="IsMandatory">false</B><I32 N="Position">0</I32></MS></Obj></En></DCT></Obj></MS></Obj>

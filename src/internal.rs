@@ -19,13 +19,13 @@ use crate::pipeline::PipelineState;
 
 /// Base64 helpers behind the CLIXML `<BA>` codec.
 pub mod base64 {
-    /// See [`crate::clixml::encode::base64_encode`].
+    /// The CLIXML `<BA>` base64 encoder (`clixml::encode::base64_encode`).
     #[must_use]
     pub fn encode(bytes: &[u8]) -> String {
         crate::clixml::encode::base64_encode(bytes)
     }
 
-    /// See [`crate::clixml::encode::base64_decode`].
+    /// The CLIXML `<BA>` base64 decoder (`clixml::encode::base64_decode`).
     #[must_use]
     pub fn decode(s: &str) -> Option<Vec<u8>> {
         crate::clixml::encode::base64_decode(s)

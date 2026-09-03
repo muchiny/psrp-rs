@@ -1,0 +1,58 @@
+# cargo-deny configuration for psrp-rs.
+#
+#   cargo deny check
+#
+# Three things are enforced: no unpatched security advisories, no
+# licence that would make the crate undistributable, and no accidental
+# git/alternative-registry dependency.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+  # RUSTSEC-2023-0071 — "Marvin attack" timing side channel in `rsa`.
+  #
+  # MS-PSRP §3.1.2 requires RSA-OAEP(SHA-1) to unwrap the AES session
+  # key used for `SecureString` transport, so the dependency is not
+  # optional. There is **no fixed release**: the advisory applies to
+  # every `rsa` 0.9.x and to the 0.10 release candidates alike, so
+  # upgrading changes nothing.
+  #
+  # Exposure here is narrow: the crate only ever *decrypts* a session
+  # key that the server encrypted with our own freshly generated,
+  # single-use 2048-bit key pair. Recovering it would need a large
+  # number of adaptive timing measurements against one short-lived key,
+  # after which the attacker would learn a session key they already
+  # produced. Revisit as soon as `rsa` ships a constant-time release.
+  { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; required by MS-PSRP session-key exchange" },
+]
+
+[licenses]
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  # The Mozilla CA root bundle shipped by `webpki-roots`: a data
+  # licence, permissive, redistribution explicitly allowed.
+  "CDLA-Permissive-2.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
