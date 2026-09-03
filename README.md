@@ -312,11 +312,14 @@ fixed point, a closed or broken runspace pool must never return to `Opened`,
 and decrypting with the wrong session key must never yield the right
 plaintext.
 
-Fuzzing found and fixed four bugs in this crate, including a remote
-denial of service: the CLIXML parser was recursive with no depth limit, so
-about 10 KiB of nested `<Obj>` from a hostile server overflowed the stack and
-aborted the process. Parsing depth is now capped by
+This work found and fixed seven defects, including two remote denials of
+service. The CLIXML parser was recursive with no depth limit, so about 10 KiB
+of nested `<Obj>` from a hostile server overflowed the stack and aborted the
+process — parsing depth is now capped by
 [`MAX_NESTING_DEPTH`](https://docs.rs/psrp-rs/latest/psrp_rs/constant.MAX_NESTING_DEPTH.html).
+And the SSH `known_hosts` glob matcher backtracked exponentially, so a pattern
+such as `*a*a*a*a*b` against a long hostname hung host-key verification
+itself; it is now an iterative `O(n*m)` matcher.
 
 ## Cargo features
 

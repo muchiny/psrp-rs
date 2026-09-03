@@ -24,6 +24,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 - OpenSSH host **certificates** are now refused under every
   `HostKeyPolicy` except `AcceptAny`, since the crate carries no CA
   trust store. (russh 0.63 started surfacing them.)
+- **A closed or broken runspace pool could be re-opened by the client.**
+  `RunspacePoolStateMachine::open` / `connect` overwrote the state
+  unconditionally, so a terminal machine could be driven back through
+  the handshake into `Opened` — the very resurrection
+  `is_legal_server_transition` already refused on the server side. Both
+  now refuse once the machine is terminal, exposed as `is_terminal()`.
+  Found by the `runspace_state_machine` fuzz target.
 
 ### Fixed
 
