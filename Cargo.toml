@@ -1,6 +1,6 @@
 [package]
 name = "psrp-rs"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"

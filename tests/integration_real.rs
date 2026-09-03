@@ -294,13 +294,9 @@ async fn live_ssh_one_plus_one() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(22);
 
-    let transport = psrp_rs::SshPsrpTransport::connect(psrp_rs::SshConfig {
-        host,
-        port,
-        username: user,
-        auth: psrp_rs::SshAuth::Password(pass),
-        ..psrp_rs::SshConfig::default()
-    })
+    let transport = psrp_rs::SshPsrpTransport::connect(
+        psrp_rs::SshConfig::new(host, user, psrp_rs::SshAuth::Password(pass)).with_port(port),
+    )
     .await
     .expect("SSH connect");
 
@@ -324,12 +320,11 @@ async fn live_ssh_multiple_scripts() {
     let user = std::env::var("PSRP_INTEGRATION_SSH_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("PSRP_INTEGRATION_SSH_PASS").unwrap_or_else(|_| "vagrant".into());
 
-    let transport = psrp_rs::SshPsrpTransport::connect(psrp_rs::SshConfig {
+    let transport = psrp_rs::SshPsrpTransport::connect(psrp_rs::SshConfig::new(
         host,
-        username: user,
-        auth: psrp_rs::SshAuth::Password(pass),
-        ..psrp_rs::SshConfig::default()
-    })
+        user,
+        psrp_rs::SshAuth::Password(pass),
+    ))
     .await
     .expect("SSH connect");
 

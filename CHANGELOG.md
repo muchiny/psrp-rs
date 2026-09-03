@@ -6,6 +6,40 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-09-03
+
+Also ships everything listed under [1.1.0](#110--2026-06-03), which was
+**never released** — it was only ever a version number in `Cargo.toml`,
+with no tag and nothing published. 1.0.0 was the last release, so
+upgrading from it picks up the SSH transport and host-key verification
+as well as everything below.
+
+### Breaking changes
+
+- **`SshConfig` is now `#[non_exhaustive]`, and gains a builder**
+  (`ssh` feature). The 1.1.0 work added a `host_key_policy` field to a
+  struct that could be built with an exhaustive literal, which
+  `cargo semver-checks` correctly flags as a major-version break. Rather
+  than repeat that on the next field, the struct is now non-exhaustive —
+  which means a struct expression from another crate is rejected
+  outright, *including* `..SshConfig::default()`. Construct one with
+  `SshConfig::new(host, username, auth)` plus `with_port`,
+  `with_subsystem`, `with_connect_timeout` and `with_host_key_policy`:
+
+  ```rust
+  // before
+  SshConfig { host: "h".into(), port: 2222, username: "u".into(),
+              auth: SshAuth::Agent, ..Default::default() }
+  // after
+  SshConfig::new("h", "u", SshAuth::Agent).with_port(2222)
+  ```
+
+  The fields stay public, so an existing value can still be read and
+  mutated in place.
+- **MSRV raised to 1.98** (from 1.94).
+- **`winrm-rs` requirement raised to `"1.2"`** (from `"1.0"`), so the
+  fixed SOAP envelope builder cannot be resolved away. See below.
+
 ### Security
 
 - **Remote denial of service in the CLIXML parser.** `parse_clixml` is
@@ -102,6 +136,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   (RUSTSEC-2023-0071) and therefore buys no security.
 
 ## [1.1.0] — 2026-06-03
+
+> **Never released.** This version number was set in `Cargo.toml` but
+> never tagged and never published to crates.io; its contents ship as
+> part of 2.0.0. Kept as its own section so the history stays readable.
 
 ### Added
 
