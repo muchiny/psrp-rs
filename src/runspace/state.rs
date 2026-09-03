@@ -123,7 +123,18 @@ impl RunspacePoolStateMachine {
     /// Produce the actions required to start the opening handshake.
     ///
     /// Transitions the state from `BeforeOpen` to `NegotiationSent`.
+    ///
+    /// A machine that has already reached a terminal state (`Closed` or
+    /// `Broken`) refuses: it returns no actions and stays where it is.
+    /// The server-driven path is guarded by
+    /// [`is_legal_server_transition`]; this is the matching guard for
+    /// the client-driven one, so a pool cannot be resurrected from
+    /// either side. Every caller inside the crate drives a freshly
+    /// constructed machine, so nothing legitimate hits this.
     pub fn open(&mut self) -> Vec<Action> {
+        if self.is_terminal() {
+            return Vec::new();
+        }
         self.state = RunspacePoolState::Opening;
         let actions = vec![
             Action::SendMessage {
@@ -146,7 +157,12 @@ impl RunspacePoolStateMachine {
     /// message and the server responds with the current pool state. We
     /// re-emit the `SessionCapability` first to renegotiate protocol
     /// versions.
+    ///
+    /// Like [`open`](Self::open), a terminal machine refuses.
     pub fn connect(&mut self) -> Vec<Action> {
+        if self.is_terminal() {
+            return Vec::new();
+        }
         self.state = RunspacePoolState::Connecting;
         let actions = vec![
             Action::SendMessage {
@@ -205,6 +221,16 @@ impl RunspacePoolStateMachine {
     #[must_use]
     pub fn is_opened(&self) -> bool {
         self.state == RunspacePoolState::Opened
+    }
+
+    /// True once the pool is dead for good — no further handshake may be
+    /// started on this machine.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            RunspacePoolState::Closed | RunspacePoolState::Broken
+        )
     }
 
     /// Produce the actions required to close the pool.
@@ -555,6 +581,30 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, PsrpError::Protocol(_)));
         assert_eq!(m.state(), RunspacePoolState::BeforeOpen);
+    }
+
+    /// Regression (found by the `runspace_state_machine` fuzz target):
+    /// `open` used to overwrite the state unconditionally, so a client
+    /// could re-drive a closed machine back to `Opened` — the exact
+    /// resurrection `is_legal_server_transition` refuses on the server
+    /// side.
+    #[test]
+    fn rejects_client_reopening_a_terminal_pool() {
+        for terminal in [RunspacePoolState::Closed, RunspacePoolState::Broken] {
+            let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+            let _ = m.open();
+            m.state = terminal;
+
+            assert!(m.is_terminal());
+            assert!(m.open().is_empty(), "open() acted on a {terminal:?} pool");
+            assert_eq!(m.state(), terminal, "open() moved a {terminal:?} pool");
+            assert!(
+                m.connect().is_empty(),
+                "connect() acted on a {terminal:?} pool"
+            );
+            assert_eq!(m.state(), terminal, "connect() moved a {terminal:?} pool");
+            assert!(!m.is_opened());
+        }
     }
 
     #[test]

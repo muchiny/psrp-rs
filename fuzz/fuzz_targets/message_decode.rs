@@ -13,14 +13,23 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    // `decode` strips a UTF-8 BOM from the body, so re-encoding is only
-    // guaranteed to be stable from the *second* round onwards.
     let re = msg.encode();
     let again = PsrpMessage::decode(&re).expect("re-decode of self-encoded message");
     assert_eq!(msg.destination, again.destination);
     assert_eq!(msg.message_type, again.message_type);
     assert_eq!(msg.rpid, again.rpid);
     assert_eq!(msg.pid, again.pid);
-    assert_eq!(msg.data, again.data);
-    assert_eq!(re, again.encode(), "encode is not idempotent");
+
+    // `decode` strips **one** leading UTF-8 BOM (real servers emit one),
+    // and `encode` writes the body back verbatim — so a body that opens
+    // with a BOM loses exactly one per hop and is not a fixed point yet.
+    assert_eq!(
+        msg.data.strip_prefix('\u{feff}').unwrap_or(&msg.data),
+        again.data,
+        "message body changed across a re-encode"
+    );
+    if !msg.data.starts_with('\u{feff}') {
+        assert_eq!(msg.data, again.data);
+        assert_eq!(re, again.encode(), "encode is not idempotent");
+    }
 });

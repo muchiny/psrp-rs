@@ -213,6 +213,11 @@ fn wrap(inner: PsValue) -> PsValue {
 /// `f64::NAN != f64::NAN`, but `NaN` *does* survive the codec (the
 /// encoder writes `NaN`, the decoder parses it back), so plain
 /// `PartialEq` would report a false round-trip failure.
+///
+/// `PsObject::to_string` is deliberately **not** compared: the encoder
+/// writes `<ToString>` and the decoder never reads it back, so it can
+/// only ever differ. That makes this comparison strictly weaker than
+/// `PartialEq` — it can miss a bug, never invent one.
 #[must_use]
 pub fn eq_lossy(a: &PsValue, b: &PsValue) -> bool {
     match (a, b) {
