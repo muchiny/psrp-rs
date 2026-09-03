@@ -85,6 +85,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   now receives a `PublicKeyOrCertificate`. OpenSSH host *certificates*
   are refused (fail-closed) under every policy except
   `HostKeyPolicy::AcceptAny`, because the crate has no CA trust store.
+- **`winrm-rs` 1.1.2 → 1.2.0, and the requirement raised from `"1.0"` to
+  `"1.2"`.** 1.2.0 fixes an XML injection in the SOAP `ResourceURI`
+  header and raises its own MSRV to 1.98 to match ours. `psrp-rs` passes
+  a constant resource URI, so its own API does not reach the injection,
+  but every request it makes goes through that envelope builder — and
+  leaving the requirement at `"1.0"` would let a consumer resolve the
+  unfixed version. Also pulls in `base64` 0.23.
 - Routine bumps: `tokio` 1.53, `tokio-util` 0.7.19, `uuid` 1.26,
   `thiserror` 2.0.20, `indexmap` 2.14.1, `serde` 1.0.229, `aes` 0.9.3,
   `async-trait` 0.1.92.

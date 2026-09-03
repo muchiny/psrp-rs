@@ -24,7 +24,11 @@ include = [
 ]
 
 [dependencies]
-winrm-rs = "1.0"
+# 1.2 is a floor, not a convenience: it carries the fix for the XML
+# injection in the SOAP `ResourceURI` header and raises winrm-rs's MSRV
+# to 1.98 to match ours. Allowing 1.0/1.1 would let a consumer resolve
+# the unfixed envelope builder.
+winrm-rs = "1.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
