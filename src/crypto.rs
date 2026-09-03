@@ -58,23 +58,23 @@ impl ClientSessionKey {
     /// Return the Windows `PUBLICKEYBLOB` representation of the public
     /// key that PSRP expects to transport via the `PublicKey` message.
     ///
-    /// Layout:
+    /// Layout — 276 bytes total, hex-encoded to 552 characters:
     /// ```text
-    /// BLOBHEADER (12 bytes):
-    ///   bType = 0x06   (PUBLICKEYBLOB)
-    ///   bVersion = 0x02
-    ///   reserved = 0x0000
-    ///   aiKeyAlg = 0xa400 (CALG_RSA_KEYX)
+    /// BLOBHEADER (8 bytes):
+    ///   bType    = 0x06    (PUBLICKEYBLOB)   1 byte
+    ///   bVersion = 0x02                      1 byte
+    ///   reserved = 0x0000                    2 bytes
+    ///   aiKeyAlg = 0xa400  (CALG_RSA_KEYX)   4 bytes, little-endian
     /// RSAPUBKEY (12 bytes):
-    ///   magic = "RSA1"
-    ///   bitlen = 2048
-    ///   pubexp = u32 little-endian
+    ///   magic    = "RSA1"                    4 bytes
+    ///   bitlen   = 2048                      4 bytes, little-endian
+    ///   pubexp   = public exponent           4 bytes, little-endian
     /// modulus (256 bytes, little-endian)
     /// ```
     #[must_use]
     pub fn public_blob_hex(&self) -> String {
         let public = RsaPublicKey::from(&self.private);
-        let mut blob = Vec::with_capacity(12 + 12 + 256);
+        let mut blob = Vec::with_capacity(8 + 12 + 256);
         // BLOBHEADER
         blob.push(0x06);
         blob.push(0x02);

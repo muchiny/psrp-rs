@@ -126,10 +126,10 @@ impl RunspacePoolStateMachine {
     ///
     /// A machine that has already reached a terminal state (`Closed` or
     /// `Broken`) refuses: it returns no actions and stays where it is.
-    /// The server-driven path is guarded by
-    /// [`is_legal_server_transition`]; this is the matching guard for
-    /// the client-driven one, so a pool cannot be resurrected from
-    /// either side. Every caller inside the crate drives a freshly
+    /// The server-driven path is guarded by the crate-private
+    /// `is_legal_server_transition`; this is the matching guard for the
+    /// client-driven one, so a pool cannot be resurrected from either
+    /// side. Every caller inside the crate drives a freshly
     /// constructed machine, so nothing legitimate hits this.
     pub fn open(&mut self) -> Vec<Action> {
         if self.is_terminal() {
