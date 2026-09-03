@@ -10,6 +10,7 @@
 #   MODE=cmin ./fuzz/run.sh             # minimise the corpora, no fuzzing
 #   MODE=list ./fuzz/run.sh             # print the target list and exit
 #   SANITIZER=none ./fuzz/run.sh        # no ASan (much faster, less coverage)
+#   VALUE_PROFILE=0 ./fuzz/run.sh       # disable value profiling
 #
 # Targets are discovered from `cargo fuzz list`, so adding a `[[bin]]` to
 # fuzz/Cargo.toml is enough — this script needs no edit.
@@ -33,6 +34,11 @@ MAX_LEN="${MAX_LEN:-16384}"
 # regression was found exactly here.
 UNIT_TIMEOUT="${UNIT_TIMEOUT:-10}"
 RSS_LIMIT_MB="${RSS_LIMIT_MB:-2048}"
+# Use the `trace-compares` instrumentation cargo-fuzz already builds in.
+# These are byte-oriented format parsers full of magic-value comparisons
+# (fragment flags, message-type codes, CLIXML tag names), which is
+# exactly where value profiling pays for itself.
+VALUE_PROFILE="${VALUE_PROFILE:-1}"
 
 if [ "$MODE" = "smoke" ]; then
   DURATION="${SMOKE_DURATION:-10}"
@@ -92,6 +98,7 @@ for target in $TARGETS; do
     "-rss_limit_mb=$RSS_LIMIT_MB"
     "-timeout=$UNIT_TIMEOUT"
     "-max_len=$MAX_LEN"
+    "-use_value_profile=$VALUE_PROFILE"
     "-print_final_stats=1"
   )
   [ -n "$dict" ] && libfuzzer_args+=("-dict=$ROOT/$dict")
@@ -127,4 +134,8 @@ if [ ${#failed[@]} -ne 0 ]; then
   echo "Reproduce with: cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>" >&2
   exit 1
 fi
-echo "All targets survived (${MODE}, ${DURATION}s each)."
+if [ "$MODE" = "cmin" ]; then
+  echo "Corpora minimised."
+else
+  echo "All targets survived (${MODE}, ${DURATION}s each)."
+fi

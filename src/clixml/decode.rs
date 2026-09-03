@@ -290,7 +290,7 @@ fn parse_element_inner(
         "Ref" => {
             let rid = ref_ref_id_attr(e)?;
             // self-closing `<Ref/>` handled by parse_empty; otherwise drain.
-            skip_to_end(reader, "Ref")?;
+            skip_to_end(reader)?;
             Ok(Some(
                 rid.and_then(|r| state.refs.get(&r).cloned())
                     .unwrap_or(PsValue::Null),
@@ -298,7 +298,7 @@ fn parse_element_inner(
         }
         _ => {
             // Unknown top-level element — skip.
-            skip_to_end(reader, &tag)?;
+            skip_to_end(reader)?;
             Ok(None)
         }
     }
@@ -327,7 +327,7 @@ fn parse_obj_body(reader: &mut Reader<&[u8]>, state: &mut DecoderState) -> Resul
                 }
                 "TNRef" => {
                     let rid = ref_ref_id_attr(&e)?;
-                    skip_to_end(reader, "TNRef")?;
+                    skip_to_end(reader)?;
                     if let Some(rid) = rid
                         && let Some(names) = state.type_names.get(&rid)
                     {
@@ -342,10 +342,7 @@ fn parse_obj_body(reader: &mut Reader<&[u8]>, state: &mut DecoderState) -> Resul
                     let entries = parse_dict(reader, state)?;
                     embedded = Some(PsValue::Dict(entries));
                 }
-                _ => {
-                    let unknown = e.name().as_ref().to_string();
-                    skip_to_end(reader, &unknown)?;
-                }
+                _ => skip_to_end(reader)?,
             },
             Event::Empty(e) => match e.name().as_ref() {
                 "TNRef" => {
@@ -581,21 +578,24 @@ fn read_text(reader: &mut Reader<&[u8]>, closing: &str) -> Result<String> {
     Ok(decode_pwsh_escapes(&out))
 }
 
-fn skip_to_end(reader: &mut Reader<&[u8]>, closing: &str) -> Result<()> {
-    let mut depth: i32 = 1;
+/// Drain everything up to the end tag that closes the current element.
+///
+/// Iterative on purpose — this is the escape hatch for *unknown*
+/// elements, so it must stay bounded by the input size rather than by
+/// the stack. The counter saturates instead of wrapping so that a
+/// pathologically long run of start tags cannot overflow it.
+fn skip_to_end(reader: &mut Reader<&[u8]>) -> Result<()> {
+    let mut depth: usize = 1;
     let mut buf = Vec::new();
     loop {
         match reader
             .read_event_into(&mut buf)
             .map_err(|e| PsrpError::clixml(e.to_string()))?
         {
-            Event::Start(_) => depth += 1,
-            Event::End(e) => {
+            Event::Start(_) => depth = depth.saturating_add(1),
+            Event::End(_) => {
                 depth -= 1;
-                if depth <= 0 && e.name().as_ref() == closing {
-                    break;
-                }
-                if depth <= 0 {
+                if depth == 0 {
                     break;
                 }
             }
