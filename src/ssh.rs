@@ -26,15 +26,10 @@
 //! use psrp_rs::RunspacePool;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let transport = SshPsrpTransport::connect(SshConfig {
-//!     host: "linux-host".into(),
-//!     port: 22,
-//!     username: "admin".into(),
-//!     auth: SshAuth::Password("s3cret".into()),
-//!     // Default: validate against ~/.ssh/known_hosts. Override with
-//!     // HostKeyPolicy::Pinned(...) or HostKeyPolicy::AcceptAny if needed.
-//!     ..SshConfig::default()
-//! }).await?;
+//! // Host-key validation defaults to ~/.ssh/known_hosts. Override with
+//! // `.with_host_key_policy(HostKeyPolicy::Pinned(..) | ::AcceptAny)`.
+//! let config = SshConfig::new("linux-host", "admin", SshAuth::Password("s3cret".into()));
+//! let transport = SshPsrpTransport::connect(config).await?;
 //!
 //! let mut pool = RunspacePool::open_with_transport(transport).await?;
 //! let out = pool.run_script("Get-Date").await?;
@@ -98,7 +93,26 @@ impl Default for HostKeyPolicy {
 }
 
 /// SSH connection parameters.
+///
+/// Marked `#[non_exhaustive]`, so it cannot be built with a struct
+/// expression from another crate — not even with
+/// `..Default::default()`. Use [`SshConfig::new`] and the `with_*`
+/// methods:
+///
+/// ```
+/// use psrp_rs::ssh::{HostKeyPolicy, SshAuth, SshConfig};
+///
+/// let config = SshConfig::new("win-host", "admin", SshAuth::Agent)
+///     .with_port(2222)
+///     .with_host_key_policy(HostKeyPolicy::AcceptAny);
+/// ```
+///
+/// The fields stay public, so an existing value can still be read and
+/// mutated directly. The point of the attribute is that adding a field
+/// is no longer a breaking change — which is exactly what
+/// `host_key_policy` was in 1.1.0.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SshConfig {
     /// Remote hostname or IP.
     pub host: String,
@@ -128,6 +142,57 @@ impl Default for SshConfig {
             connect_timeout: Duration::from_secs(30),
             host_key_policy: HostKeyPolicy::default(),
         }
+    }
+}
+
+impl SshConfig {
+    /// Start from the defaults, supplying the three values that have no
+    /// sensible default.
+    ///
+    /// Everything else keeps its default: port 22, the `powershell`
+    /// subsystem, a 30-second connect timeout, and
+    /// [`HostKeyPolicy::default`] (validate against `~/.ssh/known_hosts`,
+    /// fail-closed).
+    #[must_use]
+    pub fn new(host: impl Into<String>, username: impl Into<String>, auth: SshAuth) -> Self {
+        Self {
+            host: host.into(),
+            username: username.into(),
+            auth,
+            ..Self::default()
+        }
+    }
+
+    /// Override the TCP port (default 22).
+    #[must_use]
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Override the SSH subsystem to request (default `powershell`).
+    #[must_use]
+    pub fn with_subsystem(mut self, subsystem: impl Into<String>) -> Self {
+        self.subsystem = subsystem.into();
+        self
+    }
+
+    /// Override the connect timeout (default 30s).
+    #[must_use]
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Override how the server's host key is validated.
+    ///
+    /// The default consults `~/.ssh/known_hosts` and refuses an unknown
+    /// host. Only [`HostKeyPolicy::AcceptAny`] disables that, and it
+    /// disables MITM protection with it.
+    #[must_use]
+    pub fn with_host_key_policy(mut self, policy: HostKeyPolicy) -> Self {
+        self.host_key_policy = policy;
+        self
     }
 }
 
@@ -565,6 +630,34 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_config_builder_sets_every_field() {
+        let cfg = SshConfig::new("host.example", "admin", SshAuth::Agent)
+            .with_port(2222)
+            .with_subsystem("pwsh")
+            .with_connect_timeout(Duration::from_secs(5))
+            .with_host_key_policy(HostKeyPolicy::AcceptAny);
+
+        assert_eq!(cfg.host, "host.example");
+        assert_eq!(cfg.username, "admin");
+        assert!(matches!(cfg.auth, SshAuth::Agent));
+        assert_eq!(cfg.port, 2222);
+        assert_eq!(cfg.subsystem, "pwsh");
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
+        assert!(matches!(cfg.host_key_policy, HostKeyPolicy::AcceptAny));
+    }
+
+    #[test]
+    fn ssh_config_new_keeps_the_safe_defaults() {
+        let cfg = SshConfig::new("h", "u", SshAuth::Agent);
+        let defaults = SshConfig::default();
+        assert_eq!(cfg.port, defaults.port);
+        assert_eq!(cfg.subsystem, defaults.subsystem);
+        assert_eq!(cfg.connect_timeout, defaults.connect_timeout);
+        // Host-key checking must not be weakened by using the builder.
+        assert!(matches!(cfg.host_key_policy, HostKeyPolicy::KnownHosts(_)));
+    }
 
     #[test]
     fn ssh_config_defaults() {

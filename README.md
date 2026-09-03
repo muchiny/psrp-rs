@@ -177,13 +177,10 @@ println!("{objects:?}");
 // Requires: cargo add psrp-rs --features ssh
 use psrp_rs::{RunspacePool, SshConfig, SshAuth, SshPsrpTransport};
 
-let transport = SshPsrpTransport::connect(SshConfig {
-    host: "win-server".into(),
-    port: 22,
-    username: "admin".into(),
-    auth: SshAuth::Password("Passw0rd!".into()),
-    ..Default::default()
-}).await?;
+// Host-key validation defaults to ~/.ssh/known_hosts (fail-closed).
+let config = SshConfig::new("win-server", "admin", SshAuth::Password("Passw0rd!".into()))
+    .with_port(22);
+let transport = SshPsrpTransport::connect(config).await?;
 
 let mut pool = RunspacePool::open_with_transport(transport).await?;
 let result = pool.run_script("$PSVersionTable").await?;
