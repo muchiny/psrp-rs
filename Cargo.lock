@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "psrp-rs"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "aes",
  "async-trait",

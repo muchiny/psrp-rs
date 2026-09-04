@@ -1,6 +1,6 @@
 [package]
 name = "psrp-rs"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -30,7 +30,7 @@ include = [
 # the shell's own ResourceURI, without which every PSRP pool this crate
 # closes leaves its runspace running on the server. Allowing anything
 # older would let a consumer resolve a build that leaks.
-winrm-rs = "1.2.1"
+winrm-rs = "1.2.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"

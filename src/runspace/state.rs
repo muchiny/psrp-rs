@@ -163,19 +163,34 @@ impl RunspacePoolStateMachine {
         if self.is_terminal() {
             return Vec::new();
         }
-        self.state = RunspacePoolState::Connecting;
-        let actions = vec![
-            Action::SendMessage {
-                message_type: MessageType::SessionCapability,
-                body: session_capability_xml(),
-            },
-            Action::SendMessage {
-                message_type: MessageType::ConnectRunspacePool,
-                body: "<Obj RefId=\"0\"><MS/></Obj>".into(),
-            },
-        ];
-        self.state = RunspacePoolState::NegotiationSent;
-        actions
+        // Existing-client reconnect (MS-PSRP §3.1.4 / MS-WSMV Reconnect). The
+        // transport already issued the WSMan `Reconnect`, and because the
+        // client kept the same `wsmv:SessionId`, the server treats the
+        // runspace as still Opened and replays no state. So the machine emits
+        // no PSRP message and goes straight to Opened — this mirrors
+        // pypsrp's `_connect_existing_client`, which sends
+        // SessionCapability/ConnectRunspacePool only for a *different* client
+        // (the `connectXml` path), a case this crate never hits because every
+        // reconnect reuses the original transport's SessionId.
+        //
+        // The previous version replayed the full handshake and then waited
+        // for a fresh RunspacePoolState=Opened; the server had nothing new to
+        // send, so the follow-up Receive died with `w:TimedOut`.
+        //
+        // Only resume a genuinely resumable pool: the fresh machine
+        // `DisconnectedPool::reconnect` builds (`BeforeOpen`), or a live pool
+        // the server moved to `Disconnected`. From anything else — a
+        // mid-handshake, closing, or terminal pool — reconnect must not
+        // fabricate an `Opened` state (fuzz-guarded: a closed pool must never
+        // resurrect).
+        if !matches!(
+            self.state,
+            RunspacePoolState::BeforeOpen | RunspacePoolState::Disconnected
+        ) {
+            return Vec::new();
+        }
+        self.state = RunspacePoolState::Opened;
+        Vec::new()
     }
 
     /// Feed a server-originated message into the machine.
@@ -581,6 +596,20 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, PsrpError::Protocol(_)));
         assert_eq!(m.state(), RunspacePoolState::BeforeOpen);
+    }
+
+    #[test]
+    fn connect_resumes_existing_client_straight_to_opened() {
+        // Existing-client reconnect: the WSMan Reconnect already resumed the
+        // shell at the transport layer, so the machine emits no PSRP message
+        // and is immediately Opened. Replaying the handshake made the server
+        // time out (w:TimedOut) because it had nothing new to send.
+        let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+        assert!(
+            m.connect().is_empty(),
+            "existing-client reconnect sends nothing"
+        );
+        assert!(m.is_opened(), "pool must be Opened right after reconnect");
     }
 
     /// Regression (found by the `runspace_state_machine` fuzz target):

@@ -6,6 +6,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.2] — 2026-09-04
+
+Disconnect/reconnect now works against a live server. It never did before —
+the path was only ever exercised by `MockTransport`. Requires `winrm-rs`
+1.2.2, which makes the underlying WinRM shell disconnectable.
+
+### Fixed
+
+- **Reconnect replayed the PSRP handshake and then timed out.**
+  `DisconnectedPool::reconnect` re-sent `SessionCapability` +
+  `ConnectRunspacePool` and waited for a fresh `RunspacePoolState=Opened`,
+  but after an existing-client WSMan `Reconnect` — same `SessionId`, so the
+  server keeps the runspace `Opened` — there was nothing more for the server
+  to send, and the follow-up Receive died with `w:TimedOut`. Reconnect now
+  resumes straight to `Opened` with no PSRP message, matching pypsrp's
+  `_connect_existing_client`. The state machine only resumes a genuinely
+  resumable pool (`BeforeOpen` or `Disconnected`); a fuzz run caught the
+  first cut resurrecting a closed pool into `Opened`, so the guard is now
+  explicit. Verified live on Server 2025: open, run, disconnect, reconnect,
+  run again, close. (`src/runspace/pool.rs`, `src/runspace/state.rs`)
+
 ## [2.0.1] — 2026-09-04
 
 A shell-lifecycle leak, found by running the crate against live Windows

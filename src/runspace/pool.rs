@@ -584,15 +584,26 @@ impl DisconnectedPool {
     /// [`WinrmPsrpTransport::reconnect`](crate::transport::WinrmPsrpTransport::reconnect)
     /// for the live path).
     ///
-    /// Sends a `ConnectRunspacePool` PSRP message and drains until the
-    /// server reports the pool back to `Opened`.
+    /// The WSMan `Reconnect` the transport performs resumes the shell, and
+    /// the reused `SessionId` keeps the server-side runspace `Opened`, so no
+    /// PSRP handshake is replayed here.
+    // Stays `async` for API stability (2.0.x): callers `.await` it, and the
+    // existing-client reconnect no longer needs to send or receive anything
+    // now that the transport does the WSMan Reconnect itself.
+    #[allow(clippy::unused_async_trait_impl)]
     pub async fn reconnect<T: PsrpTransport>(self, transport: T) -> Result<RunspacePool<T>> {
         let mut machine =
             RunspacePoolStateMachine::new(self.rpid, self.min_runspaces, self.max_runspaces)?;
-        // Skip straight to NegotiationSent — the server already knows our
-        // RPID, we just need to reconnect to the existing runspace.
+        // Existing-client reconnect: the transport has already issued the
+        // WSMan Reconnect, and the reused SessionId keeps the server-side
+        // runspace Opened. `connect` therefore emits no PSRP message and
+        // marks the machine Opened — no handshake to send, no state to drain.
+        // Replaying the handshake and draining for a fresh Opened state made
+        // the follow-up Receive time out (`w:TimedOut`), the server having
+        // nothing left to say.
         let actions = machine.connect();
-        let mut pool = RunspacePool {
+        debug_assert!(actions.is_empty() && machine.is_opened());
+        let pool = RunspacePool {
             transport,
             reassembler: Reassembler::new(),
             machine,
@@ -602,8 +613,6 @@ impl DisconnectedPool {
             session_key: self.session_key,
             pending_messages: Vec::new(),
         };
-        pool.execute(actions).await?;
-        pool.drain_until_opened().await?;
         Ok(pool)
     }
 }
@@ -1032,17 +1041,15 @@ mod tests {
         let pool = RunspacePool::open_with_transport(t).await.unwrap();
         let disconnected = pool.disconnect().await.unwrap();
 
-        // Second half: build a brand new mock, push an Opened state at
-        // the front so the reconnect drain sees it, then reconnect.
+        // Second half: existing-client reconnect. The WSMan Reconnect the
+        // transport performs already resumed the shell, so the pool is Opened
+        // with no PSRP handshake and nothing to drain — pushing an Opened
+        // state or expecting SessionCapability/ConnectRunspacePool would
+        // encode the old bug that timed the server out (`w:TimedOut`).
         let t2 = MockTransport::new();
-        t2.inbox
-            .lock()
-            .unwrap()
-            .push_front(wire(1, &state_message_bytes(RunspacePoolState::Opened)));
         let pool = disconnected.reconnect(t2.clone()).await.unwrap();
         assert_eq!(pool.state(), RunspacePoolState::Opened);
-        // Reconnect should have sent SessionCapability + ConnectRunspacePool.
-        assert_eq!(t2.sent().len(), 2);
+        assert!(t2.sent().is_empty(), "reconnect must send no PSRP message");
         let _ = pool.close().await;
     }
 
