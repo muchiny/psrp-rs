@@ -6,6 +6,42 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.1] — 2026-09-04
+
+A shell-lifecycle leak, found by running the crate against live Windows
+hosts — Server 2012 R2 and Server 2025 — rather than by reading it. It pairs
+with the two leaks fixed in `winrm-rs` 1.2.1, which this release now
+requires: without that one, closing a PSRP pool addressed the Delete to the
+`cmd` plugin, the server answered `InvalidSelectors: the shell was not
+found`, and the runspace kept running.
+
+### Fixed
+
+- **A failed `RunspacePool::disconnect` abandoned the runspace.**
+  `disconnect` takes `self`, so an error from the transport destroyed the
+  pool — and with it the caller's only handle to a runspace that was still
+  live on the server. The WinRS PowerShell plugin rejects Disconnect on both
+  Server 2012 R2 and Server 2025, so every attempt leaked one runspace
+  against `MaxShellsPerUser` (30 by default), after which every new pool
+  failed to open with `InternalError`. The shell is now closed through the
+  transport before the original error is surfaced.
+  (`src/runspace/pool.rs`)
+
+### Changed
+
+- **`winrm-rs` requirement raised to `"1.2.1"`** (from `"1.2"`). 1.2.1 is
+  what makes `Shell::close` address Delete under the shell's own
+  ResourceURI, which is the other half of the leak above.
+
+### Known
+
+- `live_disconnect_reconnect_pool` still exercises nothing on a real server.
+  Server 2025 refuses the Disconnect with `This WinRS shell instance does not
+  support disconnect and reconnect operations because it was created by an
+  older WinRS client`, so the shells created through `WinrmPsrpTransport` are
+  not marked disconnect-capable on any Windows tested. The whole
+  disconnect/reconnect path remains covered by `MockTransport` only.
+
 ## [2.0.0] — 2026-09-03
 
 Also ships everything listed under [1.1.0](#110--2026-06-03), which was

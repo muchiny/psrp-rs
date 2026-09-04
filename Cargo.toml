@@ -1,6 +1,6 @@
 [package]
 name = "psrp-rs"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -24,11 +24,13 @@ include = [
 ]
 
 [dependencies]
-# 1.2 is a floor, not a convenience: it carries the fix for the XML
+# 1.2.1 is a floor, not a convenience. 1.2 carries the fix for the XML
 # injection in the SOAP `ResourceURI` header and raises winrm-rs's MSRV
-# to 1.98 to match ours. Allowing 1.0/1.1 would let a consumer resolve
-# the unfixed envelope builder.
-winrm-rs = "1.2"
+# to 1.98 to match ours; 1.2.1 makes `Shell::close` address Delete under
+# the shell's own ResourceURI, without which every PSRP pool this crate
+# closes leaves its runspace running on the server. Allowing anything
+# older would let a consumer resolve a build that leaks.
+winrm-rs = "1.2.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"

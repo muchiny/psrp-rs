@@ -214,7 +214,21 @@ impl<T: PsrpTransport> RunspacePool<T> {
             return Err(PsrpError::protocol("pool already closed"));
         }
         self.closed = true;
-        let shell_id = self.transport.disconnect_shell().await?;
+        let shell_id = match self.transport.disconnect_shell().await {
+            Ok(id) => id,
+            Err(e) => {
+                // `disconnect` takes `self`, so a failure here would drop the
+                // pool — and with it the only handle to the server-side
+                // runspace, which stays alive. The WinRS PowerShell plugin on
+                // Server 2012 R2 rejects Disconnect outright, so every attempt
+                // leaked one runspace against `MaxShellsPerUser`. Tear the
+                // shell down before surfacing the error.
+                if let Err(close_err) = self.transport.close_shell().await {
+                    tracing::debug!("shell close after failed disconnect: {close_err}");
+                }
+                return Err(e);
+            }
+        };
         Ok(DisconnectedPool {
             shell_id,
             rpid: self.machine.rpid(),
