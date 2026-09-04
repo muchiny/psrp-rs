@@ -3136,6 +3136,8 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winrm-rs"
 version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4683126944f2b2207e1b4930217b66d1e2ad4ac7fcf2e4b376a1628f70b30e3"
 dependencies = [
  "base64 0.23.1",
  "hmac 0.13.0",
