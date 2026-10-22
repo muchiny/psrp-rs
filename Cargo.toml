@@ -53,8 +53,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"], optional = true }
 hmac = { version = "0.13", optional = true }
 # HMAC-SHA1 for hashed `known_hosts` entries needs the digest 0.11 line of
-# `sha1`; the unaliased `sha1` above stays on 0.10 because `rsa` 0.9 (OAEP)
-# is built on digest 0.10.
+# `sha1`; the unaliased `sha1` above stays on 0.10 because `rsa` 0.9 is
+# built on digest 0.10 (psrp-rs no longer uses it: the session-key exchange
+# is RSAES-PKCS1-v1_5, which takes no hash).
 sha1_hmac = { package = "sha1", version = "0.11", default-features = false, optional = true }
 # SSH password and key passphrase: wiped on drop. Same crate and version
 # line as the `SecretString` in `winrm-rs`'s credentials.

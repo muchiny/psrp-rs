@@ -27,7 +27,7 @@ Use [GitHub Security Advisories](../../security/advisories/new) to report privat
 
 ## Scope
 
-psrp-rs parses data received from a remote PowerShell host (PSRP fragments, messages and CLIXML), handles credentials through `winrm-rs`, and with the `ssh` feature verifies SSH host keys (`known_hosts`, pinned fingerprints) and holds the SSH password or key passphrase. Reports about parser crashes, unbounded resource use on hostile input, credential exposure, host-key verification that accepts a key OpenSSH would refuse, or TLS/authentication weaknesses are in scope.
+psrp-rs parses data received from a remote PowerShell host (PSRP fragments, messages and CLIXML, the `EncryptedSessionKey` message and the key it wraps, and with the `ssh` feature the PowerShell out-of-process stream received over SSH), handles credentials through `winrm-rs`, and with the `ssh` feature verifies SSH host keys (`known_hosts`, pinned fingerprints) and holds the SSH password or key passphrase. Reports about parser crashes, unbounded resource use on hostile input, credential exposure, host-key verification that accepts a key OpenSSH would refuse, or TLS/authentication weaknesses are in scope.
 
 ## Supply Chain
 
