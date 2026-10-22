@@ -42,6 +42,10 @@ specifies base64 and RSAES-PKCS1-v1_5; it now follows the specification.
   fails closed (`WinrmError::Ntlm`, the pool has to be reopened), and
   Kerberos under `EncryptionMode::Auto` seals over HTTP (a realm with RC4
   keys only needs `EncryptionMode::Never`).
+- A `PsrpTransport` that wraps or forwards to another one must forward the
+  new `send_pipeline_fragment` too: its default goes through
+  `send_fragment`, to the pool, so around `SshPsrpTransport` every pipeline
+  message would go out on `Guid.Empty`.
 
 ### Changed
 
@@ -84,6 +88,18 @@ specifies base64 and RSAES-PKCS1-v1_5; it now follows the specification.
   checks (bad padding, wrong key length) with the one message
   `session key unwrap failed`, so the error does not tell a padding
   failure from a length failure.
+- **`RunspacePool::close` over SSH returns the error when the session had
+  already broken** (the server died, an acknowledgement timed out), where
+  it used to return `Ok`. The SSH channel and connection are torn down
+  either way.
+- **Over SSH, a request abandoned mid-write or between two `<Data>` lines
+  breaks the session.** A future dropped (by a timeout or `select!`) while
+  a line was being written, or before the last `<Data>` line of a message
+  above 32 KiB was acknowledged, could leave a partial line or a partial
+  PSRP fragment on the server: the next operation now fails with a
+  protocol error and writes nothing, and the pool has to be reopened.
+  `signal_stop` after such a drop (as `Pipeline::run_with_cancel` sends
+  it) may then report that protocol error instead of `Cancelled`.
 
 ### Added
 
@@ -188,6 +204,14 @@ specifies base64 and RSAES-PKCS1-v1_5; it now follows the specification.
   so did `SshConfig`'s, which derives `Debug`: logging a configuration with
   `{:?}` leaked the secret. Both now show `<redacted>`; the key path is
   still printed.
+- **The SSH transport bounds what a hostile server can cost.** A line
+  trickled in one byte per packet, an element with ~100k attributes or a
+  flood of one-byte `<Data>` lines costs linear CPU and bounded memory;
+  `connect` buffers at most 1 MiB of output before the subsystem reply,
+  then fails with "SSH server sent unexpected output before the subsystem
+  replied"; and the text the server controls (its `__NamedPipeError__:`
+  message, sshd's stderr in the debug log, a host certificate's key id in
+  a warning) is truncated, its control and bidi characters escaped.
 
 ### Known
 

@@ -21,7 +21,8 @@
 //! `server/OutOfProcServerMediator.cs` (what the server rejects, 102-107 and 347-416).
 //!
 //! Layers: `packet` (pure, synchronous codec), `session` (the stop-and-wait
-//! engine, generic over a `Pipe`) and, in tests only, `fake` (a fake `pwsh`).
+//! engine, generic over a `Pipe`), `transport` (the `PsrpTransport` adapter
+//! over a session) and, in tests only, `fake` (a fake `pwsh`).
 //! This module never touches `russh` or `winrm_rs`.
 
 #[cfg(test)]

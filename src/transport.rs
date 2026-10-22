@@ -14,11 +14,22 @@ use crate::error::{PsrpError, Result};
 /// Abstract transport used by the runspace pool and pipeline.
 ///
 /// `send_fragment` sends the messages addressed to the pool and
-/// `send_pipeline_fragment` those addressed to a pipeline. Both MUST write
-/// the pre-encoded fragment bytes as a single `send_input` call. `recv_chunk` MUST transparently retry on
-/// `WinrmError::Timeout` (long-polling is expected) but propagate every
-/// other error — in particular SOAP faults, which usually mean the
-/// server-side shell has died and the pool must be recreated.
+/// `send_pipeline_fragment` those addressed to a pipeline, as pre-encoded
+/// fragment bytes. How they travel is up to each transport:
+/// [`WinrmPsrpTransport`] writes them in a single `send_input` call; the
+/// SSH transport (`ssh` feature) writes them in `<Data>` lines of at most
+/// 32 KiB, each acknowledged before the next. `recv_chunk` MUST
+/// transparently retry on `WinrmError::Timeout` (long-polling is expected)
+/// but propagate every other error — in particular SOAP faults, which
+/// usually mean the server-side shell has died and the pool must be
+/// recreated.
+///
+/// A transport that wraps or forwards to another one MUST forward
+/// `send_pipeline_fragment` too, not only `send_fragment`. Its default
+/// body calls `send_fragment`, which addresses the pool: around the SSH
+/// transport, such a wrapper would send every pipeline message on
+/// `Guid.Empty` instead of the pipeline's id, with no compile error and
+/// no warning.
 #[async_trait]
 pub trait PsrpTransport: Send {
     async fn send_fragment(&self, bytes: &[u8]) -> Result<()>;
