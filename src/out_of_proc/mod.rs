@@ -20,7 +20,9 @@
 //! client side of the error line, 417 and 1899-1923) and
 //! `server/OutOfProcServerMediator.cs` (what the server rejects, 102-107 and 347-416).
 //!
-//! This module is pure and synchronous: it never touches `russh` or `winrm_rs`.
+//! Layers: `packet` (pure, synchronous codec), `session` (the stop-and-wait
+//! engine, generic over a `Pipe`) and, in tests only, `fake` (a fake `pwsh`).
+//! This module never touches `russh` or `winrm_rs`.
 
 // removed by Task 5 (the three lint attributes below)
 #![cfg_attr(
@@ -48,7 +50,10 @@
     )
 )]
 
+#[cfg(test)]
+mod fake;
 mod packet;
+mod session;
 
 pub(crate) use packet::{
     LineSplitter, MAX_DATA_PAYLOAD, MAX_LINE_BYTES, Packet, SERVER_ERROR_PREFIX, Stream, parse_line,
