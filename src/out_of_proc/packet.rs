@@ -124,17 +124,23 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<Packet>> {
     })
 }
 
-/// The first `QUOTED_LINE_CHARS` characters of `line`, escaped for a log message.
-fn quote(line: &str) -> String {
-    let mut out: String = line
+/// The first `QUOTED_LINE_CHARS` characters of `text`, escaped for a log message.
+///
+/// Everything remote-controlled that reaches an error message goes through here.
+fn snippet(text: &str) -> String {
+    let mut out: String = text
         .chars()
         .take(QUOTED_LINE_CHARS)
         .flat_map(char::escape_debug)
         .collect();
-    if line.chars().nth(QUOTED_LINE_CHARS).is_some() {
+    if text.chars().nth(QUOTED_LINE_CHARS).is_some() {
         out.push('…');
     }
-    format!("\"{out}\"")
+    out
+}
+
+fn quote(line: &str) -> String {
+    format!("\"{}\"", snippet(line))
 }
 
 /// Parse exactly one packet element, with nothing before or after it.
@@ -147,7 +153,10 @@ fn parse_element(line: &str) -> std::result::Result<Packet, String> {
     let packet = match next_event(&mut reader)? {
         Event::Start(start) => {
             if start.name().as_ref() != "Data" {
-                return Err(format!("unexpected element <{}>", start.name().as_ref()));
+                return Err(format!(
+                    "unexpected element <{}>",
+                    snippet(start.name().as_ref())
+                ));
             }
             let (stream, guid) = data_attributes(&start)?;
             let text = match next_event(&mut reader)? {
@@ -177,7 +186,7 @@ fn parse_element(line: &str) -> std::result::Result<Packet, String> {
                 "SignalAck" => Packet::SignalAck,
                 "Close" => Packet::Close,
                 "CloseAck" => Packet::CloseAck,
-                other => return Err(format!("unexpected element <{other}/>")),
+                other => return Err(format!("unexpected element <{}/>", snippet(other))),
             };
             make(guid_attribute(&element)?)
         }
@@ -190,21 +199,21 @@ fn parse_element(line: &str) -> std::result::Result<Packet, String> {
 }
 
 fn next_event<'a>(reader: &mut Reader<&'a [u8]>) -> std::result::Result<Event<'a>, String> {
-    reader.read_event().map_err(|e| e.to_string())
+    reader.read_event().map_err(|e| snippet(&e.to_string()))
 }
 
 /// The attributes of an element, as `(name, value)` pairs. Duplicates are an error.
 fn attributes(element: &BytesStart<'_>) -> std::result::Result<Vec<(String, String)>, String> {
     let mut out: Vec<(String, String)> = Vec::new();
     for attr in element.attributes() {
-        let attr = attr.map_err(|e| e.to_string())?;
+        let attr = attr.map_err(|e| snippet(&e.to_string()))?;
         let name = attr.key.as_ref().to_owned();
         if out.iter().any(|(n, _)| *n == name) {
-            return Err(format!("duplicate attribute {name}"));
+            return Err(format!("duplicate attribute {}", snippet(&name)));
         }
         let value = attr
             .normalized_value(XmlVersion::Implicit1_0)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| snippet(&e.to_string()))?
             .into_owned();
         out.push((name, value));
     }
@@ -461,6 +470,26 @@ mod tests {
         let msg = parse_line("bad\u{1b}[31m line").unwrap_err().to_string();
         assert!(msg.contains("\\u{1b}"), "{msg}");
         assert!(!msg.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn error_never_echoes_remote_names_untruncated_or_unescaped() {
+        // Remote-controlled names: 500 chars with a control char in the middle.
+        let name = format!("{}\u{7}{}", "x".repeat(250), "x".repeat(250));
+        let lines = [
+            format!("<{name} PSGuid='{G}' />"),
+            format!("<{name} Stream='Default' PSGuid='{G}'>AA==</{name}>"),
+            format!("<DataAck {name}='1' {name}='2' />"),
+            format!("<DataAck {name}='1' />"),
+            format!("<Data Stream='Default' PSGuid='{G}'>AA==</{name}>"),
+            format!("<DataAck {name}"),
+            format!("<DataAck PSGuid='{G}' {name}"),
+        ];
+        for line in lines {
+            let msg = parse_line(&line).unwrap_err().to_string();
+            assert!(!msg.contains(&"x".repeat(81)), "long echo: {msg}");
+            assert!(!msg.chars().any(char::is_control), "raw control: {msg:?}");
+        }
     }
 
     #[test]

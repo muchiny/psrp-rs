@@ -22,6 +22,7 @@
 //!
 //! This module is pure and synchronous: it never touches `russh` or `winrm_rs`.
 
+// removed by Task 5 (the three lint attributes below)
 #![cfg_attr(
     not(test),
     expect(
