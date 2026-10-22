@@ -664,7 +664,20 @@ mod tests {
     async fn server_may_not_send_client_packets() {
         let (mut s, h) = session();
         h.inject(&server_line(&Packet::Command(G)));
-        assert!(s.recv().await.is_err());
+        let err = s.recv().await.unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        assert!(
+            err.to_string().contains(
+                "PowerShell sent a packet only a client may send: \
+                 <Command PSGuid='0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9' />"
+            ),
+            "{err}"
+        );
+        // The session is broken: a later request fails the same way and
+        // writes nothing.
+        let again = s.send(Uuid::nil(), b"a").await.unwrap_err();
+        assert_eq!(again.to_string(), err.to_string());
+        assert!(h.written().is_empty(), "{:?}", h.written());
     }
 
     #[tokio::test(start_paused = true)]
@@ -848,10 +861,16 @@ mod tests {
         h.hold_replies(true);
 
         let first = s.send(Uuid::nil(), b"a").await.unwrap_err();
-        assert!(first.to_string().contains("within 60 s"), "{first}");
+        assert!(
+            first.to_string().contains(&format!(
+                "PowerShell did not acknowledge Data for {NIL} within 60 s"
+            )),
+            "{first}"
+        );
 
         let second = s.send(Uuid::nil(), b"b").await.unwrap_err();
         assert!(matches!(second, PsrpError::Protocol(_)), "{second:?}");
+        assert_eq!(second.to_string(), first.to_string());
         assert_eq!(h.written().len(), 1, "{:?}", h.written());
     }
 
@@ -865,7 +884,13 @@ mod tests {
         }
         h.hold_replies(false);
 
-        assert!(s.send(Uuid::nil(), b"a").await.is_err());
+        let err = s.send(Uuid::nil(), b"a").await.unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("PowerShell sent more than 1024 bytes of data that were not received"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

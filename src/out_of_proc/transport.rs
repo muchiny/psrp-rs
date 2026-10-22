@@ -280,7 +280,15 @@ mod tests {
 
         let err = pool.close().await.unwrap_err();
 
-        assert!(err.to_string().contains("within 60 s"), "{err}");
+        // The pool's CloseRunspacePool message (Data on the pool) goes
+        // first, and its acknowledgement never comes.
+        assert!(
+            err.to_string().contains(
+                "PowerShell did not acknowledge Data for \
+                 00000000-0000-0000-0000-000000000000 within 60 s"
+            ),
+            "{err}"
+        );
         assert!(h.violations().is_empty(), "{:?}", h.violations());
         Ok(())
     }
