@@ -24,38 +24,13 @@
 //! engine, generic over a `Pipe`) and, in tests only, `fake` (a fake `pwsh`).
 //! This module never touches `russh` or `winrm_rs`.
 
-// removed by Task 5 (the three lint attributes below)
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into SshPsrpTransport by a later commit of this series"
-    )
-)]
-#![cfg_attr(
-    not(test),
-    expect(
-        unused_imports,
-        reason = "re-exports consumed by SshPsrpTransport in a later commit of this series"
-    )
-)]
-// The unit tests exercise `packet` directly, so under `cfg(test)` the
-// re-exports below and the not-yet-used items would only warn.
-#![cfg_attr(
-    test,
-    allow(
-        dead_code,
-        unused_imports,
-        reason = "wired into SshPsrpTransport by a later commit of this series"
-    )
-)]
-
 #[cfg(test)]
 mod fake;
 mod packet;
 mod session;
 mod transport;
 
-pub(crate) use packet::{
-    LineSplitter, MAX_DATA_PAYLOAD, MAX_LINE_BYTES, Packet, SERVER_ERROR_PREFIX, Stream, parse_line,
-};
+#[cfg(test)]
+pub(crate) use packet::{Packet, parse_line};
+pub(crate) use session::Pipe;
+pub(crate) use transport::OutOfProcTransport;
