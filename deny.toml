@@ -14,7 +14,7 @@ yanked = "deny"
 ignore = [
   # RUSTSEC-2023-0071 — "Marvin attack" timing side channel in `rsa`.
   #
-  # MS-PSRP §3.1.2 requires RSA-OAEP(SHA-1) to unwrap the AES session
+  # MS-PSRP 2.2.2.4 requires RSAES-PKCS1-v1_5 to unwrap the AES session
   # key used for `SecureString` transport, so the dependency is not
   # optional. There is **no fixed release**: the advisory applies to
   # every `rsa` 0.9.x and to the 0.10 release candidates alike, so

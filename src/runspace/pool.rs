@@ -308,18 +308,27 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// Sends a `PublicKey` message containing a freshly-generated
     /// 2048-bit RSA public key and blocks until the server responds
     /// with an `EncryptedSessionKey` — the 256-bit AES key wrapped in
-    /// RSA-OAEP(SHA-1).
+    /// RSAES-PKCS1-v1_5, base64-encoded.
     pub async fn request_session_key(&mut self) -> Result<()> {
         if self.session_key.is_some() {
             return Ok(());
         }
         let client_key = crate::crypto::ClientSessionKey::generate()?;
-        let blob_hex = client_key.public_blob_hex();
-        // PSRP §2.2.2.4 — PublicKey message body is an <Obj> with a
-        // single <MS>/<S N="PublicKey"> containing the blob.
-        let body = crate::clixml::to_clixml(&PsValue::Object(
-            PsObject::new().with("PublicKey", PsValue::String(blob_hex)),
-        ));
+        self.exchange_session_key(&client_key).await
+    }
+
+    /// The exchange of [`request_session_key`](Self::request_session_key)
+    /// with a caller-supplied key pair (so tests need not generate one).
+    async fn exchange_session_key(
+        &mut self,
+        client_key: &crate::crypto::ClientSessionKey,
+    ) -> Result<()> {
+        // MS-PSRP 2.2.2.3 — the PublicKey message body is an <Obj> with a
+        // single <MS>/<S N="PublicKey"> holding the base64 PUBLICKEYBLOB.
+        let body = crate::clixml::to_clixml(&PsValue::Object(PsObject::new().with(
+            "PublicKey",
+            PsValue::String(client_key.public_blob_base64()),
+        )));
         self.send_psrp_message(MessageType::PublicKey, body).await?;
 
         // Drain until we get the EncryptedSessionKey.
@@ -327,7 +336,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
             let msg = self.next_message().await?;
             if msg.message_type == MessageType::EncryptedSessionKey {
                 let parsed = parse_clixml(&msg.data)?;
-                let hex = parsed
+                let encoded = parsed
                     .into_iter()
                     .find_map(|v| match v {
                         PsValue::Object(obj) => obj
@@ -341,7 +350,9 @@ impl<T: PsrpTransport> RunspacePool<T> {
                             "EncryptedSessionKey message missing EncryptedSessionKey property",
                         )
                     })?;
-                let bytes = hex_decode(&hex)?;
+                // MS-PSRP 2.2.2.4 — the property is base64, not hex.
+                let bytes = crate::clixml::encode::base64_decode(&encoded)
+                    .ok_or_else(|| PsrpError::protocol("EncryptedSessionKey: invalid base64"))?;
                 let raw = client_key.decrypt_session_key(&bytes)?;
                 self.session_key = Some(crate::crypto::SessionKey::from_bytes(raw));
                 return Ok(());
@@ -616,29 +627,6 @@ impl DisconnectedPool {
             pending_messages: Vec::new(),
         };
         Ok(pool)
-    }
-}
-
-pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if clean.len() % 2 != 0 {
-        return Err(PsrpError::protocol("hex: odd length"));
-    }
-    let mut out = Vec::with_capacity(clean.len() / 2);
-    for pair in clean.as_bytes().as_chunks::<2>().0 {
-        let hi = hex_digit(pair[0])?;
-        let lo = hex_digit(pair[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-fn hex_digit(b: u8) -> Result<u8> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(PsrpError::protocol(format!("hex: invalid digit 0x{b:02X}"))),
     }
 }
 
@@ -1070,15 +1058,121 @@ mod tests {
         // Double-close was already covered; this just keeps the symmetry.
     }
 
+    /// An opened mock pool plus a key pair for the exchange.
+    async fn pool_for_key_exchange() -> (
+        MockTransport,
+        RunspacePool<MockTransport>,
+        crate::crypto::ClientSessionKey,
+    ) {
+        let t = MockTransport::new();
+        t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Opened)));
+        let pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
+        let key = crate::crypto::ClientSessionKey::generate().unwrap();
+        (t, pool, key)
+    }
+
+    fn encrypted_session_key_reply(property: &str) -> Vec<u8> {
+        wire(
+            9,
+            &PsrpMessage {
+                destination: Destination::Client,
+                message_type: MessageType::EncryptedSessionKey,
+                rpid: Uuid::nil(),
+                pid: Uuid::nil(),
+                data: to_clixml(&PsValue::Object(
+                    PsObject::new().with("EncryptedSessionKey", PsValue::String(property.into())),
+                )),
+            }
+            .encode(),
+        )
+    }
+
+    /// The `PublicKey` string of the last message the pool sent.
+    fn sent_public_key(t: &MockTransport) -> String {
+        let sent = t.sent();
+        let mut reassembler = Reassembler::new();
+        let payload = reassembler
+            .feed(sent.last().expect("a message was sent"))
+            .unwrap()
+            .pop()
+            .expect("one complete message");
+        let msg = PsrpMessage::decode(&payload).unwrap();
+        assert_eq!(msg.message_type, MessageType::PublicKey);
+        parse_clixml(&msg.data)
+            .unwrap()
+            .into_iter()
+            .find_map(|v| match v {
+                PsValue::Object(o) => o
+                    .get("PublicKey")
+                    .and_then(PsValue::as_str)
+                    .map(str::to_string),
+                _ => None,
+            })
+            .expect("PublicKey property")
+    }
+
     #[tokio::test]
-    async fn hex_decode_roundtrip_and_errors() {
-        // Exercise the hex helper via a fake EncryptedSessionKey path.
+    async fn session_key_exchange_uses_base64_both_ways() {
+        // MS-PSRP 2.2.2.3 / 2.2.2.4: the PUBLICKEYBLOB and the encrypted
+        // session key are both base64. The "server" here wraps an AES key
+        // from the blob it reads back out of the sent message.
+        let (t, mut pool, key) = pool_for_key_exchange().await;
+        let aes = [0x42u8; 32];
+        let blob = key.public_blob();
+        let wrapped = crate::crypto::test_support::server_wrap_session_key(&blob, &aes);
+        t.push_incoming(encrypted_session_key_reply(
+            &crate::clixml::encode::base64_encode(&wrapped),
+        ));
+
+        pool.exchange_session_key(&key).await.unwrap();
+
+        let public_key = sent_public_key(&t);
         assert_eq!(
-            hex_decode("deadBEEF").unwrap(),
-            vec![0xde, 0xad, 0xbe, 0xef]
+            crate::clixml::encode::base64_decode(&public_key).as_deref(),
+            Some(blob.as_slice()),
+            "PublicKey must be the base64 of the 276-byte PUBLICKEYBLOB: {public_key}"
         );
-        assert!(hex_decode("ABC").is_err()); // odd length
-        assert!(hex_decode("GG").is_err()); // bad digit
+        assert_eq!(blob.len(), 276);
+        // The unwrapped key is the one the server chose.
+        let sealed = crate::crypto::SessionKey::from_bytes(aes).encrypt_secure_string("pw");
+        assert_eq!(
+            pool.session_key()
+                .unwrap()
+                .decrypt_secure_string(&sealed)
+                .unwrap(),
+            "pw"
+        );
+        let _ = pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn session_key_exchange_rejects_a_hex_reply() {
+        // The old (wrong) encoding: hex of the SIMPLEBLOB. Its characters
+        // happen to be valid base64, so it must fail on length/header, not
+        // panic and not yield a key.
+        let (t, mut pool, key) = pool_for_key_exchange().await;
+        let wrapped =
+            crate::crypto::test_support::server_wrap_session_key(&key.public_blob(), &[1; 32]);
+        let hex = wrapped.iter().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02X}");
+            acc
+        });
+        t.push_incoming(encrypted_session_key_reply(&hex));
+        let err = pool.exchange_session_key(&key).await.unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        assert!(pool.session_key().is_none());
+        let _ = pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn session_key_exchange_rejects_invalid_base64_reply() {
+        let (t, mut pool, key) = pool_for_key_exchange().await;
+        t.push_incoming(encrypted_session_key_reply("not base64 !!!"));
+        let err = pool.exchange_session_key(&key).await.unwrap_err();
+        assert!(err.to_string().contains("base64"), "{err}");
+        assert!(pool.session_key().is_none());
+        let _ = pool.close().await;
     }
 
     #[test]

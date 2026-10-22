@@ -54,11 +54,6 @@ pub mod parse {
         crate::metadata::state_from_xml(xml)
     }
 
-    /// Decode the hex-encoded body of an `EncryptedSessionKey` message.
-    pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
-        crate::runspace::pool::hex_decode(s)
-    }
-
     /// Decode a `Get-Command` metadata object.
     #[must_use]
     pub fn command_metadata(value: &PsValue) -> Option<crate::metadata::CommandMetadata> {
