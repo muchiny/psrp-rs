@@ -68,6 +68,8 @@ pub mod host;
 pub mod internal;
 pub mod message;
 pub mod metadata;
+#[cfg(feature = "ssh")]
+mod out_of_proc;
 pub mod pipeline;
 pub mod records;
 pub mod runspace;
