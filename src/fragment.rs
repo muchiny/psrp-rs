@@ -287,7 +287,8 @@ mod tests {
         let bytes = encode_message(2, &payload);
         let (a, b) = bytes.split_at(10);
         let mut r = Reassembler::new();
-        assert!(r.feed(a).unwrap().is_empty());
+        let fed = r.feed(a).unwrap();
+        assert!(fed.is_empty(), "{fed:?}");
         let out = r.feed(b).unwrap();
         assert_eq!(out, vec![payload]);
     }

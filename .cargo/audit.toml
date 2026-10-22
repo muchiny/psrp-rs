@@ -1,0 +1,8 @@
+# Lu par `cargo audit` (même exception que deny.toml, à garder synchronisées).
+[advisories]
+ignore = [
+  # rsa (Marvin) : aucune version corrigée. Concerne le rsa 0.9 de l'échange
+  # de clé de session MS-PSRP et le rsa 0.10-rc tiré par russh/ssh-key
+  # (clés d'hôte et clés utilisateur RSA). Revue avant 2027-01-19.
+  "RUSTSEC-2023-0071",
+]

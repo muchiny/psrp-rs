@@ -140,7 +140,10 @@ async fn open_pool_and_run_script() {
     assert_eq!(out, vec![PsValue::String("hello".into()), PsValue::I32(42)]);
     pool.close().await.unwrap();
     assert!(*transport.closed.lock().unwrap());
-    assert!(!transport.sent().is_empty());
+    assert!(
+        !transport.sent().is_empty(),
+        "aucun message envoyé par le transport"
+    );
 }
 
 #[tokio::test]

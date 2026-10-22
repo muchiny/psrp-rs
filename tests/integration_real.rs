@@ -171,7 +171,7 @@ async fn live_pipeline_builder_with_parameter() {
         .expect("run_all_streams");
     assert_eq!(result.state, PipelineState::Completed);
     assert_eq!(result.output, vec![PsValue::I32(42)]);
-    assert!(result.errors.is_empty());
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
 
     let _ = pool.close().await;
 }

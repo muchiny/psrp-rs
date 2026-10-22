@@ -907,7 +907,7 @@ mod tests {
         let got = parse_clixml("<Obj RefId=\"0\"></Obj>").unwrap();
         if let PsValue::Object(o) = &got[0] {
             assert!(o.properties.is_empty());
-            assert!(o.type_names.is_empty());
+            assert!(o.type_names.is_empty(), "{:?}", o.type_names);
         } else {
             panic!();
         }

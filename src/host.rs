@@ -700,7 +700,7 @@ mod tests {
                 choices: &[(String, String)],
                 _default: i32,
             ) -> Result<i32> {
-                assert!(choices.is_empty());
+                assert!(choices.is_empty(), "{choices:?}");
                 Ok(0)
             }
         }
@@ -731,7 +731,7 @@ mod tests {
                 _message: &str,
                 fields: &[String],
             ) -> Result<Vec<PsValue>> {
-                assert!(fields.is_empty());
+                assert!(fields.is_empty(), "{fields:?}");
                 Ok(vec![])
             }
         }
