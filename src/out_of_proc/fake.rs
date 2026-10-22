@@ -62,6 +62,8 @@ struct State {
 
     // Configuration.
     die_after: Option<usize>,
+    /// Replies to the client lines after this many are held.
+    hold_after: Option<usize>,
     chunk_size: Option<usize>,
     output: Vec<PsValue>,
     run_forever: bool,
@@ -134,6 +136,9 @@ impl State {
         if self.die_after == Some(self.lines_seen) {
             self.die();
             return;
+        }
+        if self.hold_after.is_some_and(|n| self.lines_seen > n) {
+            self.held.get_or_insert_with(Vec::new);
         }
         for (text, is_ack) in replies {
             self.emit(&text);
@@ -462,16 +467,26 @@ impl FakeHandle {
     }
 
     /// While on, replies (and injected text) are buffered, invisible to `read`.
+    /// Turning it off also cancels [`Self::hold_replies_after_writes`].
     pub(crate) fn hold_replies(&self, on: bool) {
         {
             let mut state = lock(&self.state);
             if on {
                 state.held.get_or_insert_with(Vec::new);
-            } else if let Some(held) = state.held.take() {
-                state.out.extend(held);
+            } else {
+                state.hold_after = None;
+                if let Some(held) = state.held.take() {
+                    state.out.extend(held);
+                }
             }
         }
         self.notify.notify_one();
+    }
+
+    /// Replies to the first `n` client lines go out as usual; from the next
+    /// one on, replies are held as by [`Self::hold_replies`].
+    pub(crate) fn hold_replies_after_writes(&self, n: usize) {
+        lock(&self.state).hold_after = Some(n);
     }
 
     /// While on, `write` hands the first half of its bytes to the server and

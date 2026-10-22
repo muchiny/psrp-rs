@@ -18,10 +18,12 @@
 //! of the line on the wire, which would corrupt the next line and kill
 //! `pwsh`. The session then fails closed: the next operation breaks it ("a
 //! request was abandoned while its line was being written") and writes
-//! nothing. A send dropped between two `<Data>` lines of one payload leaves a
-//! partial PSRP message on the server: discarded when the pipeline's command
-//! is closed, but on the session (`Guid.Empty`) it stays in the server's
-//! reassembler.
+//! nothing. A send of more than [`MAX_DATA_PAYLOAD`] bytes (several `<Data>`
+//! lines) dropped before its last line was acknowledged may leave part of a
+//! PSRP fragment in `pwsh`'s byte-level reassembler, which would then read
+//! every later byte at a shifted offset: the next operation likewise breaks
+//! the session ("a send was abandoned between two Data lines") and writes
+//! nothing.
 //!
 //! Every wait for an acknowledgement is bounded by [`ACK_TIMEOUT`]; expiry,
 //! end of stream, a server error line or a malformed line break the session
@@ -42,12 +44,21 @@ use crate::error::{PsrpError, Result};
 /// for the session `CloseAck`.
 pub(crate) const ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Received `<Data>` bytes not yet taken by [`OutOfProcSession::recv`] beyond
-/// which the session is broken.
+/// Received `<Data>` bytes not yet taken by [`OutOfProcSession::recv`],
+/// [`QUEUE_ENTRY_OVERHEAD`] included, beyond which the session is broken.
 pub(crate) const MAX_QUEUED_BYTES: usize = 64 << 20;
+
+/// What one queued payload costs beyond its bytes: its `Vec` header in the
+/// queue and its heap allocation. Without it, a flood of one-byte `<Data>`
+/// lines would let [`MAX_QUEUED_BYTES`] of payload mean gigabytes of heap.
+const QUEUE_ENTRY_OVERHEAD: usize = 64;
 
 /// Why the session breaks when a request was dropped in the middle of [`Pipe::write`].
 const ABANDONED_WRITE: &str = "a request was abandoned while its line was being written";
+
+/// Why the session breaks when a send was dropped before the last `<Data>`
+/// line of its payload.
+const ABANDONED_PAYLOAD: &str = "a send was abandoned between two Data lines";
 
 /// The byte channel to a `pwsh -sshs` process: its stdin and its stdout.
 #[async_trait]
@@ -74,7 +85,7 @@ pub(crate) struct OutOfProcSession<P: Pipe> {
     lines: LineSplitter,
     /// `<Data>` payloads received and not yet handed out by `recv`.
     inbound: VecDeque<Vec<u8>>,
-    /// Total bytes in `inbound`.
+    /// What `inbound` costs: its bytes plus [`QUEUE_ENTRY_OVERHEAD`] per entry.
     inbound_bytes: usize,
     /// Limit on `inbound_bytes`: [`MAX_QUEUED_BYTES`] outside tests.
     max_queued_bytes: usize,
@@ -84,6 +95,10 @@ pub(crate) struct OutOfProcSession<P: Pipe> {
     /// the write was abandoned, maybe with part of the line sent. Implies
     /// `awaiting`, which only a `pump` (which checks this first) clears.
     write_in_progress: bool,
+    /// Set while a payload of several `<Data>` lines is being sent: still
+    /// set when the next operation starts means the send was dropped with
+    /// part of a PSRP fragment on the server.
+    payload_in_progress: bool,
     /// The pipeline whose `<Command>` was acknowledged and not yet closed.
     open_command: Option<Uuid>,
     /// Why the session is unusable, once it is.
@@ -100,6 +115,7 @@ impl<P: Pipe> OutOfProcSession<P> {
             max_queued_bytes: MAX_QUEUED_BYTES,
             awaiting: None,
             write_in_progress: false,
+            payload_in_progress: false,
             open_command: None,
             broken: None,
         }
@@ -121,6 +137,7 @@ impl<P: Pipe> OutOfProcSession<P> {
         if payload.is_empty() {
             return Ok(());
         }
+        self.ready()?;
         if !guid.is_nil() {
             // A request dropped mid-flight may have opened or closed a
             // command: read its acknowledgement before looking.
@@ -134,6 +151,9 @@ impl<P: Pipe> OutOfProcSession<P> {
                     .await?;
             }
         }
+        // pwsh reassembles PSRP fragments byte by byte across `<Data>`
+        // lines: a payload cut short would shift every later byte.
+        self.payload_in_progress = payload.len() > MAX_DATA_PAYLOAD;
         for chunk in payload.chunks(MAX_DATA_PAYLOAD) {
             let data = Packet::Data {
                 stream: Stream::Default,
@@ -142,6 +162,7 @@ impl<P: Pipe> OutOfProcSession<P> {
             };
             self.request(data, Packet::DataAck(guid)).await?;
         }
+        self.payload_in_progress = false;
         Ok(())
     }
 
@@ -155,6 +176,7 @@ impl<P: Pipe> OutOfProcSession<P> {
             if let Some(payload) = self.dequeue() {
                 return Ok(payload);
             }
+            self.ready()?;
             if let Err(e) = self.pump().await {
                 // The error is sticky: the next `recv` reports it again.
                 return self.dequeue().ok_or(e);
@@ -165,7 +187,7 @@ impl<P: Pipe> OutOfProcSession<P> {
     /// The oldest queued non-empty payload.
     fn dequeue(&mut self) -> Option<Vec<u8>> {
         while let Some(payload) = self.inbound.pop_front() {
-            self.inbound_bytes = self.inbound_bytes.saturating_sub(payload.len());
+            self.inbound_bytes = self.inbound_bytes.saturating_sub(queue_cost(&payload));
             if !payload.is_empty() {
                 return Some(payload);
             }
@@ -175,6 +197,7 @@ impl<P: Pipe> OutOfProcSession<P> {
 
     /// Stops the open pipeline with `<Signal>`. Without one, writes nothing.
     pub(crate) async fn signal(&mut self) -> Result<()> {
+        self.ready()?;
         self.settle_bounded().await?;
         match self.open_command {
             Some(pid) => {
@@ -190,6 +213,7 @@ impl<P: Pipe> OutOfProcSession<P> {
     /// `pwsh` never acknowledges the session `<Close>` while a command is
     /// open, hence the order.
     pub(crate) async fn close(&mut self) -> Result<()> {
+        self.ready()?;
         self.settle_bounded().await?;
         if let Some(pid) = self.open_command {
             self.request(Packet::Close(pid), Packet::CloseAck(pid))
@@ -316,7 +340,7 @@ impl<P: Pipe> OutOfProcSession<P> {
     }
 
     fn queue(&mut self, payload: Vec<u8>) -> Result<()> {
-        let total = self.inbound_bytes.saturating_add(payload.len());
+        let total = self.inbound_bytes.saturating_add(queue_cost(&payload));
         if total > self.max_queued_bytes {
             return Err(PsrpError::protocol(format!(
                 "PowerShell sent more than {} bytes of data that were not received",
@@ -348,6 +372,18 @@ impl<P: Pipe> OutOfProcSession<P> {
         Ok(())
     }
 
+    /// [`Self::usable`] at the start of an operation: also breaks the session
+    /// if a send was dropped between two `<Data>` lines of one payload.
+    ///
+    /// Not part of `usable`, which the requests of that very send go through.
+    fn ready(&mut self) -> Result<()> {
+        self.usable()?;
+        if self.payload_in_progress {
+            return Err(self.fail(PsrpError::protocol(ABANDONED_PAYLOAD)));
+        }
+        Ok(())
+    }
+
     /// Breaks the session; returns the reason as a protocol error.
     ///
     /// The first reason sticks: every later operation reports it.
@@ -358,6 +394,11 @@ impl<P: Pipe> OutOfProcSession<P> {
         };
         PsrpError::Protocol(self.broken.get_or_insert(reason).clone())
     }
+}
+
+/// What `payload` counts for against [`MAX_QUEUED_BYTES`] while queued.
+fn queue_cost(payload: &[u8]) -> usize {
+    payload.len().saturating_add(QUEUE_ENTRY_OVERHEAD)
 }
 
 /// The element of the request that `ack` acknowledges, and its `PSGuid`.
@@ -723,6 +764,65 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_send_dropped_between_two_data_lines_breaks_the_session() -> Result<()> {
+        let (mut s, h) = session();
+        h.inject(&server_line(&data(Uuid::nil(), b"early")));
+        // The first Data line of the payload is acknowledged, the second
+        // one's acknowledgement is held: the send is dropped between them,
+        // a partial PSRP fragment left in pwsh's reassembler.
+        h.hold_replies_after_writes(1);
+        assert!(
+            timeout(
+                Duration::from_secs(1),
+                s.send(Uuid::nil(), &vec![7u8; 70_000])
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(h.written().len(), 2, "{:?}", h.written());
+        h.hold_replies(false);
+        let before = h.written();
+
+        let err = s.send(Uuid::nil(), b"c").await.unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("a send was abandoned between two Data lines"),
+            "{err}"
+        );
+        assert_eq!(s.signal().await.unwrap_err().to_string(), err.to_string());
+        assert_eq!(s.close().await.unwrap_err().to_string(), err.to_string());
+        // What was already received is still handed out, then the error.
+        assert_eq!(s.recv().await?, b"early");
+        assert_eq!(s.recv().await.unwrap_err().to_string(), err.to_string());
+        // Nothing after the partial payload.
+        assert_eq!(h.written(), before);
+        assert!(h.violations().is_empty(), "{:?}", h.violations());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_completed_multi_line_send_leaves_the_session_usable() -> Result<()> {
+        let (mut s, h) = session();
+        s.send(Uuid::nil(), &vec![7u8; 70_000]).await?;
+        s.send(P1, b"x").await?;
+        s.signal().await?;
+        s.close().await?;
+        assert_eq!(
+            h.written()[3..],
+            [
+                line(&Packet::Command(P1)),
+                line(&data(P1, b"x")),
+                line(&Packet::Signal(P1)),
+                line(&Packet::Close(P1)),
+                line(&Packet::Close(Uuid::nil())),
+            ]
+        );
+        assert!(h.violations().is_empty(), "{:?}", h.violations());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_write_stuck_past_the_timeout_is_reported_as_such() {
         let (mut s, h) = session();
         h.stall_writes(true);
@@ -766,6 +866,41 @@ mod tests {
         h.hold_replies(false);
 
         assert!(s.send(Uuid::nil(), b"a").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn many_tiny_data_lines_count_their_overhead_against_the_queue_limit() {
+        // 20 bytes of payload, but each queued entry costs heap beyond it.
+        let (fake, h) = FakePwsh::new();
+        let mut s = OutOfProcSession::new(fake).with_max_queued_bytes(1024);
+        for _ in 0..20 {
+            h.inject(&server_line(&data(Uuid::nil(), &[1u8])));
+        }
+
+        let err = s.send(Uuid::nil(), b"a").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("PowerShell sent more than 1024 bytes of data that were not received"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn received_data_frees_its_whole_cost_in_the_queue() -> Result<()> {
+        let (fake, h) = FakePwsh::new();
+        let mut s = OutOfProcSession::new(fake).with_max_queued_bytes(1024);
+        // Just under the limit each round; any cost not given back on
+        // `recv` would add up across rounds.
+        for _ in 0..3 {
+            for _ in 0..15 {
+                h.inject(&server_line(&data(Uuid::nil(), &[1u8])));
+            }
+            s.send(Uuid::nil(), b"a").await?;
+            for _ in 0..15 {
+                assert_eq!(s.recv().await?, [1u8]);
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
