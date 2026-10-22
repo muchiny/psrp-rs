@@ -172,3 +172,33 @@ pub mod ssh {
         crate::ssh::constant_time_eq(a, b)
     }
 }
+
+/// The OutOfProc line codec (SSH transport).
+#[cfg(feature = "ssh")]
+pub mod out_of_proc {
+    /// The splitter's line limit.
+    pub const MAX_LINE_BYTES: usize = crate::out_of_proc::MAX_LINE_BYTES;
+
+    /// Parses one line as the SSH transport does; on success, the line
+    /// PowerShell's writer produces for the same packet, without its `\n`.
+    /// `None` for a blank line or an error.
+    #[must_use]
+    pub fn reencode(line: &str) -> Option<String> {
+        let packet = crate::out_of_proc::parse_line(line).ok()??;
+        let mut out = packet.to_line();
+        out.pop();
+        Some(out)
+    }
+
+    /// Feeds `chunks` in order to a fresh line splitter; `None` as soon as
+    /// it reports an error.
+    #[must_use]
+    pub fn split(chunks: &[&[u8]]) -> Option<Vec<String>> {
+        let mut splitter = crate::out_of_proc::LineSplitter::new();
+        let mut lines = Vec::new();
+        for chunk in chunks {
+            lines.extend(splitter.push(chunk).ok()?);
+        }
+        Some(lines)
+    }
+}
