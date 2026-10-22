@@ -508,7 +508,9 @@ impl<T: PsrpTransport> RunspacePool<T> {
         if mt == MessageType::CreatePipeline {
             self.transport.execute_pipeline(&frag_bytes, pid).await
         } else {
-            self.transport.send_fragment(&frag_bytes).await
+            self.transport
+                .send_pipeline_fragment(&frag_bytes, pid)
+                .await
         }
     }
 
@@ -1157,5 +1159,75 @@ mod tests {
         // No new outgoing PublicKey fragment.
         assert_eq!(t.sent().len(), sent_before);
         let _ = pool.close().await;
+    }
+
+    // ---------- pid routing at the transport boundary ----------
+
+    #[tokio::test]
+    async fn pipeline_input_carries_its_pid_to_the_transport() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(NoInteractionHost)).await;
+        let pid = Uuid::new_v4();
+        let mut handle = crate::pipeline::Pipeline::new("$input")
+            .with_input(true)
+            .__with_forced_pid_for_test(pid)
+            .start(&mut pool)
+            .await
+            .unwrap();
+        handle.write_input(PsValue::I32(1)).await.unwrap();
+        handle.end_input().await.unwrap();
+        // CreatePipeline goes through `execute_pipeline`, not recorded here.
+        assert_eq!(t.pipeline_sends(), vec![pid, pid]);
+    }
+
+    #[tokio::test]
+    async fn host_response_is_routed_with_the_call_pid() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(crate::host::NoInteractionHost)).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
+        t.push_incoming(wire(
+            2,
+            &host_call_bytes_with(
+                7,
+                crate::host::HostMethodId::ReadLine.to_i64(),
+                PsValue::List(vec![]),
+                rpid,
+                pid,
+            ),
+        ));
+        t.push_incoming(wire(
+            3,
+            &PsrpMessage {
+                destination: Destination::Client,
+                message_type: MessageType::PipelineState,
+                rpid,
+                pid,
+                data: to_clixml(&PsValue::Object(PsObject::new().with(
+                    "PipelineState",
+                    PsValue::I32(crate::pipeline::PipelineState::Completed as i32),
+                ))),
+            }
+            .encode(),
+        ));
+        let _ = crate::pipeline::Pipeline::new("irrelevant")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await;
+        // open (2) + CreatePipeline (1) + HostResponse (1).
+        assert_eq!(t.pipeline_sends(), vec![pid]);
+        assert_eq!(t.sent().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn command_metadata_is_routed_with_its_pid() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(NoInteractionHost)).await;
+        // The empty inbox makes the wait for the reply fail, as expected.
+        let _ = pool
+            .get_command_metadata(&["Get-Date"], crate::metadata::CommandType::CMDLET)
+            .await;
+        assert_eq!(t.pipeline_sends().len(), 1);
+        assert!(!t.pipeline_sends()[0].is_nil());
     }
 }

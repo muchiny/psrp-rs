@@ -13,14 +13,33 @@ use crate::error::{PsrpError, Result};
 
 /// Abstract transport used by the runspace pool and pipeline.
 ///
-/// `send_fragment` MUST write the pre-encoded fragment bytes as a single
-/// `send_input` call. `recv_chunk` MUST transparently retry on
+/// `send_fragment` sends the messages addressed to the pool and
+/// `send_pipeline_fragment` those addressed to a pipeline. Both MUST write
+/// the pre-encoded fragment bytes as a single `send_input` call. `recv_chunk` MUST transparently retry on
 /// `WinrmError::Timeout` (long-polling is expected) but propagate every
 /// other error — in particular SOAP faults, which usually mean the
 /// server-side shell has died and the pool must be recreated.
 #[async_trait]
 pub trait PsrpTransport: Send {
     async fn send_fragment(&self, bytes: &[u8]) -> Result<()>;
+
+    /// Send the fragments of a message addressed to pipeline `pipeline_id`
+    /// (`Uuid::nil()` addresses the pool). Transports that multiplex by
+    /// pipeline (PowerShell's out-of-process protocol) override it; the
+    /// default forwards to `send_fragment`, which keeps WinRM unchanged.
+    ///
+    /// Takes `&mut self`, like [`PsrpTransport::execute_pipeline`]: with
+    /// `&self`, `#[async_trait]` would require `Self: Sync` on a default
+    /// body, which this trait does not promise.
+    async fn send_pipeline_fragment(
+        &mut self,
+        bytes: &[u8],
+        pipeline_id: uuid::Uuid,
+    ) -> Result<()> {
+        let _ = pipeline_id;
+        self.send_fragment(bytes).await
+    }
+
     async fn recv_chunk(&mut self) -> Result<Vec<u8>>;
     async fn signal_stop(&self) -> Result<()>;
     async fn close_shell(&mut self) -> Result<()>;
@@ -237,6 +256,7 @@ pub mod mock {
     use super::{PsrpError, PsrpTransport, Result, async_trait};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
 
     /// In-memory transport used by the test suite.
     #[derive(Clone, Default, Debug)]
@@ -247,6 +267,8 @@ pub mod mock {
         pub closed: Arc<Mutex<bool>>,
         pub fail_send: Arc<Mutex<bool>>,
         pub fail_recv: Arc<Mutex<Option<PsrpError>>>,
+        /// Pipeline ids passed to `send_pipeline_fragment`, in call order.
+        pub pipeline_sends: Arc<Mutex<Vec<Uuid>>>,
     }
 
     impl MockTransport {
@@ -261,6 +283,10 @@ pub mod mock {
         pub fn sent(&self) -> Vec<Vec<u8>> {
             self.outbox.lock().unwrap().clone()
         }
+
+        pub fn pipeline_sends(&self) -> Vec<Uuid> {
+            self.pipeline_sends.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -270,6 +296,12 @@ pub mod mock {
                 return Err(PsrpError::protocol("mock send failure"));
             }
             self.outbox.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+
+        async fn send_pipeline_fragment(&mut self, bytes: &[u8], pipeline_id: Uuid) -> Result<()> {
+            self.send_fragment(bytes).await?;
+            self.pipeline_sends.lock().unwrap().push(pipeline_id);
             Ok(())
         }
 
