@@ -14,6 +14,15 @@
 //! anything, and the command state only changes when an acknowledgement is
 //! read, so it always matches what the server confirmed.
 //!
+//! A request dropped *while* its line is being written may have put a prefix
+//! of the line on the wire, which would corrupt the next line and kill
+//! `pwsh`. The session then fails closed: the next operation breaks it ("a
+//! request was abandoned while its line was being written") and writes
+//! nothing. A send dropped between two `<Data>` lines of one payload leaves a
+//! partial PSRP message on the server: discarded when the pipeline's command
+//! is closed, but on the session (`Guid.Empty`) it stays in the server's
+//! reassembler.
+//!
 //! Every wait for an acknowledgement is bounded by [`ACK_TIMEOUT`]; expiry,
 //! end of stream, a server error line or a malformed line break the session
 //! for good. Every later request then fails at once with the same reason,
@@ -28,18 +37,29 @@ use uuid::Uuid;
 use super::packet::{LineSplitter, MAX_DATA_PAYLOAD, Packet, Stream, parse_line};
 use crate::error::{PsrpError, Result};
 
-/// Bound on every wait for an acknowledgement. PowerShell's own client waits
-/// 60 s for `SignalAck` and for the session `CloseAck`.
+/// Bound on every request: writing its line, then waiting for its
+/// acknowledgement. PowerShell's own client waits 60 s for `SignalAck` and
+/// for the session `CloseAck`.
 pub(crate) const ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Received `<Data>` bytes not yet taken by [`OutOfProcSession::recv`] beyond
 /// which the session is broken.
 pub(crate) const MAX_QUEUED_BYTES: usize = 64 << 20;
 
+/// Why the session breaks when a request was dropped in the middle of [`Pipe::write`].
+const ABANDONED_WRITE: &str = "a request was abandoned while its line was being written";
+
 /// The byte channel to a `pwsh -sshs` process: its stdin and its stdout.
 #[async_trait]
 pub(crate) trait Pipe: Send {
     /// Writes every byte to the remote stdin.
+    ///
+    /// Need not be cancel-safe. The future may be dropped mid-way, when the
+    /// caller's operation is cancelled, possibly after part of the bytes
+    /// went out. The session then never writes again (it breaks itself), so
+    /// the pipe need not resume nor roll back a partial write; it must only
+    /// tolerate being dropped at any await point, and still be torn down
+    /// afterwards.
     async fn write(&mut self, bytes: &[u8]) -> Result<()>;
     /// Next non-empty chunk of remote stdout; `Err` once the remote end is
     /// gone. Must be cancel-safe: dropping the future loses no byte.
@@ -60,6 +80,10 @@ pub(crate) struct OutOfProcSession<P: Pipe> {
     max_queued_bytes: usize,
     /// The acknowledgement the request in flight waits for.
     awaiting: Option<Packet>,
+    /// Set for the duration of [`Pipe::write`]: still set afterwards means
+    /// the write was abandoned, maybe with part of the line sent. Implies
+    /// `awaiting`, which only a `pump` (which checks this first) clears.
+    write_in_progress: bool,
     /// The pipeline whose `<Command>` was acknowledged and not yet closed.
     open_command: Option<Uuid>,
     /// Why the session is unusable, once it is.
@@ -75,6 +99,7 @@ impl<P: Pipe> OutOfProcSession<P> {
             inbound_bytes: 0,
             max_queued_bytes: MAX_QUEUED_BYTES,
             awaiting: None,
+            write_in_progress: false,
             open_command: None,
             broken: None,
         }
@@ -171,9 +196,7 @@ impl<P: Pipe> OutOfProcSession<P> {
     ///
     /// Fails at once, writing nothing, on a broken session.
     async fn request(&mut self, packet: Packet, ack: Packet) -> Result<()> {
-        if let Some(reason) = &self.broken {
-            return Err(PsrpError::Protocol(reason.clone()));
-        }
+        self.usable()?;
         let line = packet.to_line();
         let fallback = ack.clone();
         match tokio::time::timeout(ACK_TIMEOUT, self.exchange(line.as_bytes(), ack)).await {
@@ -185,7 +208,10 @@ impl<P: Pipe> OutOfProcSession<P> {
     async fn exchange(&mut self, line: &[u8], ack: Packet) -> Result<()> {
         self.settle().await?;
         self.awaiting = Some(ack);
-        if let Err(e) = self.pipe.write(line).await {
+        self.write_in_progress = true;
+        let written = self.pipe.write(line).await;
+        self.write_in_progress = false;
+        if let Err(e) = written {
             return Err(self.fail(e));
         }
         self.settle().await
@@ -211,14 +237,19 @@ impl<P: Pipe> OutOfProcSession<P> {
         }
     }
 
-    /// Breaks the session after [`ACK_TIMEOUT`] elapsed waiting for an
-    /// acknowledgement (the awaited one, else `fallback`).
+    /// Breaks the session after [`ACK_TIMEOUT`] elapsed writing a line or
+    /// waiting for an acknowledgement (the awaited one, else `fallback`).
     fn timed_out(&mut self, fallback: &Packet) -> PsrpError {
         let (element, guid) = request_element(self.awaiting.as_ref().unwrap_or(fallback));
-        self.fail(PsrpError::protocol(format!(
-            "PowerShell did not acknowledge {element} for {guid} within {} s",
-            ACK_TIMEOUT.as_secs()
-        )))
+        let secs = ACK_TIMEOUT.as_secs();
+        let reason = if self.write_in_progress {
+            format!(
+                "PowerShell did not accept {element} for {guid} within {secs} s: the write did not complete"
+            )
+        } else {
+            format!("PowerShell did not acknowledge {element} for {guid} within {secs} s")
+        };
+        self.fail(PsrpError::protocol(reason))
     }
 
     /// Reads one chunk and processes every line it completes.
@@ -226,9 +257,7 @@ impl<P: Pipe> OutOfProcSession<P> {
     /// The read is the only `.await`: the processing that follows is
     /// synchronous, so a dropped future loses nothing.
     async fn pump(&mut self) -> Result<()> {
-        if let Some(reason) = &self.broken {
-            return Err(PsrpError::Protocol(reason.clone()));
-        }
+        self.usable()?;
         let read = self.pipe.read().await;
         let processed = read.and_then(|chunk| self.process(&chunk));
         processed.map_err(|e| self.fail(e))
@@ -289,6 +318,17 @@ impl<P: Pipe> OutOfProcSession<P> {
             Packet::CloseAck(pid) if self.open_command == Some(*pid) => self.open_command = None,
             _ => {}
         }
+    }
+
+    /// `Err` on a broken session; breaks it first if a write was abandoned.
+    fn usable(&mut self) -> Result<()> {
+        if let Some(reason) = &self.broken {
+            return Err(PsrpError::Protocol(reason.clone()));
+        }
+        if self.write_in_progress {
+            return Err(self.fail(PsrpError::protocol(ABANDONED_WRITE)));
+        }
+        Ok(())
     }
 
     /// Breaks the session; returns the reason as a protocol error.
@@ -599,6 +639,58 @@ mod tests {
         );
         assert!(h.violations().is_empty(), "{:?}", h.violations());
         Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_dropped_while_its_line_is_written_breaks_the_session() -> Result<()> {
+        let (mut s, h) = session();
+        h.inject(&server_line(&data(Uuid::nil(), b"early")));
+        s.send(Uuid::nil(), b"a").await?;
+        let before = h.written();
+        h.stall_writes(true);
+        assert!(
+            timeout(Duration::from_secs(1), s.send(Uuid::nil(), b"b"))
+                .await
+                .is_err()
+        );
+        h.stall_writes(false);
+
+        let err = s.send(Uuid::nil(), b"c").await.unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("a request was abandoned while its line was being written"),
+            "{err}"
+        );
+        assert_eq!(s.signal().await.unwrap_err().to_string(), err.to_string());
+        assert_eq!(s.close().await.unwrap_err().to_string(), err.to_string());
+        // What was already received is still handed out, then the error.
+        assert_eq!(s.recv().await?, b"early");
+        assert_eq!(s.recv().await.unwrap_err().to_string(), err.to_string());
+        // Nothing after the half-written line: it would have been corrupted.
+        assert_eq!(h.written(), before);
+        assert!(h.violations().is_empty(), "{:?}", h.violations());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_stuck_past_the_timeout_is_reported_as_such() {
+        let (mut s, h) = session();
+        h.stall_writes(true);
+
+        let err = s.send(Uuid::nil(), b"a").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "PowerShell did not accept Data for {NIL} within 60 s"
+            )),
+            "{msg}"
+        );
+        assert!(!msg.contains("acknowledge"), "{msg}");
+
+        let again = s.send(Uuid::nil(), b"b").await.unwrap_err();
+        assert_eq!(again.to_string(), msg);
+        assert!(h.written().is_empty(), "{:?}", h.written());
     }
 
     #[tokio::test(start_paused = true)]

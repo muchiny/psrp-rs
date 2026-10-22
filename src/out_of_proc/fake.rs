@@ -65,7 +65,7 @@ struct State {
     chunk_size: Option<usize>,
     output: Vec<PsValue>,
     run_forever: bool,
-    holding: bool,
+    stall_writes: bool,
 
     // Server-side protocol state.
     /// The pool's RPID, from `InitRunspacePool`.
@@ -82,8 +82,8 @@ struct State {
     // Stdout.
     /// Bytes `read` may hand out.
     out: VecDeque<u8>,
-    /// Bytes queued while `holding`, after those of `out`.
-    held: Vec<u8>,
+    /// While replies are held: the bytes queued since, after those of `out`.
+    held: Option<Vec<u8>>,
     /// The fake exited (hang-up or death): it no longer reacts to client
     /// lines, and `read` ends the stream once everything queued was read.
     exited: bool,
@@ -317,8 +317,8 @@ impl State {
 
     fn emit(&mut self, text: &str) {
         self.queued += text.len();
-        if self.holding {
-            self.held.extend_from_slice(text.as_bytes());
+        if let Some(held) = &mut self.held {
+            held.extend_from_slice(text.as_bytes());
         } else {
             self.out.extend(text.as_bytes());
         }
@@ -347,7 +347,7 @@ impl State {
     }
 
     fn at_eof(&self) -> bool {
-        self.exited && self.out.is_empty() && self.held.is_empty()
+        self.exited && self.out.is_empty() && self.held.as_ref().is_none_or(Vec::is_empty)
     }
 }
 
@@ -397,8 +397,19 @@ impl FakePwsh {
 #[async_trait]
 impl Pipe for FakePwsh {
     async fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        lock(&self.state).client_bytes(bytes);
+        let stalled = {
+            let mut state = lock(&self.state);
+            if state.stall_writes {
+                state.client_bytes(&bytes[..bytes.len() / 2]);
+            } else {
+                state.client_bytes(bytes);
+            }
+            state.stall_writes
+        };
         self.notify.notify_one();
+        if stalled {
+            std::future::pending::<()>().await;
+        }
         Ok(())
     }
 
@@ -450,13 +461,19 @@ impl FakeHandle {
     pub(crate) fn hold_replies(&self, on: bool) {
         {
             let mut state = lock(&self.state);
-            state.holding = on;
-            if !on {
-                let held = std::mem::take(&mut state.held);
+            if on {
+                state.held.get_or_insert_with(Vec::new);
+            } else if let Some(held) = state.held.take() {
                 state.out.extend(held);
             }
         }
         self.notify.notify_one();
+    }
+
+    /// While on, `write` hands the first half of its bytes to the server and
+    /// never completes: a write stuck mid-line, as on a full SSH window.
+    pub(crate) fn stall_writes(&self, on: bool) {
+        lock(&self.state).stall_writes = on;
     }
 
     /// Queues raw stdout text: an error line, junk, a BOM, a stray `<Data>`.
