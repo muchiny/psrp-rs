@@ -30,11 +30,12 @@ mod packet;
 mod session;
 mod transport;
 
+#[cfg(feature = "__internal")]
+pub(crate) use packet::LineSplitter;
 #[cfg(test)]
 pub(crate) use packet::Packet;
 #[cfg(any(test, feature = "__internal"))]
 pub(crate) use packet::parse_line;
-#[cfg(feature = "__internal")]
-pub(crate) use packet::{LineSplitter, MAX_LINE_BYTES};
+pub(crate) use packet::{MAX_LINE_BYTES, quote_bytes};
 pub(crate) use session::Pipe;
 pub(crate) use transport::OutOfProcTransport;

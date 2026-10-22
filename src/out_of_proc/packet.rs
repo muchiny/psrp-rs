@@ -149,7 +149,7 @@ const QUOTED_LINE_BYTES: usize = (QUOTED_LINE_CHARS + 1) * 4;
 
 /// [`quote`] for bytes that may not be UTF-8: only a bounded prefix is
 /// decoded, lossily.
-fn quote_bytes(bytes: &[u8]) -> String {
+pub(crate) fn quote_bytes(bytes: &[u8]) -> String {
     let head = bytes.get(..QUOTED_LINE_BYTES).unwrap_or(bytes);
     quote(&String::from_utf8_lossy(head))
 }

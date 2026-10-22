@@ -81,7 +81,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::error::{PsrpError, Result};
-use crate::out_of_proc::{OutOfProcTransport, Pipe};
+use crate::out_of_proc::{MAX_LINE_BYTES, OutOfProcTransport, Pipe, quote_bytes};
 use crate::transport::PsrpTransport;
 
 /// Host-key validation policy for [`SshPsrpTransport`].
@@ -487,7 +487,9 @@ impl SshPsrpTransport {
                             config.subsystem
                         )));
                     }
-                    Some(ChannelMsg::Data { data }) => pending.extend_from_slice(&data),
+                    Some(ChannelMsg::Data { data }) => {
+                        append_pre_reply_output(&mut pending, &data)?;
+                    }
                     Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
                         return Err(PsrpError::protocol(
                             "SSH channel closed before the subsystem started",
@@ -567,6 +569,32 @@ impl Drop for SshPsrpTransport {
             warn!("SshPsrpTransport dropped without close — SSH session may leak");
         }
     }
+}
+
+/// Most stdout accepted before the subsystem reply.
+///
+/// `pwsh -sshs` writes nothing before it reads a line, and no line is sent
+/// before `connect` returns, so such bytes come from a chatty login shell
+/// and the session rejects them at the first line, quoting it. The cap is
+/// the longest line the session accepts: below it nothing changes (the
+/// first line still reaches the session and its error), and the server
+/// cannot make `connect` buffer more than one line's worth, while russh
+/// keeps refilling the window until `connect_timeout`.
+const MAX_PRE_REPLY_BYTES: usize = MAX_LINE_BYTES;
+
+/// Appends stdout received before the subsystem reply to `pending`; `Err`,
+/// appending nothing, once that would exceed [`MAX_PRE_REPLY_BYTES`].
+fn append_pre_reply_output(pending: &mut Vec<u8>, data: &[u8]) -> Result<()> {
+    if pending.len().saturating_add(data.len()) > MAX_PRE_REPLY_BYTES {
+        let head: Vec<u8> = pending.iter().chain(data).take(1024).copied().collect();
+        return Err(PsrpError::protocol(format!(
+            "SSH server sent unexpected output before the subsystem replied \
+             (over {MAX_PRE_REPLY_BYTES} bytes): {}",
+            quote_bytes(&head)
+        )));
+    }
+    pending.extend_from_slice(data);
+    Ok(())
 }
 
 /// Apply the policy. Returns `Ok(())` if the key should be accepted, or
@@ -1523,6 +1551,35 @@ mod tests {
         ] {
             assert!(valid_ssh_host(host), "{host:?} refused");
         }
+    }
+
+    #[test]
+    fn output_before_the_subsystem_reply_is_capped() {
+        let mut pending = Vec::new();
+        append_pre_reply_output(&mut pending, b"hello from .bashrc\n").unwrap();
+        assert_eq!(pending, b"hello from .bashrc\n");
+
+        // Exactly at the cap: accepted.
+        let fill = vec![b'x'; MAX_PRE_REPLY_BYTES - pending.len()];
+        append_pre_reply_output(&mut pending, &fill).unwrap();
+        assert_eq!(pending.len(), MAX_PRE_REPLY_BYTES);
+
+        // One byte over: refused, quoting the start of the output, and
+        // nothing more is buffered.
+        let err = append_pre_reply_output(&mut pending, b"x").unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SSH server sent unexpected output before the subsystem replied"),
+            "{msg}"
+        );
+        assert!(msg.contains("\"hello from .bashrc\\nxxx"), "{msg}");
+        assert_eq!(pending.len(), MAX_PRE_REPLY_BYTES);
+
+        // One chunk over the cap on its own is refused too.
+        let mut empty = Vec::new();
+        assert!(append_pre_reply_output(&mut empty, &vec![0; MAX_PRE_REPLY_BYTES + 1]).is_err());
+        assert_eq!(empty, Vec::<u8>::new());
     }
 
     #[tokio::test]
