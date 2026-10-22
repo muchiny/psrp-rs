@@ -26,7 +26,7 @@ ignore = [
   # number of adaptive timing measurements against one short-lived key,
   # after which the attacker would learn a session key they already
   # produced. Revisit as soon as `rsa` ships a constant-time release.
-  { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; required by MS-PSRP session-key exchange" },
+  { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; required by MS-PSRP session-key exchange and, via russh/ssh-key, by RSA host/user keys ; revue avant 2027-01-19" },
 ]
 
 [licenses]
@@ -50,8 +50,28 @@ allow = [
 confidence-threshold = 0.9
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
+skip = [
+    { crate = "block-buffer@0.10.4", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "const-oid@0.9.6", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "cpufeatures@0.2.17", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "crypto-common@0.1.7", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "der@0.7.10", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "digest@0.10.7", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "generic-array@0.14.7", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "getrandom@0.2.17", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "pkcs1@0.7.5", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "pkcs8@0.10.2", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "rand@0.8.8", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "rand_core@0.6.4", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "rsa@0.9.10", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "sha1@0.10.7", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "signature@2.2.0", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "spki@0.7.3", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "syn@2.0.119", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "windows-sys@0.52.0", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+]
 
 [sources]
 unknown-registry = "deny"

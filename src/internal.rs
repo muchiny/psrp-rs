@@ -112,22 +112,52 @@ pub mod pool {
 /// `known_hosts` host-pattern matching (SSH transport).
 #[cfg(feature = "ssh")]
 pub mod ssh {
+    pub use russh::keys::ssh_key::{PublicKey, known_hosts::KnownHosts};
+
+    /// What a `known_hosts` text says about one host key.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum KnownHostsVerdict {
+        /// An unmarked entry for the host lists the key.
+        Trusted,
+        /// An `@revoked` entry for the host lists the key.
+        Revoked,
+        /// No entry vouches for the key.
+        NotTrusted,
+    }
+
+    /// Look a host key up in the text of a `known_hosts` file, as the
+    /// `KnownHosts` host-key policy does.
+    #[must_use]
+    pub fn known_hosts_verdict(
+        contents: &str,
+        host: &str,
+        port: u16,
+        key: &PublicKey,
+    ) -> KnownHostsVerdict {
+        use crate::ssh::KnownHostsVerdict as V;
+        match crate::ssh::known_hosts_verdict(contents, host, port, key) {
+            V::Trusted => KnownHostsVerdict::Trusted,
+            V::Revoked => KnownHostsVerdict::Revoked,
+            V::NotTrusted => KnownHostsVerdict::NotTrusted,
+        }
+    }
+
+    /// The name ssh(1) looks `host:port` up under in `known_hosts`.
+    #[must_use]
+    pub fn known_hosts_lookup_name(host: &str, port: u16) -> String {
+        crate::ssh::known_hosts_lookup_name(host, port)
+    }
+
     /// OpenSSH glob matching (`*` / `?`, case-insensitive).
     #[must_use]
     pub fn glob_match(pattern: &str, target: &str) -> bool {
         crate::ssh::glob_match(pattern, target)
     }
 
-    /// Split a `[host]:port` pattern into its parts.
+    /// Match a lookup name against a `known_hosts` pattern list.
     #[must_use]
-    pub fn parse_pattern_host_port(pattern: &str) -> (&str, Option<u16>) {
-        crate::ssh::parse_pattern_host_port(pattern)
-    }
-
-    /// Match a host/port against a `known_hosts` pattern list.
-    #[must_use]
-    pub fn host_matches_patterns(patterns: &[String], host: &str, port: u16) -> bool {
-        crate::ssh::host_matches_patterns(patterns, host, port)
+    pub fn host_matches_patterns(patterns: &[String], lookup: &str) -> bool {
+        crate::ssh::host_matches_patterns(patterns, lookup)
     }
 
     /// Match a host against a hashed (`|1|salt|hash`) `known_hosts` entry.

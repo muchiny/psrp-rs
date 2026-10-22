@@ -1,6 +1,6 @@
 [package]
 name = "psrp-rs"
-version = "2.0.2"
+version = "3.0.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -24,13 +24,17 @@ include = [
 ]
 
 [dependencies]
-# 1.2.1 is a floor, not a convenience. 1.2 carries the fix for the XML
+# 1.3.0 is a floor, not a convenience. 1.2 carries the fix for the XML
 # injection in the SOAP `ResourceURI` header and raises winrm-rs's MSRV
 # to 1.98 to match ours; 1.2.1 makes `Shell::close` address Delete under
 # the shell's own ResourceURI, without which every PSRP pool this crate
-# closes leaves its runspace running on the server. Allowing anything
-# older would let a consumer resolve a build that leaks.
-winrm-rs = "1.2.2"
+# closes leaves its runspace running on the server; 1.2.2 makes the PSRP
+# shell disconnectable. 1.3.0 makes NTLM sealing work and fail closed
+# (under 1.2.x every NTLM SOAP body over HTTP ended up crossing in
+# plaintext) and builds TLS on `ring` only, which takes `aws-lc-sys`
+# out of the tree. Allowing anything older would let a consumer resolve a
+# build that leaks or sends NTLM traffic in clear.
+winrm-rs = "1.3.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
@@ -45,8 +49,16 @@ sha1 = { version = "0.10", default-features = false }
 rand = "0.8"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 serde = { version = "1", features = ["derive"], optional = true }
-russh = { version = "0.63", optional = true }
-hmac = { version = "0.12", optional = true }
+# `ring` instead of the default `aws-lc-rs`: keeps `aws-lc-sys` out of the tree.
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"], optional = true }
+hmac = { version = "0.13", optional = true }
+# HMAC-SHA1 for hashed `known_hosts` entries needs the digest 0.11 line of
+# `sha1`; the unaliased `sha1` above stays on 0.10 because `rsa` 0.9 (OAEP)
+# is built on digest 0.10.
+sha1_hmac = { package = "sha1", version = "0.11", default-features = false, optional = true }
+# SSH password and key passphrase: wiped on drop. Same crate and version
+# line as the `SecretString` in `winrm-rs`'s credentials.
+secrecy = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
@@ -55,7 +67,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [features]
 default = []
-ssh = ["dep:russh", "dep:hmac"]
+ssh = ["dep:russh", "dep:hmac", "dep:sha1_hmac", "dep:secrecy"]
 serde = ["dep:serde", "uuid/serde", "indexmap/serde"]
 # Internal-only. Re-exports crate internals needed by `fuzz/` targets
 # through the `internal` module. NOT part of the public API — any item

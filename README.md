@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Shared pool** -- `SharedRunspacePool` for multi-task access behind `Arc<Mutex<_>>`
 - **Blocking wrapper** -- synchronous API for CLI tools and scripts
 - **SSH transport** -- feature-gated (`--features ssh`) alternative to WinRM via `russh`
-- **Pure Rust** -- no C dependencies, `#![forbid(unsafe_code)]`
+- **Pure Rust crate** -- `#![forbid(unsafe_code)]`, no C code of its own; the only C in the dependency tree is `ring` (crypto for rustls and `russh`), which needs a C compiler but no system library
 
 ## Installation
 
@@ -240,9 +240,9 @@ Set via `RunspacePool::open_with_options(transport, min, max)` or
 | Session-key crypto | RSA + AES (pure Rust) | yes | built-in |
 | SSH transport | `russh` (feature-gated) | yes | built-in |
 | Auth methods | NTLMv2, Basic, Kerberos, Certificate (via winrm-rs) | NTLM, Basic, Kerberos, CredSSP | all |
-| TLS backend | rustls (pure Rust) | OpenSSL | SChannel / OpenSSL |
+| TLS backend | rustls (`ring` crypto provider) | OpenSSL | SChannel / OpenSSL |
 | Binary size | single static binary | interpreter | runtime |
-| C dependencies | none | OpenSSL | CLR |
+| C dependencies | `ring` only (transitive, no system library) | OpenSSL | CLR |
 
 ## Contributing
 

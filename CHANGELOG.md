@@ -6,6 +6,136 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-10-22
+
+SSH host-key checks now follow OpenSSH: several `known_hosts` lines that
+OpenSSH applies, revocations among them, were ignored. The SSH password
+and key passphrase are kept in `SecretString`s, which breaks code that
+builds `SshAuth` from a `String`; no other public item changed. `winrm-rs`
+1.3.0 or later is now required.
+
+### Upgrading from 2.x
+
+- `SshAuth::Password` and `SshAuth::PrivateKey::passphrase` take a
+  `SecretString`: pass a `String` with `.into()` (a `&str` literal with
+  `.into()` already compiles), and read one back with `expose_secret()`
+  (`ExposeSecret` is re-exported from `psrp_rs::ssh`).
+- `SshPsrpTransport::connect` refuses a host ssh(1) refuses (see
+  Security), before any network access.
+- A hand-written `[host]:22` line in `known_hosts` no longer matches;
+  write `host`.
+- Through `winrm-rs` 1.3: NTLM over HTTP now seals every message and
+  fails closed (`WinrmError::Ntlm`, the pool has to be reopened), and
+  Kerberos under `EncryptionMode::Auto` seals over HTTP (a realm with RC4
+  keys only needs `EncryptionMode::Never`).
+
+### Changed
+
+- **`winrm-rs` requirement raised to `"1.3.0"`** (from `"1.2.2"`). Under
+  1.2.x, NTLM message sealing never worked: with the default
+  `EncryptionMode::Auto` over HTTP, the first SOAP body rode on the
+  handshake in plaintext and every later one, refused by the server once
+  sealed, was re-sent in plaintext. 1.3.0 seals every request and fails
+  closed. It also builds TLS on `ring` only, so `aws-lc-sys` and its CMake
+  build are gone from the tree. No `psrp-rs` code changed; the PSRP shell
+  calls (`open_psrp_shell`, `reconnect_shell`, the SOAP envelopes) are
+  identical. What callers can see through `psrp-rs` (the `winrm-rs` 1.3.0
+  changelog has the full list):
+  - an HTTP 401 or an unsealed answer to a sealed NTLM request is
+    `WinrmError::Ntlm`; the request is not re-sent and the pool has to be
+    reopened;
+  - with the `winrm-rs` `kerberos` feature, `EncryptionMode::Auto` now seals
+    over HTTP; a realm that only has RC4 keys needs `EncryptionMode::Never`;
+  - `AuthMethod::Certificate` with `use_tls = false` fails when the
+    `WinrmClient` is built;
+  - a response body over `4 * max(max_envelope_size, 512 KiB)` (2 MiB by
+    default) is `SoapError::ParseError`.
+- **`russh` 0.63 → 0.64** (`ssh` feature), built with
+  `default-features = false, features = ["ring", "rsa", "flate2"]`: the
+  features of russh's default set, with `ring` in place of `aws-lc-rs`, so
+  the `ssh` feature brings no `aws-lc-sys` either. **`hmac` 0.12 → 0.13**;
+  the HMAC-SHA1 of hashed `known_hosts` entries now runs on `sha1` 0.11
+  (renamed `sha1_hmac` in `Cargo.toml`), while `sha1` 0.10 stays for the
+  RSA-OAEP session-key exchange, since `rsa` 0.9 is built on digest 0.10.
+  No API change.
+
+### Security
+
+- **`known_hosts` lookups did not follow OpenSSH, and most of the
+  differences let a revoked key through** (`ssh` feature,
+  `HostKeyPolicy::KnownHosts`). ssh(1) looks a host up under one name (the
+  host as `ssh -G` prints it on port 22, `[host]:port` on any other port),
+  matches every pattern, plain or hashed, against that name, and compares
+  keys without their comment. `psrp-rs` instead:
+  - compared keys with their comment, so a line copied from a `.pub` file
+    (`@revoked * KEY user@host`) revoked nothing, and a trusted line with a
+    comment trusted nothing;
+  - skipped as malformed any line whose fields were separated by a tab,
+    several spaces or leading spaces, `@revoked` lines included;
+  - compared hashed entries (`|1|salt|hash`, what `ssh-keygen -H` and
+    `HashKnownHosts yes` write) with the bare host name whatever the port:
+    an entry recorded for port 22 was trusted on every port of the host,
+    one recorded for another port never matched, and an `@revoked` hashed
+    line for another port was never applied;
+  - matched a pattern without a port on port 22 only, so `@revoked * KEY`
+    (the sshd(8) example) revoked nothing on any other port, and
+    `[host]:*` never matched;
+  - hashed the host name as given, so `Host.Example.COM` missed the hashed
+    entries for `host.example.com`, `@revoked` lines included, while plain
+    patterns ignored case;
+  - looked numeric addresses up as written, so a connection to `127.1` or
+    `2001:db8:0:0::1` missed `@revoked 127.0.0.1` or `@revoked 2001:db8::1`
+    (now canonical, `inet_aton` forms included: `0x7f.1`, `017.0.0.1`);
+  - honoured a hashed entry whose salt is not 20 bytes, a line OpenSSH
+    refuses.
+
+  Lookups now follow OpenSSH 10.0, checked against lines produced by
+  `ssh-keygen -H` and the host names `ssh -G` prints. One visible
+  tightening: a hand-written `[host]:22` entry no longer matches, since
+  ssh(1) never looks that name up; write `host` instead. Two differences
+  remain, on purpose: nothing is retried under the bare name when no entry
+  matches `[host]:port` (ssh(1) does in some setups; refusing is the safe
+  side), and a pattern of 1023 bytes or more is honoured (OpenSSH ignores
+  the whole line, `@revoked` included). The `known_hosts_match` fuzz
+  target now drives the whole lookup, with keys stripped of their comment
+  as a server presents them, and asserts that `@revoked * KEY comment`
+  revokes the key for any host and port and that the verdict depends
+  neither on the case of the host name nor on how fields are spaced. The
+  comment and spacing assertions were checked the other way round: each
+  fails within a minute once its fix is undone.
+- **`SshPsrpTransport::connect` refuses a host ssh(1) refuses**: empty,
+  starting with `-`, or holding whitespace, a control character or one of
+  ``'`"$\;&<>|(){},`` (what `ssh -G` reports as "hostname contains invalid
+  characters"). Such a host used to reach the resolver and the logs, where
+  a newline in it could forge a log line, and a `known_hosts` lookup,
+  where `,` is the list separator.
+- **Breaking: `SshAuth` keeps the SSH password and key passphrase in
+  `SecretString`s.** `SshAuth::Password` and
+  `SshAuth::PrivateKey::passphrase` now hold a `SecretString` (from
+  `secrecy` 0.10, as in `winrm-rs`'s credentials, and re-exported with
+  `ExposeSecret` as `psrp_rs::ssh::{SecretString, ExposeSecret}`) instead
+  of a `String`. The copy each `SshAuth` and each of its clones holds is
+  zeroized when dropped; before, every copy stayed in freed memory. Not
+  covered: the value the caller builds it from (converting a `String` with
+  spare capacity reallocates it and leaves the old buffer as it was), and
+  the copies russh's key loader makes; russh wipes the copy of the
+  password it sends. `SshAuth::Password("…".into())` still compiles; a
+  `String` now takes `.into()`, and reading a secret back takes
+  `expose_secret()`.
+- **`SshAuth`'s `Debug` printed the password and the key passphrase**, and
+  so did `SshConfig`'s, which derives `Debug`: logging a configuration with
+  `{:?}` leaked the secret. Both now show `<redacted>`; the key path is
+  still printed.
+
+### Known
+
+- `psrp_rs::blocking` drives the pool on a current-thread Tokio runtime.
+  `winrm-rs` 1.3.0 documents a race on its dedicated sealed connections
+  (NTLM or Kerberos over HTTP, measured against a server with
+  `AllowUnencrypted = false`) that it mitigates on such a runtime but does
+  not close. When it hits, the call fails with an HTTP 401 error; the
+  request is never re-sent in plaintext. Not reproduced with `psrp-rs`.
+
 ## [2.0.2] — 2026-09-04
 
 Disconnect/reconnect now works against a live server. It never did before —
