@@ -81,7 +81,9 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::error::{PsrpError, Result};
-use crate::out_of_proc::{MAX_LINE_BYTES, OutOfProcTransport, Pipe, quote_bytes};
+use crate::out_of_proc::{
+    MAX_LINE_BYTES, OutOfProcTransport, Pipe, escape_remote_text, quote_bytes,
+};
 use crate::transport::PsrpTransport;
 
 /// Host-key validation policy for [`SshPsrpTransport`].
@@ -304,7 +306,7 @@ impl russh::client::Handler for ClientHandler {
                 warn!(
                     host = %self.host,
                     port = self.port,
-                    issuer = %cert.key_id(),
+                    issuer = %escape_remote_text(cert.key_id(), LOGGED_REMOTE_CHARS),
                     "SSH host certificate rejected: certificate authorities are not supported"
                 );
                 return Ok(false);
@@ -375,8 +377,7 @@ impl Pipe for RusshPipe {
                 Some(ChannelMsg::Data { data }) if !data.is_empty() => return Ok(data.to_vec()),
                 Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
                     // stderr: log and skip
-                    let text = String::from_utf8_lossy(&data);
-                    debug!(stderr = %text, "SSH stderr");
+                    debug!(stderr = %stderr_log_text(&data), "SSH stderr");
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     self.exit_status = Some(exit_status);
@@ -569,6 +570,19 @@ impl Drop for SshPsrpTransport {
             warn!("SshPsrpTransport dropped without close — SSH session may leak");
         }
     }
+}
+
+/// How much remote-controlled text one log line carries, in characters.
+const LOGGED_REMOTE_CHARS: usize = 1024;
+
+/// Remote stderr bytes as they are logged: decoded lossily, truncated to
+/// [`LOGGED_REMOTE_CHARS`] and with control and bidi characters escaped,
+/// so that sshd's stderr cannot forge or rewrite a log line.
+fn stderr_log_text(data: &[u8]) -> String {
+    // Enough bytes for one character more than is logged, so the
+    // truncation mark still shows.
+    let head = data.get(..(LOGGED_REMOTE_CHARS + 1) * 4).unwrap_or(data);
+    escape_remote_text(&String::from_utf8_lossy(head), LOGGED_REMOTE_CHARS)
 }
 
 /// Most stdout accepted before the subsystem reply.
@@ -1551,6 +1565,18 @@ mod tests {
         ] {
             assert!(valid_ssh_host(host), "{host:?} refused");
         }
+    }
+
+    #[test]
+    fn remote_stderr_is_logged_escaped_and_truncated() {
+        let text = stderr_log_text(b"sshd: \x1b[2Jfake\r\x07\xe2\x80\xae \"ok\" \xff");
+        assert_eq!(
+            text,
+            "sshd: \\u{1b}[2Jfake\\r\\u{7}\\u{202e} \"ok\" \u{FFFD}"
+        );
+
+        let long = stderr_log_text(&[b'e'; 5000]);
+        assert_eq!(long, format!("{}…", "e".repeat(1024)));
     }
 
     #[test]

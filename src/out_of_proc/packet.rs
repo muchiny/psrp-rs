@@ -114,9 +114,9 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<Packet>> {
         && head.eq_ignore_ascii_case(SERVER_ERROR_PREFIX)
     {
         let message = line.get(SERVER_ERROR_PREFIX.len()..).unwrap_or_default();
-        let message: String = message.chars().take(QUOTED_SERVER_ERROR_CHARS).collect();
         return Err(PsrpError::protocol(format!(
-            "PowerShell reported a protocol error: {message}"
+            "PowerShell reported a protocol error: {}",
+            escape_remote_text(message, QUOTED_SERVER_ERROR_CHARS)
         )));
     }
     parse_element(line.trim()).map(Some).map_err(|why| {
@@ -137,6 +137,44 @@ fn snippet(text: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// The first `max_chars` characters of `text`, with the characters that
+/// could rewrite a terminal or a log line escaped as by `escape_debug`:
+/// controls (C0, DEL, C1: ESC, BEL, a lone CR...), line and paragraph
+/// separators, and the invisible format characters among them the bidi
+/// embeddings, overrides and isolates. Printable text, quotes and
+/// backslashes are kept as they are, so a message stays readable.
+pub(crate) fn escape_remote_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for c in text.chars().take(max_chars) {
+        if rewrites_output(c) {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    if text.chars().nth(max_chars).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Whether `c` can move the cursor, ring, reorder or hide text once printed.
+fn rewrites_output(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}' // soft hyphen
+            | '\u{061C}' // Arabic letter mark (bidi)
+            | '\u{180E}' // Mongolian vowel separator
+            | '\u{200B}'..='\u{200F}' // zero-width characters, LRM, RLM
+            | '\u{2028}'..='\u{202E}' // line and paragraph separators, bidi embeddings, overrides
+            | '\u{2060}'..='\u{206F}' // word joiner, invisible operators, bidi isolates
+            | '\u{FEFF}' // zero-width no-break space
+            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+            | '\u{E0000}'..='\u{E007F}' // tags
+        )
 }
 
 fn quote(line: &str) -> String {
@@ -468,6 +506,44 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn server_error_message_is_escaped_but_keeps_its_text_and_quotes() {
+        let line = format!(
+            "{SERVER_ERROR_PREFIX}bad\u{1b}[2J\r\u{7}x\u{202e}y\u{2066}z \"q\" 'a' \\ é\u{a0}:"
+        );
+        let msg = parse_line(&line).unwrap_err().to_string();
+        assert!(
+            msg.contains("bad\\u{1b}[2J\\r\\u{7}x\\u{202e}y\\u{2066}z \"q\" 'a' \\ é\u{a0}:"),
+            "{msg}"
+        );
+        assert!(
+            !msg.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{202e}' | '\u{2066}')),
+            "{msg:?}"
+        );
+    }
+
+    #[test]
+    fn escape_remote_text_leaves_no_output_rewriting_character() {
+        let risky: String = ('\u{0}'..='\u{9f}')
+            .filter(|c| c.is_control())
+            .chain(['\u{ad}', '\u{61c}', '\u{180e}', '\u{feff}'])
+            .chain('\u{200b}'..='\u{200f}')
+            .chain('\u{2028}'..='\u{202e}')
+            .chain('\u{2060}'..='\u{206f}')
+            .chain('\u{fff9}'..='\u{fffb}')
+            .chain('\u{e0000}'..='\u{e007f}')
+            .collect();
+        let out = escape_remote_text(&risky, usize::MAX);
+        assert!(!out.chars().any(rewrites_output), "{out:?}");
+        assert_eq!(
+            escape_remote_text("keep \"this\" 'as' \\ is: é", 100),
+            "keep \"this\" 'as' \\ is: é"
+        );
+        assert_eq!(escape_remote_text("abcdef", 3), "abc…");
+        assert_eq!(escape_remote_text("abc", 3), "abc");
     }
 
     #[test]

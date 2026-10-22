@@ -36,6 +36,6 @@ pub(crate) use packet::LineSplitter;
 pub(crate) use packet::Packet;
 #[cfg(any(test, feature = "__internal"))]
 pub(crate) use packet::parse_line;
-pub(crate) use packet::{MAX_LINE_BYTES, quote_bytes};
+pub(crate) use packet::{MAX_LINE_BYTES, escape_remote_text, quote_bytes};
 pub(crate) use session::Pipe;
 pub(crate) use transport::OutOfProcTransport;
