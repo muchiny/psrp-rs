@@ -149,16 +149,28 @@ impl<P: Pipe> OutOfProcSession<P> {
     ///
     /// What is already queued is handed out even after the session broke, so
     /// that the pool can still see a terminal state; then comes the error.
+    /// That includes the `<Data>` queued by the very chunk that broke it.
     pub(crate) async fn recv(&mut self) -> Result<Vec<u8>> {
         loop {
-            while let Some(payload) = self.inbound.pop_front() {
-                self.inbound_bytes = self.inbound_bytes.saturating_sub(payload.len());
-                if !payload.is_empty() {
-                    return Ok(payload);
-                }
+            if let Some(payload) = self.dequeue() {
+                return Ok(payload);
             }
-            self.pump().await?;
+            if let Err(e) = self.pump().await {
+                // The error is sticky: the next `recv` reports it again.
+                return self.dequeue().ok_or(e);
+            }
         }
+    }
+
+    /// The oldest queued non-empty payload.
+    fn dequeue(&mut self) -> Option<Vec<u8>> {
+        while let Some(payload) = self.inbound.pop_front() {
+            self.inbound_bytes = self.inbound_bytes.saturating_sub(payload.len());
+            if !payload.is_empty() {
+                return Some(payload);
+            }
+        }
+        None
     }
 
     /// Stops the open pipeline with `<Signal>`. Without one, writes nothing.
@@ -263,11 +275,16 @@ impl<P: Pipe> OutOfProcSession<P> {
         processed.map_err(|e| self.fail(e))
     }
 
+    /// Handles every line `chunk` completes, in order, and only then the
+    /// splitter's error: the first error wins, so a `__NamedPipeError__:`
+    /// line is reported even when a bad line follows it in the same chunk,
+    /// and the `<Data>` before a bad line is still queued.
     fn process(&mut self, chunk: &[u8]) -> Result<()> {
-        for line in self.lines.push(chunk)? {
-            self.on_line(&line)?;
+        let (lines, split_error) = self.lines.push(chunk);
+        for line in &lines {
+            self.on_line(line)?;
         }
-        Ok(())
+        split_error.map_or(Ok(()), Err)
     }
 
     fn on_line(&mut self, line: &str) -> Result<()> {
@@ -559,6 +576,38 @@ mod tests {
         let err = s.recv().await.unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
         assert!(s.send(Uuid::nil(), b"a").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_server_error_line_wins_over_a_bad_line_in_the_same_chunk() {
+        let (mut s, h) = session();
+        h.set_chunk_size(4096);
+        // What pwsh writes as it dies: its message, then a stack line that
+        // may be in the console code page rather than UTF-8.
+        h.inject_bytes(b"__NamedPipeError__:pwsh-said-this\r\n   at Foo\xe9()\r\n");
+        let err = s.recv().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("PowerShell reported a protocol error: pwsh-said-this"),
+            "{err}"
+        );
+        // The first reason sticks.
+        let again = s.send(Uuid::nil(), b"a").await.unwrap_err();
+        assert_eq!(again.to_string(), err.to_string());
+        assert!(h.written().is_empty(), "{:?}", h.written());
+    }
+
+    #[tokio::test]
+    async fn lines_before_a_bad_line_in_the_same_chunk_are_processed() -> Result<()> {
+        let (mut s, h) = session();
+        h.set_chunk_size(4096);
+        let mut chunk = server_line(&data(Uuid::nil(), b"kept")).into_bytes();
+        chunk.extend_from_slice(b"\xff\r\n");
+        h.inject_bytes(&chunk);
+        assert_eq!(s.recv().await?, b"kept");
+        let err = s.recv().await.unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        Ok(())
     }
 
     #[tokio::test]

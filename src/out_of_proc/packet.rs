@@ -143,6 +143,17 @@ fn quote(line: &str) -> String {
     format!("\"{}\"", snippet(line))
 }
 
+/// Enough bytes for `QUOTED_LINE_CHARS + 1` characters, so that [`snippet`]
+/// still sees whether the text goes on.
+const QUOTED_LINE_BYTES: usize = (QUOTED_LINE_CHARS + 1) * 4;
+
+/// [`quote`] for bytes that may not be UTF-8: only a bounded prefix is
+/// decoded, lossily.
+fn quote_bytes(bytes: &[u8]) -> String {
+    let head = bytes.get(..QUOTED_LINE_BYTES).unwrap_or(bytes);
+    quote(&String::from_utf8_lossy(head))
+}
+
 /// Parse exactly one packet element, with nothing before or after it.
 ///
 /// These lines are not CLIXML, so the "no hand-rolled XML outside `clixml/`"
@@ -269,24 +280,44 @@ impl LineSplitter {
         }
     }
 
-    /// Appends `bytes`; returns every completed line without its `\n` or `\r\n`.
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
-        let mut data = std::mem::take(&mut self.buf);
-        data.extend_from_slice(bytes);
-
+    /// Appends `bytes`; returns every line they complete, without its `\n`
+    /// or `\r\n`, and the error that stopped the split, if any.
+    ///
+    /// The lines completed before an error are returned with it, in order:
+    /// a `__NamedPipeError__:` line followed, in the same chunk, by a line
+    /// that is not UTF-8 still reaches the caller.
+    ///
+    /// Linear in `bytes.len()`: only the new bytes are searched for `\n`,
+    /// and the partial line kept from earlier pushes is never rescanned.
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> (Vec<String>, Option<PsrpError>) {
         let mut lines = Vec::new();
-        let mut rest: &[u8] = &[];
-        for segment in data.split_inclusive(|b| *b == b'\n') {
-            match segment.strip_suffix(b"\n") {
-                Some(line) => lines.push(self.finish_line(line)?),
-                None => rest = segment,
+        let mut rest = bytes;
+        loop {
+            let mut parts = rest.splitn(2, |b| *b == b'\n');
+            let head = parts.next().unwrap_or_default();
+            let Some(tail) = parts.next() else {
+                // No `\n` left: `head` (all of `rest`) continues the partial line.
+                if self.buf.len().saturating_add(head.len()) > MAX_LINE_BYTES {
+                    return (lines, Some(too_long()));
+                }
+                self.buf.extend_from_slice(head);
+                return (lines, None);
+            };
+            let line = if self.buf.is_empty() {
+                self.finish_line(head)
+            } else if self.buf.len().saturating_add(head.len()) > MAX_LINE_BYTES {
+                Err(too_long())
+            } else {
+                let mut whole = std::mem::take(&mut self.buf);
+                whole.extend_from_slice(head);
+                self.finish_line(&whole)
+            };
+            match line {
+                Ok(line) => lines.push(line),
+                Err(e) => return (lines, Some(e)),
             }
+            rest = tail;
         }
-        if rest.len() > MAX_LINE_BYTES {
-            return Err(too_long());
-        }
-        self.buf = rest.to_vec();
-        Ok(lines)
     }
 
     /// Validate one complete line (its `\n` already removed) and turn it into a `String`.
@@ -295,8 +326,12 @@ impl LineSplitter {
             return Err(too_long());
         }
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let text = std::str::from_utf8(line)
-            .map_err(|e| PsrpError::protocol(format!("OutOfProc line is not valid UTF-8: {e}")))?;
+        let text = std::str::from_utf8(line).map_err(|e| {
+            PsrpError::protocol(format!(
+                "OutOfProc line is not valid UTF-8 ({e}): {}",
+                quote_bytes(line)
+            ))
+        })?;
         let text = if self.seen_first_line {
             text
         } else {
@@ -320,6 +355,14 @@ mod tests {
 
     fn g() -> Uuid {
         Uuid::parse_str(G).unwrap()
+    }
+
+    /// `LineSplitter::push` as a `Result`: the lines, or the error alone.
+    fn push(s: &mut LineSplitter, bytes: &[u8]) -> Result<Vec<String>> {
+        match s.push(bytes) {
+            (lines, None) => Ok(lines),
+            (_, Some(e)) => Err(e),
+        }
     }
 
     #[test]
@@ -495,7 +538,8 @@ mod tests {
     #[test]
     fn splitter_strips_crlf_and_lf() -> Result<()> {
         let mut s = LineSplitter::new();
-        let lines = s.push(
+        let lines = push(
+            &mut s,
             format!("<CloseAck PSGuid='{NIL}' />\r\n<DataAck PSGuid='{NIL}' />\n").as_bytes(),
         )?;
         assert_eq!(
@@ -511,12 +555,15 @@ mod tests {
     #[test]
     fn splitter_keeps_a_partial_line_until_its_newline() -> Result<()> {
         let mut s = LineSplitter::new();
-        assert_eq!(s.push(b"<DataAck")?, Vec::<String>::new());
+        assert_eq!(push(&mut s, b"<DataAck")?, Vec::<String>::new());
         assert_eq!(
-            s.push(format!(" PSGuid='{NIL}' />\r").as_bytes())?,
+            push(&mut s, format!(" PSGuid='{NIL}' />\r").as_bytes())?,
             Vec::<String>::new()
         );
-        assert_eq!(s.push(b"\n")?, [format!("<DataAck PSGuid='{NIL}' />")]);
+        assert_eq!(
+            push(&mut s, b"\n")?,
+            [format!("<DataAck PSGuid='{NIL}' />")]
+        );
         Ok(())
     }
 
@@ -528,13 +575,13 @@ mod tests {
         let bytes = transcript.as_bytes();
 
         let mut whole = LineSplitter::new();
-        let expected = whole.push(bytes)?;
+        let expected = push(&mut whole, bytes)?;
         assert_eq!(expected.len(), 3);
 
         let mut one_by_one = LineSplitter::new();
         let mut got = Vec::new();
         for b in bytes {
-            got.extend(one_by_one.push(std::slice::from_ref(b))?);
+            got.extend(push(&mut one_by_one, std::slice::from_ref(b))?);
         }
         assert_eq!(got, expected);
 
@@ -542,8 +589,8 @@ mod tests {
         let cr = bytes.iter().position(|b| *b == b'\r').unwrap();
         let (head, tail) = bytes.split_at(cr + 1);
         let mut split = LineSplitter::new();
-        let mut got = split.push(head)?;
-        got.extend(split.push(tail)?);
+        let mut got = push(&mut split, head)?;
+        got.extend(push(&mut split, tail)?);
         assert_eq!(got, expected);
         Ok(())
     }
@@ -553,30 +600,86 @@ mod tests {
         let mut ok = LineSplitter::new();
         let mut bytes = vec![b'a'; MAX_LINE_BYTES];
         bytes.push(b'\n');
-        assert_eq!(ok.push(&bytes)?.len(), 1);
+        assert_eq!(push(&mut ok, &bytes)?.len(), 1);
 
         let mut bad = LineSplitter::new();
-        assert!(bad.push(&vec![b'a'; MAX_LINE_BYTES + 1]).is_err());
+        assert!(push(&mut bad, &vec![b'a'; MAX_LINE_BYTES + 1]).is_err());
 
         // Overlong even though its terminator arrived in the same push.
         let mut bad = LineSplitter::new();
         let mut bytes = vec![b'a'; MAX_LINE_BYTES + 1];
         bytes.push(b'\n');
-        assert!(bad.push(&bytes).is_err());
+        assert!(push(&mut bad, &bytes).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn splitter_cost_stays_linear_when_a_line_trickles_in_byte_by_byte() {
+        // A hostile server may send one maximal line one byte per SSH packet;
+        // rescanning the partial line on every push made that quadratic
+        // (minutes of CPU). Linear, it takes milliseconds even in debug.
+        let budget = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        let mut s = LineSplitter::new();
+        for i in 0..MAX_LINE_BYTES {
+            let lines = push(&mut s, b"a").unwrap();
+            assert_eq!(lines, Vec::<String>::new());
+            assert!(
+                start.elapsed() < budget,
+                "{i} one-byte pushes took over {budget:?}: the splitter is not linear"
+            );
+        }
+        let lines = push(&mut s, b"\n").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn splitter_returns_the_lines_completed_before_an_error() {
+        let mut s = LineSplitter::new();
+        let (lines, error) = s.push(b"__NamedPipeError__:boom\r\n\xff\r\n<CloseAck");
+        assert_eq!(lines, ["__NamedPipeError__:boom"]);
+        assert!(matches!(error, Some(PsrpError::Protocol(_))), "{error:?}");
+
+        let mut s = LineSplitter::new();
+        let mut bytes = b"<DataAck/>\n".to_vec();
+        bytes.extend(vec![b'a'; MAX_LINE_BYTES + 1]);
+        let (lines, error) = s.push(&bytes);
+        assert_eq!(lines, ["<DataAck/>"]);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn invalid_utf8_error_quotes_the_line_escaped_and_truncated() {
+        let mut s = LineSplitter::new();
+        let msg = push(&mut s, b"bad \xff line\x1b[31m\r\n")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("\"bad \u{FFFD} line\\u{1b}[31m\""), "{msg}");
+        assert!(!msg.contains('\u{1b}'), "{msg:?}");
+
+        let mut long = vec![b'x'; 500];
+        long.extend_from_slice(b"\xff\n");
+        let msg = push(&mut LineSplitter::new(), &long)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(&format!("\"{}…\"", "x".repeat(80))), "{msg}");
+        assert!(!msg.contains(&"x".repeat(81)), "{msg}");
     }
 
     #[test]
     fn splitter_rejects_invalid_utf8() {
         let mut s = LineSplitter::new();
-        assert!(s.push(b"\xff\xfe<x>\n").is_err());
+        assert!(push(&mut s, b"\xff\xfe<x>\n").is_err());
     }
 
     #[test]
     fn splitter_strips_a_bom_on_the_first_line_only() -> Result<()> {
         let mut s = LineSplitter::new();
-        let lines =
-            s.push(format!("\u{FEFF}<CloseAck PSGuid='{NIL}' />\r\n\u{FEFF}x\n").as_bytes())?;
+        let lines = push(
+            &mut s,
+            format!("\u{FEFF}<CloseAck PSGuid='{NIL}' />\r\n\u{FEFF}x\n").as_bytes(),
+        )?;
         assert_eq!(
             lines,
             [

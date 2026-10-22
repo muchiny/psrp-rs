@@ -316,11 +316,15 @@ impl State {
     }
 
     fn emit(&mut self, text: &str) {
-        self.queued += text.len();
+        self.emit_bytes(text.as_bytes());
+    }
+
+    fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.queued += bytes.len();
         if let Some(held) = &mut self.held {
-            held.extend_from_slice(text.as_bytes());
+            held.extend_from_slice(bytes);
         } else {
-            self.out.extend(text.as_bytes());
+            self.out.extend(bytes);
         }
     }
 
@@ -478,7 +482,12 @@ impl FakeHandle {
 
     /// Queues raw stdout text: an error line, junk, a BOM, a stray `<Data>`.
     pub(crate) fn inject(&self, raw: &str) {
-        lock(&self.state).emit(raw);
+        self.inject_bytes(raw.as_bytes());
+    }
+
+    /// Queues raw stdout bytes, not necessarily UTF-8.
+    pub(crate) fn inject_bytes(&self, raw: &[u8]) {
+        lock(&self.state).emit_bytes(raw);
         self.notify.notify_one();
     }
 
