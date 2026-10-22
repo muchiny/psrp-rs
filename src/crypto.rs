@@ -41,6 +41,9 @@ const SESSION_KEY_BLOB_HEADER: [u8; 12] = [
     0x01, 0x02, 0x00, 0x00, 0x10, 0x66, 0x00, 0x00, 0x00, 0xA4, 0x00, 0x00,
 ];
 
+/// The only error text for a failed RSA unwrap or a wrong-sized key.
+const SESSION_KEY_UNWRAP_FAILED: &str = "session key unwrap failed";
+
 /// Size of the RSA block that follows the header (2048-bit key).
 const SESSION_KEY_BLOCK_LEN: usize = 256;
 
@@ -166,13 +169,14 @@ impl ClientSessionKey {
         let mut decrypted = self
             .private
             .decrypt_blinded(&mut rand::thread_rng(), Pkcs1v15Encrypt, &big_endian)
-            .map_err(|e| PsrpError::protocol(format!("session key unwrap: {e}")))?;
+            // One fixed message for every post-RSA failure: a bad padding
+            // and a wrong plaintext length must not be told apart (the
+            // Bleichenbacher oracle), so neither the cause nor the length
+            // is reported.
+            .map_err(|_| PsrpError::protocol(SESSION_KEY_UNWRAP_FAILED))?;
         if decrypted.len() != 32 {
             decrypted.zeroize();
-            return Err(PsrpError::protocol(format!(
-                "session key: expected 32 bytes, got {}",
-                decrypted.len()
-            )));
+            return Err(PsrpError::protocol(SESSION_KEY_UNWRAP_FAILED));
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(&decrypted);
@@ -481,7 +485,15 @@ mod tests {
         assert!(client.decrypt_session_key(&swapped).is_err());
         // A key of the wrong size is refused even if the padding is valid.
         let short = test_support::server_wrap_raw(&client.public_blob(), &[1u8; 16]);
-        assert!(client.decrypt_session_key(&short).is_err());
+        let wrong_len = client.decrypt_session_key(&short).unwrap_err().to_string();
+        // A padding failure (wrong byte order) and a wrong plaintext length
+        // must be indistinguishable: no Bleichenbacher-style oracle.
+        let bad_padding = client
+            .decrypt_session_key(&swapped)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(wrong_len, bad_padding, "unwrap failures must be uniform");
+        assert!(!wrong_len.contains("16"), "length leaked: {wrong_len}");
     }
 
     #[test]
