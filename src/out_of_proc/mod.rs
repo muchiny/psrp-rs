@@ -54,6 +54,7 @@
 mod fake;
 mod packet;
 mod session;
+mod transport;
 
 pub(crate) use packet::{
     LineSplitter, MAX_DATA_PAYLOAD, MAX_LINE_BYTES, Packet, SERVER_ERROR_PREFIX, Stream, parse_line,
