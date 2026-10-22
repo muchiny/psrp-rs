@@ -213,15 +213,24 @@ fn next_event<'a>(reader: &mut Reader<&'a [u8]>) -> std::result::Result<Event<'a
     reader.read_event().map_err(|e| snippet(&e.to_string()))
 }
 
-/// The attributes of an element, as `(name, value)` pairs. Duplicates are an error.
-fn attributes(element: &BytesStart<'_>) -> std::result::Result<Vec<(String, String)>, String> {
-    let mut out: Vec<(String, String)> = Vec::new();
+/// The attributes of an element, as `(name, value)` pairs; `Err(expected)`
+/// as soon as there are more than `max`.
+///
+/// Stops at the first attribute past `max`: a line may hold ~100k of them,
+/// and this runs synchronously, out of reach of any timeout. quick-xml
+/// rejects a duplicate name itself (its checks are on by default).
+fn attributes(
+    element: &BytesStart<'_>,
+    max: usize,
+    expected: &str,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(max);
     for attr in element.attributes() {
         let attr = attr.map_err(|e| snippet(&e.to_string()))?;
-        let name = attr.key.as_ref().to_owned();
-        if out.iter().any(|(n, _)| *n == name) {
-            return Err(format!("duplicate attribute {}", snippet(&name)));
+        if out.len() >= max {
+            return Err(expected.to_owned());
         }
+        let name = attr.key.as_ref().to_owned();
         let value = attr
             .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|e| snippet(&e.to_string()))?
@@ -237,22 +246,24 @@ fn parse_guid(value: &str) -> std::result::Result<Uuid, String> {
 
 /// The sole `PSGuid` attribute of an `*Ack` / `Command` / `Signal` / `Close` element.
 fn guid_attribute(element: &BytesStart<'_>) -> std::result::Result<Uuid, String> {
-    match attributes(element)?.as_slice() {
+    const EXPECTED: &str = "expected exactly one attribute, PSGuid";
+    match attributes(element, 1, EXPECTED)?.as_slice() {
         [(name, value)] if name == "PSGuid" => parse_guid(value),
-        _ => Err("expected exactly one attribute, PSGuid".to_owned()),
+        _ => Err(EXPECTED.to_owned()),
     }
 }
 
 /// The `Stream` and `PSGuid` attributes of a `<Data>` element, in either order.
 fn data_attributes(element: &BytesStart<'_>) -> std::result::Result<(Stream, Uuid), String> {
-    match attributes(element)?.as_slice() {
+    const EXPECTED: &str = "expected exactly the attributes Stream and PSGuid";
+    match attributes(element, 2, EXPECTED)?.as_slice() {
         [(a, x), (b, y)] if a == "Stream" && b == "PSGuid" => {
             Ok((parse_stream(x)?, parse_guid(y)?))
         }
         [(a, x), (b, y)] if a == "PSGuid" && b == "Stream" => {
             Ok((parse_stream(y)?, parse_guid(x)?))
         }
-        _ => Err("expected exactly the attributes Stream and PSGuid".to_owned()),
+        _ => Err(EXPECTED.to_owned()),
     }
 }
 
@@ -349,6 +360,7 @@ fn too_long() -> PsrpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     const G: &str = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
     const NIL: &str = "00000000-0000-0000-0000-000000000000";
@@ -498,6 +510,40 @@ mod tests {
         ];
         for line in lines {
             assert!(parse_line(&line).is_err(), "accepted: {line}");
+        }
+    }
+
+    #[test]
+    fn an_element_with_many_attributes_is_rejected_at_once() {
+        // One maximal line holds ~100k attributes; collecting them all, with
+        // a duplicate scan, was quadratic and synchronous (no timeout can
+        // interrupt it).
+        let mut attrs = String::new();
+        for i in 0..100_000 {
+            write!(attrs, " a{i}=''").unwrap();
+        }
+        let budget = std::time::Duration::from_secs(1);
+        for line in [
+            format!("<DataAck{attrs} />"),
+            format!("<Data{attrs}>AA==</Data>"),
+        ] {
+            let start = std::time::Instant::now();
+            let err = parse_line(&line).unwrap_err();
+            let took = start.elapsed();
+            assert!(took < budget, "took {took:?}");
+            assert!(err.to_string().contains("expected exactly"), "{err}");
+        }
+    }
+
+    #[test]
+    fn duplicate_attributes_are_rejected_by_quick_xml() {
+        for line in [
+            format!("<Data PSGuid='{G}' PSGuid='{G}'>AA==</Data>"),
+            format!("<Data Stream='Default' Stream='Default' PSGuid='{G}'>AA==</Data>"),
+            format!("<DataAck PSGuid='{G}' PSGuid='{G}' />"),
+        ] {
+            let msg = parse_line(&line).unwrap_err().to_string();
+            assert!(msg.contains("duplicated attribute"), "{msg}");
         }
     }
 
