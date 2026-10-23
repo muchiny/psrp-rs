@@ -148,6 +148,20 @@ fn clixml_seeds() -> Vec<(&'static str, String)> {
             )
             .into(),
         ),
+        // The second occurrence of an object in one graph, as PowerShell
+        // writes it (`<Ref />` self-closed): list item, dict key and value,
+        // property and top level, plus a dangling one and one back to the
+        // object still being built.
+        (
+            "self_closed_ref.xml",
+            concat!(
+                r#"<Obj RefId="0"><LST><Obj RefId="1"><MS><S N="a">x</S></MS></Obj>"#,
+                r#"<Ref RefId="1" /><I32>3</I32><Ref RefId="9" /><Ref RefId="0" /></LST></Obj>"#,
+                r#"<Obj RefId="2"><DCT><En><Ref N="Key" RefId="1" /><Ref N="Value" RefId="1" /></En></DCT></Obj>"#,
+                r#"<Obj RefId="3"><MS><Ref N="p" RefId="1" /></MS></Obj><Ref RefId="1" />"#,
+            )
+            .into(),
+        ),
         // `"😀".ToCharArray()`: a `[char]` is one UTF-16 unit, so an emoji is
         // two `<C>` of surrogates, which must not fail the document.
         (
