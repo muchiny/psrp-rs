@@ -136,6 +136,21 @@ specifies base64 and RSAES-PKCS1-v1_5; it now follows the specification.
   AES key under RSAES-PKCS1-v1_5, little-endian). A real server answered
   `Invalid public key data.` over SSH, and the WinRM call timed out. The
   exchange now follows the specification and works over SSH and WinRM.
+- **A broken or closed runspace pool could be brought back to `Opened`.**
+  `RunspacePoolStateMachine::close` overwrote a terminal `Broken` or
+  `Closed` state with `Closing`, so a later `open` restarted the handshake
+  and a server message could reopen the pool. `close` now leaves a terminal
+  pool untouched and sends no `CloseRunspacePool`.
+  Found by the nightly `runspace_state_machine` fuzz run.
+- **The CLIXML encoder corrupted some strings on the wire.** It left a `_`
+  literal unless a complete `_xHHHH_` followed, but the escape it wrote for
+  the next character could itself complete a false sequence: a property
+  name `_x0041` followed by a carriage return arrived as `"Ax000D_"`, and a
+  literal `_X0041_` arrived as `"A"` on a real PowerShell server. Every `_`
+  followed by `x` or `X` is now written `_x005F_`, which is exactly what
+  PowerShell's own serializer does (`InternalSerializer.EncodeString`), so
+  text such as `$my_xml` is sent as `$my_x005F_xml`. Found by the nightly
+  `clixml_roundtrip` fuzz run.
 
 ### Security
 

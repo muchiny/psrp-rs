@@ -326,8 +326,9 @@ fn escape_inner(s: &str, attribute: bool) -> String {
             // would come back as `"9+\u{1f}"`. This is PowerShell's own
             // rule (`InternalSerializer.EncodeString`), and deciding on the
             // next character alone is what makes it exact: `x` is never
-            // rewritten, so every `_x` left in the output opens an escape
-            // emitted here. Matching the whole `_xHHHH_` pattern on the
+            // rewritten, so every `_x` the decoder reaches at a token
+            // boundary opens an escape emitted here (an escape's trailing
+            // `_` is consumed with it). Matching the whole `_xHHHH_` pattern on the
             // input instead missed a sequence closed by the escape of the
             // character after it (`"_x0041\r"` in an attribute). `X` is
             // covered because PowerShell decodes with
