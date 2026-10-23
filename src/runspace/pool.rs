@@ -614,8 +614,15 @@ impl<T: PsrpTransport> RunspacePool<T> {
             .get("ci")
             .and_then(PsValue::as_i64)
             .ok_or_else(|| PsrpError::protocol("host call: missing ci"))?;
+        // `mi` is a `RemoteHostMethodId` enum: PowerShell sends it as an
+        // `<Obj>` with the number as a bare child (read under `_value`),
+        // other implementations as a plain integer.
         let mi_raw = obj
             .get("mi")
+            .and_then(|v| match v {
+                PsValue::Object(o) => o.get("_value"),
+                plain => Some(plain),
+            })
             .and_then(|v| v.as_i64().or_else(|| v.as_i32().map(i64::from)))
             .ok_or_else(|| PsrpError::protocol("host call: missing mi"))?;
         let mi = HostMethodId::from_i64(mi_raw);
@@ -1164,6 +1171,51 @@ mod tests {
             .await;
         // open (2) + CreatePipeline (1) + HostResponse error (1) = 4
         assert_eq!(t.sent().len(), 4);
+        let _ = pool.close().await;
+    }
+
+    /// Real servers send `mi` as an enum `<Obj>` (captured shape), not as a
+    /// bare integer: the call used to fail with "host call: missing mi".
+    #[tokio::test]
+    async fn host_call_accepts_the_method_id_as_an_enum_object() {
+        use async_trait::async_trait;
+        struct Alice;
+        #[async_trait]
+        impl crate::host::PsHost for Alice {
+            async fn read_line(&self) -> Result<String> {
+                Ok("alice".into())
+            }
+        }
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(Alice)).await;
+        let body = format!(
+            concat!(
+                r#"<Obj RefId="0"><MS><I64 N="ci">7</I64>"#,
+                r#"<Obj N="mi" RefId="1"><TN RefId="1"><T>System.Management.Automation.Remoting.RemoteHostMethodId</T>"#,
+                r#"<T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN>"#,
+                r#"<ToString>ReadLine</ToString><I32>{}</I32></Obj>"#,
+                r#"<Obj N="mp" RefId="2"><TN RefId="2"><T>System.Collections.ArrayList</T><T>System.Object</T></TN><LST/></Obj>"#,
+                r#"</MS></Obj>"#,
+            ),
+            crate::host::HostMethodId::ReadLine.to_i64()
+        );
+        let msg = PsrpMessage {
+            destination: Destination::Client,
+            message_type: MessageType::RunspacePoolHostCall,
+            rpid: Uuid::nil(),
+            pid: Uuid::nil(),
+            data: body,
+        };
+        pool.handle_host_call(&msg).await.unwrap();
+        let mut reassembler = Reassembler::new();
+        let response = t
+            .sent()
+            .iter()
+            .flat_map(|fragment| reassembler.feed(fragment).unwrap())
+            .map(|payload| PsrpMessage::decode(&payload).unwrap())
+            .rfind(|m| m.message_type == MessageType::RunspacePoolHostResponse)
+            .expect("a response was sent");
+        assert!(response.data.contains("alice"), "{}", response.data);
         let _ = pool.close().await;
     }
 
