@@ -62,6 +62,48 @@ impl PsrpError {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, PsrpError>;
 
+/// How much of a message the server wrote an error message quotes, in
+/// characters.
+pub(crate) const MAX_SERVER_MESSAGE_CHARS: usize = 1024;
+
+/// The first `max_chars` characters of `text`, with the characters that
+/// could rewrite a terminal or a log line escaped as by `escape_debug`:
+/// controls (C0, DEL, C1: ESC, BEL, a lone CR...), line and paragraph
+/// separators, and the invisible format characters among them the bidi
+/// embeddings, overrides and isolates. Printable text, quotes and
+/// backslashes are kept as they are, so a message stays readable.
+pub(crate) fn escape_remote_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for c in text.chars().take(max_chars) {
+        if rewrites_output(c) {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    if text.chars().nth(max_chars).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Whether `c` can move the cursor, ring, reorder or hide text once printed.
+pub(crate) fn rewrites_output(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}' // soft hyphen
+            | '\u{061C}' // Arabic letter mark (bidi)
+            | '\u{180E}' // Mongolian vowel separator
+            | '\u{200B}'..='\u{200F}' // zero-width characters, LRM, RLM
+            | '\u{2028}'..='\u{202E}' // line and paragraph separators, bidi embeddings, overrides
+            | '\u{2060}'..='\u{206F}' // word joiner, invisible operators, bidi isolates
+            | '\u{FEFF}' // zero-width no-break space
+            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+            | '\u{E0000}'..='\u{E007F}' // tags
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
