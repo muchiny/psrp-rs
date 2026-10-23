@@ -17,6 +17,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`PipelineFailed` says why the pipeline failed.** A terminating error
+  (`throw`, a cmdlet run with `-ErrorAction Stop`, `1/0`) is reported in the
+  `PipelineState` message, which was never read, so the error was always
+  "unknown error". It now carries the exception message the server
+  attached. When the error stream also held `ErrorRecord`s, their text was
+  a dump of the whole record several KiB long; it is now the exception
+  message. What the server wrote is escaped (control and bidi characters)
+  and bounded: 1024 characters per error, at most 8 errors quoted and the
+  rest counted, and the same goes for the text of every CLIXML parse error,
+  which can quote the document.
 - **`RunspacePoolStateMachine::open` is accepted from `BeforeOpen` only.**
   It refused a closed or broken pool, but from `Closing`, `Opened` or
   `Disconnected` it reset the machine to `NegotiationSent` and sent the

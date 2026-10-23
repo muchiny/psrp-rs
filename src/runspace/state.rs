@@ -399,7 +399,10 @@ pub(crate) fn extract_runspace_state(xml: &str) -> Result<RunspacePoolState> {
 /// is the message of that record's exception. The server writes it, so it
 /// is trimmed, escaped and bounded like any server text quoted in an
 /// error, and a blank one counts as none.
-fn terminal_state_reason(xml: &str) -> Option<String> {
+/// The exception message the server attached to a state message
+/// (`ExceptionAsErrorRecord`, MS-PSRP 2.2.2.9 and 2.2.2.21), escaped and
+/// bounded, for a `RunspacePoolState` and a `PipelineState` alike.
+pub(crate) fn terminal_state_reason(xml: &str) -> Option<String> {
     let message = parse_clixml(xml).ok()?.into_iter().find_map(|value| {
         let PsValue::Object(obj) = value else {
             return None;
