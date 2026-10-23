@@ -235,13 +235,16 @@ fn parse_element_inner(
             // A `[char]` is one UTF-16 code unit on the wire
             // (`XmlConvert.ToString((UInt16)c)`), so half of an emoji comes
             // as `<C>55357</C>`: a surrogate is no `char`, and one of them
-            // must not fail the whole document, so it reads as U+FFFD.
-            let unit: u16 = text
+            // must not fail the whole document, so it reads as U+FFFD (as does
+            // a number that is no scalar value at all). A scalar above the
+            // plane is still read as that character: PowerShell would not
+            // send it, but psrp-rs used to write `<C>128512</C>` for `'😀'`.
+            let code: u32 = text
                 .trim()
                 .parse()
                 .map_err(|err| PsrpError::clixml(format!("C: {err}")))?;
             Ok(Some(PsValue::Char(
-                char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER),
+                char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER),
             )))
         }
         "BA" => {
@@ -1096,10 +1099,25 @@ mod tests {
     fn char_invalid_code_point() {
         // Not a number
         assert!(parse_clixml("<C>abc</C>").is_err());
-        // Not a UTF-16 code unit: PowerShell's `ToUInt16` rejects these too.
-        assert!(parse_clixml("<C>65536</C>").is_err());
-        assert!(parse_clixml("<C>128512</C>").is_err());
         assert!(parse_clixml("<C>-1</C>").is_err());
+        assert!(parse_clixml("<C>4294967296</C>").is_err());
+    }
+
+    /// Older psrp-rs wrote `'😀'` as `<C>128512</C>`; it is still read back as
+    /// that character, and a number that is no scalar value is U+FFFD.
+    #[test]
+    fn char_above_the_bmp_is_still_read_leniently() {
+        assert_eq!(
+            parse_clixml("<C>65536</C><C>128512</C><C>1114111</C><C>1114112</C><C>4294967295</C>")
+                .unwrap(),
+            vec![
+                PsValue::Char('\u{10000}'),
+                PsValue::Char('\u{1F600}'),
+                PsValue::Char('\u{10FFFF}'),
+                PsValue::Char('\u{FFFD}'),
+                PsValue::Char('\u{FFFD}'),
+            ]
+        );
     }
 
     /// `"😀".ToCharArray()` is `<C>55357</C><C>56832</C>`: a lone surrogate
