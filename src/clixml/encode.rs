@@ -629,27 +629,45 @@ pub(crate) fn build_create_pipeline_xml(
     o
 }
 
-/// Decode a base64 string, ignoring whitespace.
+/// Decode base64 the way .NET's `Convert.FromBase64String` does, which is
+/// what PowerShell reads and writes.
+///
+/// The only characters skipped are space, tab, CR and LF. What remains must
+/// be a multiple of four characters of the standard alphabet, with at most
+/// two `=` and only at the end. The bits left over in a padded final group
+/// are not checked (`Zh==` is accepted, as in .NET). Anything else, text
+/// after the padding included, is `None`: a payload that PowerShell would
+/// refuse is not silently truncated.
 pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut symbols: Vec<u8> = Vec::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b' ' | b'\t' | b'\r' | b'\n' => {}
+            _ => symbols.push(b),
+        }
+    }
+    if symbols.len() % 4 != 0 {
+        return None;
+    }
+    let padding = symbols.iter().rev().take_while(|&&b| b == b'=').count();
+    if padding > 2 {
+        return None;
+    }
+    let data = &symbols[..symbols.len() - padding];
+    let mut out = Vec::with_capacity(symbols.len() / 4 * 3);
     let mut buf = 0u32;
     let mut bits = 0u32;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            continue;
-        }
-        if c == '=' {
-            break;
-        }
-        let v = match c {
-            'A'..='Z' => c as u32 - 'A' as u32,
-            'a'..='z' => c as u32 - 'a' as u32 + 26,
-            '0'..='9' => c as u32 - '0' as u32 + 52,
-            '+' => 62,
-            '/' => 63,
+    for &b in data {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            // Includes a `=` that is not part of the final padding.
             _ => return None,
         };
-        buf = (buf << 6) | v;
+        buf = (buf << 6) | u32::from(v);
         bits += 6;
         if bits >= 8 {
             bits -= 8;
@@ -966,6 +984,51 @@ mod tests {
             to_clixml(&PsValue::Bytes(bytes.clone())),
             format!("<BA>{b64}</BA>")
         );
+    }
+
+    /// What .NET's `Convert.FromBase64String` accepts and rejects (#26): the
+    /// old decoder cut the text at the first `=`, accepted a missing
+    /// padding or a stray character after it, and skipped any Unicode
+    /// whitespace.
+    #[test]
+    fn base64_decode_matches_dotnet() {
+        let ok: &[(&str, &[u8])] = &[
+            ("", b""),
+            ("   \t\r\n", b""),
+            ("Zg==", b"f"),
+            ("Zm8=", b"fo"),
+            ("Zm9v", b"foo"),
+            // SP, TAB, CR, LF are skipped anywhere, padding included.
+            ("Zm9v\r\nYmFy\r\n", b"foobar"),
+            (" Z\tg = = ", b"f"),
+            // Leftover bits of the last group are not checked, as in .NET.
+            ("Zh==", b"f"),
+            ("Zm9=", b"fo"),
+            ("+/+/", &[0xFB, 0xFF, 0xBF]),
+        ];
+        for (text, bytes) in ok {
+            assert_eq!(base64_decode(text).as_deref(), Some(*bytes), "{text:?}");
+        }
+        for text in [
+            "AA==!!junk",   // text after the padding
+            "Zg==Zm9v",     // a second group after the padding
+            "A",            // not a multiple of four
+            "AAAAA",        // idem
+            "Zg",           // padding missing
+            "Zg=",          // padding incomplete
+            "Z===",         // three `=`
+            "====",         // only padding
+            "AA=A",         // `=` in the middle
+            "=AAA",         // `=` first
+            "Zm9v!AAA",     // invalid character
+            "Zm9v-_AA",     // URL-safe alphabet
+            "Zm9v\u{a0}",   // non-breaking space is not whitespace to .NET
+            "Zm9v\u{2003}", // nor is an em space
+            "Zm9v\u{b}",    // nor a vertical tab
+            "Zm9\u{e9}",    // non-ASCII
+        ] {
+            assert!(base64_decode(text).is_none(), "{text:?} was accepted");
+        }
     }
 
     #[test]
