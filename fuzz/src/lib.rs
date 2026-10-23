@@ -87,7 +87,7 @@ fn gen_value(u: &mut Unstructured<'_>, depth: u32, safe: bool) -> ArbResult<PsVa
     // Below the depth budget (or once the input is exhausted) only
     // scalars are produced, which keeps generation total.
     let scalars_only = depth == 0 || u.is_empty();
-    let last = if scalars_only { 21 } else { 24 };
+    let last = if scalars_only { 22 } else { 25 };
     Ok(match u.int_in_range(0..=last)? {
         0 => PsValue::Null,
         1 => PsValue::Bool(u.arbitrary()?),
@@ -111,7 +111,8 @@ fn gen_value(u: &mut Unstructured<'_>, depth: u32, safe: bool) -> ArbResult<PsVa
         19 => PsValue::Version(gen_string(u, safe)?),
         20 => PsValue::Uri(gen_string(u, safe)?),
         21 => PsValue::Xml(gen_string(u, safe)?),
-        22 => {
+        22 => PsValue::ScriptBlock(gen_string(u, safe)?),
+        23 => {
             let n = u.int_in_range(0..=4usize)?;
             let mut items = Vec::with_capacity(n);
             for _ in 0..n {
@@ -119,7 +120,7 @@ fn gen_value(u: &mut Unstructured<'_>, depth: u32, safe: bool) -> ArbResult<PsVa
             }
             PsValue::List(items)
         }
-        23 => {
+        24 => {
             let n = u.int_in_range(0..=3usize)?;
             let mut entries = Vec::with_capacity(n);
             for _ in 0..n {

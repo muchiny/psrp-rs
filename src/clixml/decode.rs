@@ -120,6 +120,11 @@ fn parse_empty(e: &BytesStart, _state: &mut DecoderState) -> Result<Option<PsVal
     match e.name().as_ref() {
         "Nil" => Ok(Some(PsValue::Null)),
         "S" => Ok(Some(PsValue::String(String::new()))),
+        // PowerShell normally writes an empty value self-closed
+        // (`<S N="x" />`, `<SBK N="x" />`: the .NET writer shortens an element
+        // with no content), and `<S></S>` only when its output buffer happens
+        // to flush before the end tag; both must decode.
+        "SBK" | "SCT" => Ok(Some(PsValue::ScriptBlock(String::new()))),
         "ToString" => Ok(None),
         _ => Ok(None),
     }
@@ -267,8 +272,11 @@ fn parse_element_inner(
             let text = read_text(reader, "XD")?;
             Ok(Some(PsValue::Xml(text)))
         }
-        "SCT" => {
-            let text = read_text(reader, "SCT")?;
+        // `SBK` is PowerShell's tag (MS-PSRP 2.2.5.1.23). `SCT` was never
+        // one: it is what psrp-rs itself used to write, still accepted so
+        // that such output decodes.
+        "SBK" | "SCT" => {
+            let text = read_text(reader, &tag)?;
             Ok(Some(PsValue::ScriptBlock(text)))
         }
         "SS" => {
@@ -409,7 +417,11 @@ fn parse_member_set(
                         .unwrap_or(PsValue::Null);
                     obj.properties.insert(name, value);
                 }
-                _ => {}
+                _ => {
+                    if let Some(v) = parse_empty(&e, state)? {
+                        obj.properties.insert(name_attr(&e)?.unwrap_or_default(), v);
+                    }
+                }
             },
             Event::End(e) if e.name().as_ref() == closing_tag.as_str() => break,
             Event::Eof => return Err(PsrpError::clixml("EOF inside member set")),
@@ -497,12 +509,13 @@ fn parse_dict_entry(
                     }
                 }
             }
-            Event::Empty(e) if e.name().as_ref() == "Nil" => {
-                let name = name_attr(&e)?.unwrap_or_default();
-                match name.as_str() {
-                    "Key" => key = PsValue::Null,
-                    "Value" => val = PsValue::Null,
-                    _ => {}
+            Event::Empty(e) => {
+                if let Some(v) = parse_empty(&e, state)? {
+                    match name_attr(&e)?.unwrap_or_default().as_str() {
+                        "Key" => key = v,
+                        "Value" => val = v,
+                        _ => {}
+                    }
                 }
             }
             Event::End(e) if e.name().as_ref() == "En" => break,
@@ -1134,6 +1147,12 @@ mod tests {
                 PsValue::Xml("some xml data".into()),
             ),
             (
+                "<SBK>Get-Process</SBK>",
+                PsValue::ScriptBlock("Get-Process".into()),
+            ),
+            // `SCT` is not a PowerShell tag; it is only what psrp-rs
+            // itself used to write, kept so that output still decodes.
+            (
                 "<SCT>Get-Process</SCT>",
                 PsValue::ScriptBlock("Get-Process".into()),
             ),
@@ -1147,6 +1166,148 @@ mod tests {
             assert_eq!(got.len(), 1, "{xml}");
             assert_eq!(got[0], expected, "{xml}");
         }
+    }
+
+    /// Regression (#19): PowerShell's script-block tag is `SBK`
+    /// (`SerializationStrings.ScriptBlockTag`, MS-PSRP 2.2.5.1.23), and
+    /// the decoder only knew `SCT`, so every `<SBK>` was skipped as an
+    /// unknown element: a top-level output vanished, a property went
+    /// missing, a list item disappeared and shifted the ones after it.
+    ///
+    /// The documents are verbatim `PSSerializer.Serialize` output
+    /// (pwsh 7.3.12), indentation removed.
+    #[test]
+    fn script_block_sbk_from_powershell_is_not_dropped() {
+        // Top level: `{}` and a body with XML metacharacters and a
+        // literal `_x000D_`, which PowerShell escapes as in `<S>`.
+        let got =
+            parse_clixml(r#"<SBK></SBK><SBK> Get-Date "a&amp;b&lt;c&gt;" _x005F_x000D_ </SBK>"#)
+                .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                PsValue::ScriptBlock(String::new()),
+                PsValue::ScriptBlock(r#" Get-Date "a&b<c>" _x000D_ "#.into()),
+            ]
+        );
+
+        // `[pscustomobject]@{ Action = { 1 }; L = @({ 2 }, 3) }`: a
+        // property value and a list item.
+        let xml = concat!(
+            r#"<Obj RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T>"#,
+            r#"<T>System.Object</T></TN><MS><SBK N="Action"> 1 </SBK>"#,
+            r#"<Obj N="L" RefId="1"><TN RefId="1"><T>System.Object[]</T><T>System.Array</T>"#,
+            r#"<T>System.Object</T></TN><LST><SBK> 2 </SBK><I32>3</I32></LST></Obj></MS></Obj>"#,
+        );
+        let got = parse_clixml(xml).unwrap();
+        let PsValue::Object(obj) = &got[0] else {
+            panic!("expected an object, got {got:?}");
+        };
+        assert_eq!(obj.get("Action"), Some(&PsValue::ScriptBlock(" 1 ".into())));
+        let Some(PsValue::Object(list)) = obj.get("L") else {
+            panic!("expected `L` to be an object, got {obj:?}");
+        };
+        assert_eq!(
+            list.get("_value"),
+            Some(&PsValue::List(vec![
+                PsValue::ScriptBlock(" 2 ".into()),
+                PsValue::I32(3),
+            ]))
+        );
+    }
+
+    /// A script block survives the encoder and decoder at every position,
+    /// with content that needs each kind of escape: XML metacharacters, a
+    /// CR (which XML end-of-line handling would turn into LF) and a
+    /// literal `_x` that would otherwise read as a `_xHHHH_` escape.
+    #[test]
+    fn script_block_round_trips_with_escapes() {
+        let body = "if ($a -lt 1) {\r\n  'a&b' <c> \"_x000D_\" _x\r}\n";
+        let sb = PsValue::ScriptBlock(body.into());
+
+        let xml = to_clixml(&sb);
+        assert!(xml.starts_with("<SBK>") && xml.ends_with("</SBK>"), "{xml}");
+        assert!(!xml.contains('\r'), "literal CR in {xml:?}");
+        assert_eq!(parse_clixml(&xml).unwrap(), vec![sb.clone()], "{xml}");
+
+        let obj = PsValue::Object(PsObject::new().with("Action", sb.clone()));
+        let xml = to_clixml(&obj);
+        assert!(xml.contains(r#"<SBK N="Action">"#), "{xml}");
+        assert_eq!(parse_clixml(&xml).unwrap(), vec![obj], "{xml}");
+
+        let list = PsValue::List(vec![sb.clone(), PsValue::I32(3)]);
+        let got = parse_clixml(&to_clixml(&list)).unwrap();
+        let PsValue::Object(o) = &got[0] else {
+            panic!("expected the list wrapped in an object, got {got:?}");
+        };
+        assert_eq!(o.get("_value"), Some(&list));
+
+        // As a dict value and as a dict key.
+        let dict = PsValue::Dict(vec![
+            (PsValue::String("k".into()), sb.clone()),
+            (sb.clone(), PsValue::I32(4)),
+        ]);
+        let xml = to_clixml(&dict);
+        assert!(
+            xml.contains(r#"<SBK N="Value">"#) && xml.contains(r#"<SBK N="Key">"#),
+            "{xml}"
+        );
+        let got = parse_clixml(&xml).unwrap();
+        let PsValue::Object(o) = &got[0] else {
+            panic!("expected the dict wrapped in an object, got {got:?}");
+        };
+        assert_eq!(o.get("_value"), Some(&dict), "{xml}");
+    }
+
+    /// PowerShell normally writes an empty script block (or string) self-closed,
+    /// `<SBK N="x" />`, and `<SBK></SBK>` only when its output buffer flushes
+    /// before the end tag: neither may be dropped, wherever it appears (a
+    /// self-closed `<S N="x"/>` in a member set or dict entry used to be lost).
+    #[test]
+    fn self_closed_script_block_is_an_empty_script_block() {
+        let empty = PsValue::ScriptBlock(String::new());
+        let wrapped = |xml: &str| -> PsValue {
+            let got = parse_clixml(xml).unwrap();
+            let [PsValue::Object(o)] = got.as_slice() else {
+                panic!("expected one object, got {got:?}");
+            };
+            o.get("_value").cloned().unwrap_or(PsValue::Null)
+        };
+
+        // Top level, the legacy tag included.
+        assert_eq!(
+            parse_clixml("<SBK/><SCT/><I32>1</I32>").unwrap(),
+            vec![empty.clone(), empty.clone(), PsValue::I32(1)]
+        );
+        // A list item: the items after it keep their position.
+        assert_eq!(
+            wrapped(r#"<Obj RefId="0"><LST><SBK/><I32>2</I32></LST></Obj>"#),
+            PsValue::List(vec![empty.clone(), PsValue::I32(2)])
+        );
+        // A dict value and a dict key.
+        assert_eq!(
+            wrapped(concat!(
+                r#"<Obj RefId="0"><DCT><En><S N="Key">k</S><SBK N="Value"/></En>"#,
+                r#"<En><SBK N="Key"/><I32 N="Value">3</I32></En></DCT></Obj>"#,
+            )),
+            PsValue::Dict(vec![
+                (PsValue::String("k".into()), empty.clone()),
+                (empty.clone(), PsValue::I32(3)),
+            ])
+        );
+        // A property. Member sets and dict entries now read every
+        // self-closed value the way lists and the top level do, so a
+        // self-closed `<S N="…"/>` is an empty string there too.
+        let got = parse_clixml(
+            r#"<Obj RefId="0"><MS><SBK N="Action"/><S N="Empty"/><I32 N="After">4</I32></MS></Obj>"#,
+        )
+        .unwrap();
+        let [PsValue::Object(o)] = got.as_slice() else {
+            panic!("expected one object, got {got:?}");
+        };
+        assert_eq!(o.get("Action"), Some(&empty));
+        assert_eq!(o.get("Empty"), Some(&PsValue::String(String::new())));
+        assert_eq!(o.get("After"), Some(&PsValue::I32(4)));
     }
 
     #[test]
