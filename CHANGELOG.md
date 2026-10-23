@@ -6,6 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-10-23
+
+Eight defects of the CLIXML codec and the session-key exchange, each found
+by comparing psrp-rs with PowerShell's own serializer (most of them live,
+on Windows Server 2025 and pwsh 7.6.7). Some change what goes on the wire:
+a carriage return is now escaped, a script block is `<SBK>`, and a
+SecureString is encrypted with a zero IV and no prefix, so a SecureString
+ciphertext written by 3.0.0 or earlier no longer decrypts correctly.
+
 ### Fixed
 
 - **A `[char]` that is half of a surrogate pair no longer fails the whole
