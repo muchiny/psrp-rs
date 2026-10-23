@@ -168,6 +168,17 @@ fn clixml_seeds() -> Vec<(&'static str, String)> {
             "char_surrogates.xml",
             "<C>55357</C><C>56832</C><C>65535</C><C>65536</C><I32>1</I32>".into(),
         ),
+        // A .NET enum as PowerShell writes it: the number is a nameless child.
+        (
+            "enum.xml",
+            concat!(
+                r#"<Obj RefId="0"><TN RefId="0"><T>System.IO.FileAttributes</T><T>System.Enum</T>"#,
+                r#"<T>System.ValueType</T><T>System.Object</T></TN>"#,
+                r#"<ToString>ReadOnly, Hidden</ToString><I32>3</I32></Obj>"#,
+                r#"<Obj RefId="1"><LST><Obj RefId="2"><TNRef RefId="0"/><ToString>x</ToString><By>1</By></Obj></LST></Obj>"#,
+            )
+            .into(),
+        ),
         ("bom.xml", "\u{feff}<S>bom</S>".into()),
         ("empty_string.xml", "<S></S><S/>".into()),
     ]

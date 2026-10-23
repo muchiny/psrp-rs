@@ -27,6 +27,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The value of a .NET enum is no longer dropped.** PowerShell writes an
+  enum as an `<Obj>` with its type names, a `<ToString>` and the number as
+  a nameless child (`<I32>1</I32>`); the decoder skipped that child, so every
+  enum in a result (`[DayOfWeek]::Friday`, a `PriorityClass`, the
+  `CommandOrigin` of an `InvocationInfo`) arrived as an object with no value.
+  The number is now under the `_value` property, as a bare `<LST>` or
+  `<DCT>` already was. The method id of a host call is an enum, so a host
+  call whose `mi` came this way failed with `host call: missing mi`; it is
+  read from `_value` now.
 - **`PipelineFailed` says why the pipeline failed.** A terminating error
   (`throw`, a cmdlet run with `-ErrorAction Stop`, `1/0`) is reported in the
   `PipelineState` message, which was never read, so the error was always

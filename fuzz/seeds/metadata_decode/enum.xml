@@ -1,0 +1,1 @@
+<Obj RefId="0"><TN RefId="0"><T>System.IO.FileAttributes</T><T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN><ToString>ReadOnly, Hidden</ToString><I32>3</I32></Obj><Obj RefId="1"><LST><Obj RefId="2"><TNRef RefId="0"/><ToString>x</ToString><By>1</By></Obj></LST></Obj>
