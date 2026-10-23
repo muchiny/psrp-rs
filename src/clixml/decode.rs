@@ -120,6 +120,8 @@ fn parse_empty(e: &BytesStart, _state: &mut DecoderState) -> Result<Option<PsVal
     match e.name().as_ref() {
         "Nil" => Ok(Some(PsValue::Null)),
         "S" => Ok(Some(PsValue::String(String::new()))),
+        // PowerShell writes `<SBK></SBK>`; `<SBK/>` is the same to XML.
+        "SBK" | "SCT" => Ok(Some(PsValue::ScriptBlock(String::new()))),
         "ToString" => Ok(None),
         _ => Ok(None),
     }
@@ -412,7 +414,11 @@ fn parse_member_set(
                         .unwrap_or(PsValue::Null);
                     obj.properties.insert(name, value);
                 }
-                _ => {}
+                _ => {
+                    if let Some(v) = parse_empty(&e, state)? {
+                        obj.properties.insert(name_attr(&e)?.unwrap_or_default(), v);
+                    }
+                }
             },
             Event::End(e) if e.name().as_ref() == closing_tag.as_str() => break,
             Event::Eof => return Err(PsrpError::clixml("EOF inside member set")),
@@ -500,12 +506,13 @@ fn parse_dict_entry(
                     }
                 }
             }
-            Event::Empty(e) if e.name().as_ref() == "Nil" => {
-                let name = name_attr(&e)?.unwrap_or_default();
-                match name.as_str() {
-                    "Key" => key = PsValue::Null,
-                    "Value" => val = PsValue::Null,
-                    _ => {}
+            Event::Empty(e) => {
+                if let Some(v) = parse_empty(&e, state)? {
+                    match name_attr(&e)?.unwrap_or_default().as_str() {
+                        "Key" => key = v,
+                        "Value" => val = v,
+                        _ => {}
+                    }
                 }
             }
             Event::End(e) if e.name().as_ref() == "En" => break,
@@ -1231,6 +1238,72 @@ mod tests {
             panic!("expected the list wrapped in an object, got {got:?}");
         };
         assert_eq!(o.get("_value"), Some(&list));
+
+        // As a dict value and as a dict key.
+        let dict = PsValue::Dict(vec![
+            (PsValue::String("k".into()), sb.clone()),
+            (sb.clone(), PsValue::I32(4)),
+        ]);
+        let xml = to_clixml(&dict);
+        assert!(
+            xml.contains(r#"<SBK N="Value">"#) && xml.contains(r#"<SBK N="Key">"#),
+            "{xml}"
+        );
+        let got = parse_clixml(&xml).unwrap();
+        let PsValue::Object(o) = &got[0] else {
+            panic!("expected the dict wrapped in an object, got {got:?}");
+        };
+        assert_eq!(o.get("_value"), Some(&dict), "{xml}");
+    }
+
+    /// PowerShell writes an empty script block as `<SBK></SBK>`, but
+    /// `<SBK/>` is the same element to XML, so it must not be dropped
+    /// either, wherever it appears.
+    #[test]
+    fn self_closed_script_block_is_an_empty_script_block() {
+        let empty = PsValue::ScriptBlock(String::new());
+        let wrapped = |xml: &str| -> PsValue {
+            let got = parse_clixml(xml).unwrap();
+            let [PsValue::Object(o)] = got.as_slice() else {
+                panic!("expected one object, got {got:?}");
+            };
+            o.get("_value").cloned().unwrap_or(PsValue::Null)
+        };
+
+        // Top level, the legacy tag included.
+        assert_eq!(
+            parse_clixml("<SBK/><SCT/><I32>1</I32>").unwrap(),
+            vec![empty.clone(), empty.clone(), PsValue::I32(1)]
+        );
+        // A list item: the items after it keep their position.
+        assert_eq!(
+            wrapped(r#"<Obj RefId="0"><LST><SBK/><I32>2</I32></LST></Obj>"#),
+            PsValue::List(vec![empty.clone(), PsValue::I32(2)])
+        );
+        // A dict value and a dict key.
+        assert_eq!(
+            wrapped(concat!(
+                r#"<Obj RefId="0"><DCT><En><S N="Key">k</S><SBK N="Value"/></En>"#,
+                r#"<En><SBK N="Key"/><I32 N="Value">3</I32></En></DCT></Obj>"#,
+            )),
+            PsValue::Dict(vec![
+                (PsValue::String("k".into()), empty.clone()),
+                (empty.clone(), PsValue::I32(3)),
+            ])
+        );
+        // A property. Member sets and dict entries now read every
+        // self-closed value the way lists and the top level do, so a
+        // self-closed `<S N="…"/>` is an empty string there too.
+        let got = parse_clixml(
+            r#"<Obj RefId="0"><MS><SBK N="Action"/><S N="Empty"/><I32 N="After">4</I32></MS></Obj>"#,
+        )
+        .unwrap();
+        let [PsValue::Object(o)] = got.as_slice() else {
+            panic!("expected one object, got {got:?}");
+        };
+        assert_eq!(o.get("Action"), Some(&empty));
+        assert_eq!(o.get("Empty"), Some(&PsValue::String(String::new())));
+        assert_eq!(o.get("After"), Some(&PsValue::I32(4)));
     }
 
     #[test]
