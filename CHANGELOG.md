@@ -6,6 +6,32 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`RunspacePool::request_session_key` no longer waits forever when the
+  server breaks the pool.** The exchange skipped every message except
+  `EncryptedSessionKey`, including a `RunspacePoolState` saying `Broken` or
+  `Closed`, so a server that rejected the key left the call polling (about
+  40 s, then a timeout, over WinRM). It now fails at once with a
+  `PsrpError::Protocol`, and the terminal-state error, here and when a
+  server breaks a pool that is opening, carries the server's reason (the
+  exception message of the state message's error record), truncated to 1024
+  characters with control and bidi characters escaped. There is still no
+  timeout on the exchange: over WinRM a receive cannot be cancelled safely,
+  so close the pool after giving up on it.
+- **A carriage return in a string sent to PowerShell is no longer turned
+  into a line feed.** PowerShell's XML reader normalises line endings in
+  element text, so `"a\r\nb"` arrived as `"a\nb"`. The encoder now writes
+  a CR in element text as `_x000D_`, as PowerShell's own serializer does
+  (tab and line feed stay literal in text). A script read from a CRLF file
+  now reaches PowerShell with its CRs, and each CR costs 7 bytes more on
+  the wire.
+- **Characters outside the Basic Multilingual Plane come back as one
+  character.** PowerShell writes them as two escapes of their UTF-16
+  surrogates (`_xD83D__xDE00_` for an emoji); the decoder left that text
+  literal. A pair now decodes to the character, and a lone surrogate to
+  U+FFFD.
+
 ## [3.0.0] — 2026-10-23
 
 SSH host-key checks now follow OpenSSH: several `known_hosts` lines that
