@@ -115,9 +115,13 @@ pub enum PsValue {
     ///   [`encrypt_secure_string`](crate::RunspacePool::encrypt_secure_string)
     ///   returns. The encoder writes whatever the variant holds, so a
     ///   plaintext put here crosses the wire in clear and PowerShell
-    ///   cannot decrypt it. That is also what happens today to the
-    ///   `SecureString`s a [`PsHost`](crate::PsHost) returns for
-    ///   `Read-Host -AsSecureString` or `Get-Credential`.
+    ///   cannot decrypt it.
+    ///
+    /// The `SecureString`s that a [`PsHost`](crate::PsHost) returns for
+    /// `Read-Host -AsSecureString` or `Get-Credential` are the exception:
+    /// the host returns the **plaintext** and the pool encrypts it with the
+    /// session key before it answers, starting the key exchange itself if
+    /// it has no key yet.
     SecureString(String),
     /// `<LST>` / `<IE>` / `<QUE>` / `<STK>`.
     List(Vec<PsValue>),

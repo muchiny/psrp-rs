@@ -61,7 +61,11 @@ pub trait PsHost: Send + Sync {
     async fn read_line(&self) -> Result<String> {
         Err(self.rejection_for(HostCallKind::ReadInput))
     }
-    /// Read a secure string from the host.
+    /// Read a secure string from the host (`Read-Host -AsSecureString`).
+    ///
+    /// Return the **plaintext**: the pool encrypts it with the session key
+    /// before answering the server, negotiating the key first when it has
+    /// none, and never sends the plaintext.
     async fn read_line_as_secure_string(&self) -> Result<String> {
         Err(self.rejection_for(HostCallKind::ReadSecureInput))
     }
@@ -84,7 +88,8 @@ pub trait PsHost: Send + Sync {
     ) -> Result<Vec<PsValue>> {
         Err(self.rejection_for(HostCallKind::Prompt))
     }
-    /// `Get-Credential`.
+    /// `Get-Credential`. The password is the **plaintext**, encrypted by the
+    /// pool before it is sent (see [`Self::read_line_as_secure_string`]).
     async fn get_credential(
         &self,
         _caption: &str,
