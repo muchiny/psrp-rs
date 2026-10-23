@@ -6,6 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`sha1` 0.10 and `rsa`'s `sha1` feature are gone from the dependency
+  tree.** The session-key exchange has been RSAES-PKCS1-v1_5 since 3.0.0,
+  which takes no hash, so `psrp-rs` no longer needed them. The tree also
+  loses `block-buffer` 0.10 and `cpufeatures` 0.2. No API or behaviour
+  change; the `ssh` feature keeps `sha1` 0.11 for hashed `known_hosts`
+  entries.
+
 ### Fixed
 
 - **`RunspacePoolStateMachine::open` is accepted from `BeforeOpen` only.**
