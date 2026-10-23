@@ -56,6 +56,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   encrypt a `PsValue::SecureString` by itself, and the SecureStrings that a
   `PsHost` answers to `Read-Host -AsSecureString` and `Get-Credential` still
   travel in clear (tracked in #36).
+- **A `[char]` that is half of a surrogate pair no longer fails the whole
+  pipeline.** PowerShell sends a `[char]` as its UTF-16 unit, so
+  `"😀".ToCharArray()` is `<C>55357</C><C>56832</C>`; the decoder rejected a
+  surrogate and the error discarded everything collected so far. Each one is
+  now `PsValue::Char('\u{FFFD}')`. In the other direction a `PsValue::Char`
+  outside the Basic Multilingual Plane was written as `<C>128512</C>`, which
+  PowerShell refuses (the whole message fails); it is now written as
+  U+FFFD. A value above 65535 is still a decode error, as it is for
+  PowerShell. `PsValue::Char` keeps its type; use a string to carry text.
 
 ## [3.0.0] — 2026-10-23
 

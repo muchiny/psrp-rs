@@ -58,7 +58,14 @@ pub enum PsValue {
     /// `<D>…</D>` — .NET `Decimal`. Stored as its decimal string so
     /// we don't drag in another crate for high-precision arithmetic.
     Decimal(String),
-    /// `<C>…</C>` — single UTF-16 code unit.
+    /// `<C>…</C>` — a .NET `[char]`, one UTF-16 code unit.
+    ///
+    /// A Rust `char` is a whole scalar value, so this variant holds only
+    /// the characters of the Basic Multilingual Plane. On the wire a
+    /// surrogate half (the two `[char]`s of an emoji) decodes to U+FFFD,
+    /// and a `char` outside the plane is written as U+FFFD, as PowerShell
+    /// would refuse the message otherwise. Use a [`PsValue::String`] to
+    /// carry text.
     Char(char),
     /// `<S>…</S>` — UTF-8 string.
     String(String),

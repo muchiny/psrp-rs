@@ -102,7 +102,7 @@ fn gen_value(u: &mut Unstructured<'_>, depth: u32, safe: bool) -> ArbResult<PsVa
         10 => PsValue::F32(f32::from_bits(u.arbitrary()?)),
         11 => PsValue::Double(f64::from_bits(u.arbitrary()?)),
         12 => PsValue::Decimal(gen_decimal(u, safe)?),
-        13 => PsValue::Char(u.arbitrary()?),
+        13 => PsValue::Char(gen_char(u, safe)?),
         14 => PsValue::String(gen_string(u, safe)?),
         15 => PsValue::Bytes(u.arbitrary()?),
         16 => PsValue::DateTime(gen_string(u, safe)?),
@@ -130,6 +130,19 @@ fn gen_value(u: &mut Unstructured<'_>, depth: u32, safe: bool) -> ArbResult<PsVa
         }
         _ => PsValue::Object(gen_object(u, depth, safe)?),
     })
+}
+
+/// A `[char]` is one UTF-16 code unit: only a safe value must be one
+/// the codec keeps (BMP, no surrogate); an unsafe one may be any `char`,
+/// which the encoder writes as U+FFFD when it is outside the plane.
+fn gen_char(u: &mut Unstructured<'_>, safe: bool) -> ArbResult<char> {
+    if !safe {
+        return u.arbitrary();
+    }
+    // 0xD800..=0xDFFF are no `char`: shift the upper part over them.
+    let n = u.int_in_range(0..=0xFFFFu32 - 0x800)?;
+    let cp = if n < 0xD800 { n } else { n + 0x800 };
+    Ok(char::from_u32(cp).expect("below 0x10000 and not a surrogate"))
 }
 
 fn gen_decimal(u: &mut Unstructured<'_>, safe: bool) -> ArbResult<String> {

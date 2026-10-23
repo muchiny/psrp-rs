@@ -232,13 +232,17 @@ fn parse_element_inner(
         }
         "C" => {
             let text = read_text(reader, "C")?;
-            let code: u32 = text
+            // A `[char]` is one UTF-16 code unit on the wire
+            // (`XmlConvert.ToString((UInt16)c)`), so half of an emoji comes
+            // as `<C>55357</C>`: a surrogate is no `char`, and one of them
+            // must not fail the whole document, so it reads as U+FFFD.
+            let unit: u16 = text
                 .trim()
                 .parse()
                 .map_err(|err| PsrpError::clixml(format!("C: {err}")))?;
-            let ch = char::from_u32(code)
-                .ok_or_else(|| PsrpError::clixml(format!("C: invalid code point {code}")))?;
-            Ok(Some(PsValue::Char(ch)))
+            Ok(Some(PsValue::Char(
+                char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER),
+            )))
         }
         "BA" => {
             let text = read_text(reader, "BA")?;
@@ -1090,10 +1094,49 @@ mod tests {
 
     #[test]
     fn char_invalid_code_point() {
-        // 0xD800 is a surrogate, not a valid char
-        assert!(parse_clixml("<C>55296</C>").is_err());
         // Not a number
         assert!(parse_clixml("<C>abc</C>").is_err());
+        // Not a UTF-16 code unit: PowerShell's `ToUInt16` rejects these too.
+        assert!(parse_clixml("<C>65536</C>").is_err());
+        assert!(parse_clixml("<C>128512</C>").is_err());
+        assert!(parse_clixml("<C>-1</C>").is_err());
+    }
+
+    /// `"😀".ToCharArray()` is `<C>55357</C><C>56832</C>`: a lone surrogate
+    /// is U+FFFD, wherever it sits, and does not cost the rest of the
+    /// document (the whole `run` used to fail on it).
+    #[test]
+    fn char_surrogate_is_replacement_not_an_error() {
+        for unit in [0xD800u32, 0xD83D, 0xDE00, 0xDFFF] {
+            assert_eq!(
+                parse_clixml(&format!("<C>{unit}</C>")).unwrap(),
+                vec![PsValue::Char('\u{FFFD}')],
+                "{unit:#x}"
+            );
+        }
+        // The edges of the range are still real characters.
+        assert_eq!(
+            parse_clixml("<C>55295</C><C>57344</C><C>65535</C>").unwrap(),
+            vec![
+                PsValue::Char('\u{D7FF}'),
+                PsValue::Char('\u{E000}'),
+                PsValue::Char('\u{FFFF}'),
+            ]
+        );
+        let got =
+            parse_clixml(r#"<Obj RefId="0"><LST><C>55357</C><I32>2</I32><C>56832</C></LST></Obj>"#)
+                .unwrap();
+        let [PsValue::Object(o)] = got.as_slice() else {
+            panic!("expected one object, got {got:?}");
+        };
+        assert_eq!(
+            o.get("_value"),
+            Some(&PsValue::List(vec![
+                PsValue::Char('\u{FFFD}'),
+                PsValue::I32(2),
+                PsValue::Char('\u{FFFD}'),
+            ]))
+        );
     }
 
     #[test]

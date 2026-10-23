@@ -340,6 +340,36 @@ async fn live_secure_string_round_trip() {
     let _ = pool.close().await;
 }
 
+/// `"😀".ToCharArray()` is two `<C>` of surrogates: they used to fail the whole
+/// pipeline; now each is U+FFFD. A `[char]` sent from a non-BMP `char` goes out
+/// as U+FFFD too (PowerShell rejects `<C>128512</C>`).
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_char_surrogates_and_non_bmp() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    let out = pool
+        .run_script("([string]::new([char[]](0xD83D,0xDE00))).ToCharArray()")
+        .await
+        .expect("a surrogate half must not fail the pipeline");
+    assert_eq!(
+        out,
+        vec![PsValue::Char('\u{FFFD}'), PsValue::Char('\u{FFFD}')]
+    );
+
+    let pipeline = Pipeline::empty().add_command(
+        Command::script("param($c) [int]$c").with_argument(PsValue::Char('\u{1F600}')),
+    );
+    let result = pipeline.run_all_streams(&mut pool).await.expect("run");
+    assert_eq!(result.output, vec![PsValue::I32(0xFFFD)]);
+
+    let _ = pool.close().await;
+}
+
 // ---- SSH transport tests ----
 
 /// Build the SSH config from `PSRP_INTEGRATION_SSH_{HOST,PORT,USER,PASS}`.

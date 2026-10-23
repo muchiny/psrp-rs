@@ -81,7 +81,13 @@ pub(crate) fn write_value_with(
         PsValue::F32(v) => write_simple(out, "Sg", &format_float(*v as f64), name, false),
         PsValue::Double(v) => write_simple(out, "Db", &format_float(*v), name, false),
         PsValue::Decimal(s) => write_simple(out, "D", &escape(s), name, false),
-        PsValue::Char(c) => write_simple(out, "C", &(*c as u32).to_string(), name, false),
+        // A `[char]` is one UTF-16 unit (`ToUInt16` on the other side), which a
+        // character outside the BMP is not: PowerShell would reject the whole
+        // message, so it goes out as U+FFFD instead.
+        PsValue::Char(c) => {
+            let unit = u16::try_from(u32::from(*c)).unwrap_or(0xFFFD);
+            write_simple(out, "C", &unit.to_string(), name, false);
+        }
         PsValue::String(s) => write_simple(out, "S", &escape(s), name, false),
         PsValue::Bytes(b) => write_simple(out, "BA", &base64_encode(b), name, false),
         PsValue::DateTime(s) => write_simple(out, "DT", &escape(s), name, false),
@@ -906,6 +912,7 @@ mod tests {
         assert_eq!(to_clixml(&PsValue::U32(1)), "<U32>1</U32>");
         assert_eq!(to_clixml(&PsValue::U64(1)), "<U64>1</U64>");
         assert_eq!(to_clixml(&PsValue::Char('A')), "<C>65</C>");
+        assert_eq!(to_clixml(&PsValue::Char('\u{FFFF}')), "<C>65535</C>");
         assert_eq!(to_clixml(&PsValue::Decimal("1.5".into())), "<D>1.5</D>");
     }
 
@@ -1162,6 +1169,15 @@ mod tests {
         );
         assert!(xml.contains("<S N=\"N\">FileVersionInfo</S>"));
         assert!(xml.contains("<B N=\"V\">true</B>"));
+    }
+
+    /// PowerShell reads `<C>` with `ToUInt16`: `<C>128512</C>` makes it reject
+    /// the whole message, so a character outside the BMP is sent as U+FFFD.
+    #[test]
+    fn char_outside_the_bmp_is_written_as_a_replacement() {
+        assert_eq!(to_clixml(&PsValue::Char('\u{1F600}')), "<C>65533</C>");
+        assert_eq!(to_clixml(&PsValue::Char('\u{10000}')), "<C>65533</C>");
+        assert_eq!(to_clixml(&PsValue::Char('\u{10FFFF}')), "<C>65533</C>");
     }
 
     #[test]
