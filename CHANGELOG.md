@@ -61,10 +61,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   layer. The host still returns the plaintext; the pool now encrypts it with
   the session key (AES-256-CBC, base64, as `encrypt_secure_string`). With no
   key yet it starts the key exchange itself and sends the answer when the
-  key arrives, and it answers the server's `PublicKeyRequest` (MS-PSRP
-  3.1.4.8), which used to be ignored. The `EncryptedSessionKey` is now taken
+  key arrives (or answers the host call with an error if the key cannot be
+  taken), and it answers the server's `PublicKeyRequest`, which used to be
+  ignored. The `EncryptedSessionKey` is now taken
   by whichever call reads it, not only by `request_session_key`, so a key
-  that arrives while a pipeline runs is no longer lost. Not yet reachable
+  that arrives while a pipeline runs is no longer lost. Host calls still
+  waiting for a key are not carried over `disconnect`/`reconnect`. Not yet reachable
   against PowerShell: psrp-rs declares a null host, so the server never makes
   these calls (tracked separately).
 

@@ -233,6 +233,12 @@ impl<T: PsrpTransport> RunspacePool<T> {
             return Err(PsrpError::protocol("pool already closed"));
         }
         self.closed = true;
+        if !self.deferred_host_responses.is_empty() {
+            tracing::warn!(
+                parked = self.deferred_host_responses.len(),
+                "disconnecting with host calls still waiting for a session key: they will not be answered"
+            );
+        }
         let shell_id = match self.transport.disconnect_shell().await {
             Ok(id) => id,
             Err(e) => {
@@ -293,8 +299,13 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// exercise `SecureString` encrypt/decrypt without driving the full
     /// RSA handshake, and available to callers that negotiate a key out
     /// of band.
+    ///
+    /// An exchange the pool had started is abandoned (its reply would
+    /// replace this key), and the host answers that were waiting for a key
+    /// are sent, encrypted with this one, by the next read.
     pub fn set_session_key(&mut self, key: crate::crypto::SessionKey) {
         self.session_key = Some(key);
+        self.pending_client_key = None;
     }
 
     /// Encrypt a plaintext `SecureString` value using the currently
@@ -337,6 +348,10 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// [`state`](Self::state) reports `Broken` or `Closed`: the pool can no
     /// longer be used and must be closed. Transport errors and a malformed
     /// reply are returned as well.
+    ///
+    /// An exchange the pool started itself (a host answer holding a
+    /// `SecureString`, or the server's `PublicKeyRequest`) is awaited, not
+    /// repeated.
     ///
     /// # No timeout
     ///
@@ -383,9 +398,20 @@ impl<T: PsrpTransport> RunspacePool<T> {
 
     /// Start an exchange unless there is a key or one is in flight: what a
     /// host answer holding a `SecureString` and the server's
-    /// `PublicKeyRequest` (MS-PSRP 3.1.4.8) both need.
+    /// `PublicKeyRequest` (`PUBLIC_KEY_REQUEST`) both need.
     async fn ensure_key_exchange_started(&mut self) -> Result<()> {
-        if self.session_key.is_some() || self.pending_client_key.is_some() {
+        if self.session_key.is_some() {
+            return Ok(());
+        }
+        self.start_exchange_unless_pending().await
+    }
+
+    /// Start an exchange unless one is in flight, even when a key is held:
+    /// a server that sends `PublicKeyRequest` has no key for this client
+    /// (it may have lost it across a reconnect), and the new key then
+    /// replaces the old.
+    async fn start_exchange_unless_pending(&mut self) -> Result<()> {
+        if self.pending_client_key.is_some() {
             return Ok(());
         }
         let client_key = crate::crypto::ClientSessionKey::generate()?;
@@ -414,12 +440,28 @@ impl<T: PsrpTransport> RunspacePool<T> {
 
     /// Take the key out of an `EncryptedSessionKey` message, then send the
     /// host answers that were waiting for it.
+    ///
+    /// When the reply is unusable, the parked answers are replaced by an
+    /// error response each, so the server's host calls do not wait for ever
+    /// for an answer that can no longer be encrypted.
     async fn accept_encrypted_session_key(&mut self, msg: &PsrpMessage) -> Result<()> {
         // The key pair is single use, whatever comes of the reply.
         let Some(client_key) = self.pending_client_key.take() else {
             tracing::debug!("EncryptedSessionKey without a pending exchange: ignored");
             return Ok(());
         };
+        if let Err(e) = self.take_session_key(msg, &client_key) {
+            self.fail_deferred_host_responses(&e).await;
+            return Err(e);
+        }
+        self.flush_deferred_host_responses().await
+    }
+
+    fn take_session_key(
+        &mut self,
+        msg: &PsrpMessage,
+        client_key: &crate::crypto::ClientSessionKey,
+    ) -> Result<()> {
         let parsed = parse_clixml(&msg.data)?;
         let encoded = parsed
             .into_iter()
@@ -439,15 +481,39 @@ impl<T: PsrpTransport> RunspacePool<T> {
         let bytes = crate::clixml::encode::base64_decode(&encoded)
             .ok_or_else(|| PsrpError::protocol("EncryptedSessionKey: invalid base64"))?;
         let raw = client_key.decrypt_session_key(&bytes)?;
-        let key = crate::crypto::SessionKey::from_bytes(raw);
-        self.session_key = Some(key.clone());
-        for parked in std::mem::take(&mut self.deferred_host_responses) {
+        self.session_key = Some(crate::crypto::SessionKey::from_bytes(raw));
+        Ok(())
+    }
+
+    /// Send the parked host answers, encrypted. One at a time, and removed
+    /// once sent: a read dropped in the middle (a cancelled pipeline) leaves
+    /// the rest for the next one.
+    async fn flush_deferred_host_responses(&mut self) -> Result<()> {
+        let Some(key) = self.session_key.clone() else {
+            return Ok(());
+        };
+        while let Some(parked) = self.deferred_host_responses.first() {
             let value = encrypt_secure_strings(&parked.value, &key);
             let body = build_host_response_body(parked.ci, parked.mi, &value);
-            self.send_pipeline_message(parked.response_type, parked.pid, body)
-                .await?;
+            let (response_type, pid) = (parked.response_type, parked.pid);
+            self.send_pipeline_message(response_type, pid, body).await?;
+            self.deferred_host_responses.remove(0);
         }
         Ok(())
+    }
+
+    /// Answer every parked host call with an error carrying `why`.
+    async fn fail_deferred_host_responses(&mut self, why: &PsrpError) {
+        let message = format!("the SecureString could not be sent: {why}");
+        for parked in std::mem::take(&mut self.deferred_host_responses) {
+            let body = build_host_response_error_body(parked.ci, parked.mi, &message);
+            if let Err(e) = self
+                .send_pipeline_message(parked.response_type, parked.pid, body)
+                .await
+            {
+                tracing::debug!("host error response not sent: {e}");
+            }
+        }
     }
 
     /// Run a script with a cancellation token.
@@ -480,6 +546,10 @@ impl<T: PsrpTransport> RunspacePool<T> {
 
     pub(crate) async fn next_message(&mut self) -> Result<PsrpMessage> {
         loop {
+            // Answers parked for a key that `set_session_key` has since given.
+            if !self.deferred_host_responses.is_empty() && self.session_key.is_some() {
+                self.flush_deferred_host_responses().await?;
+            }
             // Drain any buffered messages from a previous recv_chunk that
             // produced multiple PSRP messages at once.
             if let Some(msg) = self.pending_messages.pop() {
@@ -495,7 +565,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
                         return Ok(msg);
                     }
                     MessageType::PublicKeyRequest => {
-                        self.ensure_key_exchange_started().await?;
+                        self.start_exchange_unless_pending().await?;
                         return Ok(msg);
                     }
                     _ => return Ok(msg),
@@ -583,7 +653,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
             _ => MessageType::PipelineHostResponse,
         };
         // A `SecureString` crosses the wire encrypted with the session key
-        // (MS-PSRP 2.2.5.1.5), never as the plaintext the host returned: with
+        // (MS-PSRP 2.2.5.1.24), never as the plaintext the host returned: with
         // no key yet the exchange is started and the answer parked until
         // the key arrives.
         let mut value = response_value;
@@ -1215,10 +1285,126 @@ mod tests {
                 .unwrap(),
             "hunter2"
         );
+        assert!(
+            !t.sent()
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<u8>>()
+                .windows(7)
+                .any(|w| w == b"hunter2"),
+            "the plaintext crossed the transport"
+        );
         let _ = pool.close().await;
     }
 
-    /// MS-PSRP 3.1.4.8: the server asks for the client's key when it has a
+    /// A reply that cannot be taken must not leave the server's host call
+    /// waiting for ever: it is answered with an error, never with the
+    /// plaintext, and the pool can try again.
+    #[tokio::test]
+    async fn a_failed_key_exchange_answers_the_parked_host_calls_with_an_error() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+
+        t.push_incoming(encrypted_session_key_reply("not base64 !!!"));
+        let err = pool.next_message().await.unwrap_err();
+        assert!(err.to_string().contains("invalid base64"), "{err}");
+        assert!(pool.session_key().is_none());
+
+        let response = sent_messages(&t)
+            .into_iter()
+            .rfind(|m| m.message_type == MessageType::RunspacePoolHostResponse)
+            .expect("the host call was answered");
+        assert!(response.data.contains("the SecureString could not be sent"));
+        assert!(!response.data.contains("hunter2"));
+        assert!(
+            !t.sent()
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<u8>>()
+                .windows(7)
+                .any(|w| w == b"hunter2")
+        );
+
+        // A later host call starts a fresh exchange (the first key pair died).
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+        let public_keys = sent_messages(&t)
+            .iter()
+            .filter(|m| m.message_type == MessageType::PublicKey)
+            .count();
+        assert_eq!(public_keys, 2);
+        let _ = pool.close().await;
+    }
+
+    /// `PublicKeyRequest` while an exchange is in flight repeats nothing; with
+    /// a key already held it still answers (the server lost its copy).
+    #[tokio::test]
+    async fn public_key_request_while_pending_or_with_a_key() {
+        let public_keys = |t: &MockTransport| {
+            sent_messages(t)
+                .iter()
+                .filter(|m| m.message_type == MessageType::PublicKey)
+                .count()
+        };
+        let request = || {
+            wire(
+                4,
+                &PsrpMessage {
+                    destination: Destination::Client,
+                    message_type: MessageType::PublicKeyRequest,
+                    rpid: Uuid::nil(),
+                    pid: Uuid::nil(),
+                    data: to_clixml(&PsValue::Object(PsObject::new())),
+                }
+                .encode(),
+            )
+        };
+
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        t.push_incoming(request());
+        pool.next_message().await.unwrap();
+        t.push_incoming(request());
+        pool.next_message().await.unwrap();
+        assert_eq!(public_keys(&t), 1, "a pending exchange is not repeated");
+        let _ = pool.close().await;
+
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        pool.set_session_key(crate::crypto::SessionKey::from_bytes([1u8; 32]));
+        t.push_incoming(request());
+        pool.next_message().await.unwrap();
+        assert_eq!(public_keys(&t), 1, "a held key does not mute the request");
+        let _ = pool.close().await;
+    }
+
+    /// A key injected while answers are parked abandons the exchange and
+    /// releases them, encrypted with the injected key, at the next read.
+    #[tokio::test]
+    async fn set_session_key_releases_the_parked_host_answers() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+
+        let key = crate::crypto::SessionKey::from_bytes([8u8; 32]);
+        pool.set_session_key(key.clone());
+        // The reply of the abandoned exchange arrives: ignored, and the
+        // parked answer is released before it is read, under the injected key.
+        t.push_incoming(encrypted_session_key_reply("AAAA"));
+        let msg = pool.next_message().await.unwrap();
+        assert_eq!(msg.message_type, MessageType::EncryptedSessionKey);
+
+        let sealed = crate::clixml::encode::base64_decode(&sent_host_response_secret(&t)).unwrap();
+        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "hunter2");
+        let probe = pool.encrypt_secure_string("probe").unwrap();
+        let sealed = crate::clixml::encode::base64_decode(&probe).unwrap();
+        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "probe");
+        let _ = pool.close().await;
+    }
+
+    /// The server asks for the client's key when it has a
     /// `SecureString` to send; it used to be ignored.
     #[tokio::test]
     async fn public_key_request_starts_the_exchange() {
@@ -1284,6 +1470,13 @@ mod tests {
             PsValue::Dict(vec![(PsValue::String("k".into()), credential)]),
         ]);
         assert!(contains_secure_string(&value));
+        // A SecureString used as a dictionary key is found and encrypted too.
+        let keyed = PsValue::Dict(vec![(PsValue::SecureString("k".into()), PsValue::I32(1))]);
+        assert!(contains_secure_string(&keyed));
+        let PsValue::Dict(entries) = encrypt_secure_strings(&keyed, &key) else {
+            panic!()
+        };
+        assert_ne!(entries[0].0, PsValue::SecureString("k".into()));
         assert!(!contains_secure_string(&PsValue::List(vec![
             PsValue::String("pw".into())
         ])));
