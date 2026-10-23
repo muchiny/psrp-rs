@@ -6,7 +6,7 @@
 //! * Full primitive set from MS-PSRP §2.2.5.1 — `<S>`, `<C>`, `<B>`,
 //!   `<DT>`, `<TS>`, `<By>`/`<SB>`, `<U16>`/`<I16>`, `<U32>`/`<I32>`,
 //!   `<U64>`/`<I64>`, `<Sg>`/`<Db>`, `<D>`, `<BA>`, `<G>`, `<URI>`,
-//!   `<Version>`, `<XD>`, `<SCT>`, `<SS>`, `<Nil/>`.
+//!   `<Version>`, `<XD>`, `<SBK>`, `<SS>`, `<Nil/>`.
 //! * Complex types — `<Obj>` with member sets (`<MS>` / `<Props>`),
 //!   `<LST>` / `<IE>` / `<QUE>` / `<STK>`, `<DCT>`.
 //! * Reference resolution — `<Ref>` and `<TNRef>` look up previously
@@ -81,7 +81,16 @@ pub enum PsValue {
     Uri(String),
     /// `<XD>…</XD>` — `System.Xml.XmlDocument` or fragment.
     Xml(String),
-    /// `<SCT>…</SCT>` — PowerShell script block source.
+    /// `<SBK>…</SBK>` — PowerShell script block source.
+    ///
+    /// The body is escaped like `<S>`, `_xHHHH_` escapes included. Over
+    /// remoting a script block arrives on the server as a plain
+    /// **string**, not a `ScriptBlock`: PowerShell never sets
+    /// `DeserializationOptions.DeserializeScriptBlocks` there, so a
+    /// parameter typed `[scriptblock]` has to rebuild it with
+    /// `[scriptblock]::Create($s)`. The decoder also accepts `<SCT>`,
+    /// which is not a PowerShell tag but what psrp-rs itself used to
+    /// write.
     ScriptBlock(String),
     /// `<SS>…</SS>` — a `SecureString`.
     ///

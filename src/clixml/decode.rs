@@ -267,8 +267,11 @@ fn parse_element_inner(
             let text = read_text(reader, "XD")?;
             Ok(Some(PsValue::Xml(text)))
         }
-        "SCT" => {
-            let text = read_text(reader, "SCT")?;
+        // `SBK` is PowerShell's tag (MS-PSRP 2.2.5.1.23). `SCT` was never
+        // one: it is what psrp-rs itself used to write, still accepted so
+        // that such output decodes.
+        "SBK" | "SCT" => {
+            let text = read_text(reader, &tag)?;
             Ok(Some(PsValue::ScriptBlock(text)))
         }
         "SS" => {
@@ -1134,6 +1137,12 @@ mod tests {
                 PsValue::Xml("some xml data".into()),
             ),
             (
+                "<SBK>Get-Process</SBK>",
+                PsValue::ScriptBlock("Get-Process".into()),
+            ),
+            // `SCT` is not a PowerShell tag; it is only what psrp-rs
+            // itself used to write, kept so that output still decodes.
+            (
                 "<SCT>Get-Process</SCT>",
                 PsValue::ScriptBlock("Get-Process".into()),
             ),
@@ -1147,6 +1156,81 @@ mod tests {
             assert_eq!(got.len(), 1, "{xml}");
             assert_eq!(got[0], expected, "{xml}");
         }
+    }
+
+    /// Regression (#19): PowerShell's script-block tag is `SBK`
+    /// (`SerializationStrings.ScriptBlockTag`, MS-PSRP 2.2.5.1.23), and
+    /// the decoder only knew `SCT`, so every `<SBK>` was skipped as an
+    /// unknown element: a top-level output vanished, a property went
+    /// missing, a list item disappeared and shifted the ones after it.
+    ///
+    /// The documents are verbatim `PSSerializer.Serialize` output
+    /// (pwsh 7.3.12), indentation removed.
+    #[test]
+    fn script_block_sbk_from_powershell_is_not_dropped() {
+        // Top level: `{}` and a body with XML metacharacters and a
+        // literal `_x000D_`, which PowerShell escapes as in `<S>`.
+        let got =
+            parse_clixml(r#"<SBK></SBK><SBK> Get-Date "a&amp;b&lt;c&gt;" _x005F_x000D_ </SBK>"#)
+                .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                PsValue::ScriptBlock(String::new()),
+                PsValue::ScriptBlock(r#" Get-Date "a&b<c>" _x000D_ "#.into()),
+            ]
+        );
+
+        // `[pscustomobject]@{ Action = { 1 }; L = @({ 2 }, 3) }`: a
+        // property value and a list item.
+        let xml = concat!(
+            r#"<Obj RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T>"#,
+            r#"<T>System.Object</T></TN><MS><SBK N="Action"> 1 </SBK>"#,
+            r#"<Obj N="L" RefId="1"><TN RefId="1"><T>System.Object[]</T><T>System.Array</T>"#,
+            r#"<T>System.Object</T></TN><LST><SBK> 2 </SBK><I32>3</I32></LST></Obj></MS></Obj>"#,
+        );
+        let got = parse_clixml(xml).unwrap();
+        let PsValue::Object(obj) = &got[0] else {
+            panic!("expected an object, got {got:?}");
+        };
+        assert_eq!(obj.get("Action"), Some(&PsValue::ScriptBlock(" 1 ".into())));
+        let Some(PsValue::Object(list)) = obj.get("L") else {
+            panic!("expected `L` to be an object, got {obj:?}");
+        };
+        assert_eq!(
+            list.get("_value"),
+            Some(&PsValue::List(vec![
+                PsValue::ScriptBlock(" 2 ".into()),
+                PsValue::I32(3),
+            ]))
+        );
+    }
+
+    /// A script block survives the encoder and decoder at every position,
+    /// with content that needs each kind of escape: XML metacharacters, a
+    /// CR (which XML end-of-line handling would turn into LF) and a
+    /// literal `_x` that would otherwise read as a `_xHHHH_` escape.
+    #[test]
+    fn script_block_round_trips_with_escapes() {
+        let body = "if ($a -lt 1) {\r\n  'a&b' <c> \"_x000D_\" _x\r}\n";
+        let sb = PsValue::ScriptBlock(body.into());
+
+        let xml = to_clixml(&sb);
+        assert!(xml.starts_with("<SBK>") && xml.ends_with("</SBK>"), "{xml}");
+        assert!(!xml.contains('\r'), "literal CR in {xml:?}");
+        assert_eq!(parse_clixml(&xml).unwrap(), vec![sb.clone()], "{xml}");
+
+        let obj = PsValue::Object(PsObject::new().with("Action", sb.clone()));
+        let xml = to_clixml(&obj);
+        assert!(xml.contains(r#"<SBK N="Action">"#), "{xml}");
+        assert_eq!(parse_clixml(&xml).unwrap(), vec![obj], "{xml}");
+
+        let list = PsValue::List(vec![sb.clone(), PsValue::I32(3)]);
+        let got = parse_clixml(&to_clixml(&list)).unwrap();
+        let PsValue::Object(o) = &got[0] else {
+            panic!("expected the list wrapped in an object, got {got:?}");
+        };
+        assert_eq!(o.get("_value"), Some(&list));
     }
 
     #[test]
