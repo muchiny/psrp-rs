@@ -293,7 +293,8 @@ pub fn ps_host_info_null() -> PsValue {
 ///
 /// Control characters below 0x20 (except `\t`, `\n`, `\r`, which XML
 /// text preserves verbatim) are emitted as PowerShell's `_xHHHH_`
-/// escapes.
+/// escapes, and so is a `_` followed by `x` or `X` (as `_x005F_`), so
+/// that the decoder never mistakes the caller's text for an escape.
 #[must_use]
 pub fn escape(s: &str) -> String {
     escape_inner(s, false)
@@ -320,11 +321,19 @@ fn escape_inner(s: &str, attribute: bool) -> String {
             '&' => out.push_str("&amp;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            // A literal `_` that would open a `_xHHHH_` sequence has to
-            // be escaped itself, or the decoder reads the user's text as
-            // an escape: `"9+_x001F_"` would come back as `"9+\u{1f}"`.
-            // This is what PowerShell's own serializer does.
-            '_' if opens_pwsh_escape(bytes, i) => out.push_str("_x005F_"),
+            // A literal `_` followed by `x` or `X` is escaped itself, or the
+            // decoder reads the user's text as an escape: `"9+_x001F_"`
+            // would come back as `"9+\u{1f}"`. This is PowerShell's own
+            // rule (`InternalSerializer.EncodeString`), and deciding on the
+            // next character alone is what makes it exact: `x` is never
+            // rewritten, so every `_x` the decoder reaches at a token
+            // boundary opens an escape emitted here (an escape's trailing
+            // `_` is consumed with it). Matching the whole `_xHHHH_` pattern on the
+            // input instead missed a sequence closed by the escape of the
+            // character after it (`"_x0041\r"` in an attribute). `X` is
+            // covered because PowerShell decodes with
+            // `XmlConvert.DecodeName`, which accepts `_X` too.
+            '_' if matches!(bytes.get(i + 1), Some(b'x' | b'X')) => out.push_str("_x005F_"),
             '\t' | '\n' | '\r' if attribute => {
                 out.push_str(&format!("_x{:04X}_", c as u32));
             }
@@ -335,18 +344,6 @@ fn escape_inner(s: &str, attribute: bool) -> String {
         }
     }
     out
-}
-
-/// Does a `_xHHHH_` escape sequence start at byte offset `i`?
-///
-/// Mirrors the pattern `decode_pwsh_escapes` looks for, so the two stay
-/// exact inverses of each other.
-fn opens_pwsh_escape(bytes: &[u8], i: usize) -> bool {
-    i + 7 <= bytes.len()
-        && bytes[i] == b'_'
-        && bytes[i + 1] == b'x'
-        && bytes[i + 6] == b'_'
-        && bytes[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit)
 }
 
 /// Minimal, allocation-conscious base64 encoder (standard alphabet).
@@ -693,6 +690,42 @@ mod tests {
             let again = parse_clixml(&to_clixml(&decoded[0])).expect("decodes");
             assert_eq!(again[0], value, "{text:?} drifted on the second hop");
         }
+    }
+
+    /// Regression (found by the `clixml_roundtrip` fuzz target): whether a
+    /// literal `_` opens a `_xHHHH_` sequence was decided on the encoder's
+    /// *input*, but the decoder reads its *output*. When the character
+    /// after `_xHHHH` is escaped itself, its own escape opens with `_` and
+    /// closes a false sequence: the property name `"__xbaa3\r\r_"` came
+    /// back as `"_\u{baa3}x000D_\r_"`.
+    #[test]
+    fn underscore_x_before_an_escaped_char_survives() {
+        use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
+
+        let values = [
+            // The crash, as a property name (CR is escaped in attributes).
+            PsValue::Object(PsObject::new().with("__xbaa3\r\r_", PsValue::Null)),
+            PsValue::Object(PsObject::new().with("_x0041\r", PsValue::Null)),
+            // Element text: a control character, or a `_`, right after.
+            PsValue::String("_x0041\u{1}".into()),
+            PsValue::String("_x0041__".into()),
+            // `u32::from_str_radix` accepts a leading `+`.
+            PsValue::String("_x+041_".into()),
+        ];
+        let mut failures = Vec::new();
+        for value in values {
+            let xml = to_clixml(&value);
+            let decoded = parse_clixml(&xml).expect("decodes");
+            if decoded[0] != value {
+                failures.push(format!("{value:?} came back as {:?} via {xml}", decoded[0]));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+        // PowerShell reads CLIXML with `XmlConvert.DecodeName`, which also
+        // accepts `_X`: a literal `_X0041_` must not reach it unescaped.
+        let xml = to_clixml(&PsValue::String("_X0041_".into()));
+        assert!(xml.contains("_x005F_X0041_"), "`_X` left unescaped: {xml}");
     }
 
     /// XML attribute-value normalisation turns a literal tab, CR or LF
