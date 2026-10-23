@@ -120,7 +120,10 @@ fn parse_empty(e: &BytesStart, _state: &mut DecoderState) -> Result<Option<PsVal
     match e.name().as_ref() {
         "Nil" => Ok(Some(PsValue::Null)),
         "S" => Ok(Some(PsValue::String(String::new()))),
-        // PowerShell writes `<SBK></SBK>`; `<SBK/>` is the same to XML.
+        // PowerShell normally writes an empty value self-closed
+        // (`<S N="x" />`, `<SBK N="x" />`: the .NET writer shortens an element
+        // with no content), and `<S></S>` only when its output buffer happens
+        // to flush before the end tag; both must decode.
         "SBK" | "SCT" => Ok(Some(PsValue::ScriptBlock(String::new()))),
         "ToString" => Ok(None),
         _ => Ok(None),
@@ -1256,9 +1259,10 @@ mod tests {
         assert_eq!(o.get("_value"), Some(&dict), "{xml}");
     }
 
-    /// PowerShell writes an empty script block as `<SBK></SBK>`, but
-    /// `<SBK/>` is the same element to XML, so it must not be dropped
-    /// either, wherever it appears.
+    /// PowerShell normally writes an empty script block (or string) self-closed,
+    /// `<SBK N="x" />`, and `<SBK></SBK>` only when its output buffer flushes
+    /// before the end tag: neither may be dropped, wherever it appears (a
+    /// self-closed `<S N="x"/>` in a member set or dict entry used to be lost).
     #[test]
     fn self_closed_script_block_is_an_empty_script_block() {
         let empty = PsValue::ScriptBlock(String::new());
