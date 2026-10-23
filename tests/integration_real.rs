@@ -277,6 +277,65 @@ async fn live_pool_survives_multiple_pipelines() {
     let _ = pool.close().await;
 }
 
+/// `SecureString`s in both directions, against PowerShell's own layout
+/// (#21): AES-256-CBC with the session key, a zero IV, no IV prefix.
+///
+/// The codec does not encrypt `<SS>` by itself: the test encrypts and
+/// decrypts with the pool's helpers.
+async fn secure_string_round_trip<T: psrp_rs::PsrpTransport>(pool: &mut RunspacePool<T>) {
+    pool.request_session_key().await.expect("session key");
+
+    // One block, and several blocks with a character outside the BMP.
+    for secret in ["p@ss", "héllo 🌍 world, long secret"] {
+        // Server -> client: PowerShell encrypts the SecureString it outputs.
+        let out = pool
+            .run_script(&format!(
+                "ConvertTo-SecureString '{secret}' -AsPlainText -Force"
+            ))
+            .await
+            .expect("run_script");
+        let [PsValue::SecureString(body)] = out.as_slice() else {
+            panic!("expected one SecureString, got {out:?}");
+        };
+        assert_eq!(
+            pool.decrypt_secure_string(body).expect("decrypt"),
+            secret,
+            "server-encrypted {secret:?}"
+        );
+
+        // Client -> server: PowerShell decrypts the `<SS>` we send.
+        let sealed = pool.encrypt_secure_string(secret).expect("encrypt");
+        let result = Pipeline::empty()
+            .add_command(
+                Command::script("param($s) [System.Net.NetworkCredential]::new('', $s).Password")
+                    .with_parameter("s", PsValue::SecureString(sealed)),
+            )
+            .run_all_streams(pool)
+            .await
+            .expect("run_all_streams");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.output,
+            vec![PsValue::String(secret.into())],
+            "client-encrypted {secret:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_secure_string_round_trip() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    secure_string_round_trip(&mut pool).await;
+
+    let _ = pool.close().await;
+}
+
 // ---- SSH transport tests ----
 
 /// Build the SSH config from `PSRP_INTEGRATION_SSH_{HOST,PORT,USER,PASS}`.
@@ -452,6 +511,17 @@ async fn live_ssh_session_key() {
         return;
     };
     pool.request_session_key().await.expect("session key");
+    pool.close().await.expect("close");
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_secure_string_round_trip() {
+    let Some(mut pool) = ssh_pool().await else {
+        return;
+    };
+    secure_string_round_trip(&mut pool).await;
     pool.close().await.expect("close");
 }
 

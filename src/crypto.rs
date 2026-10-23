@@ -13,8 +13,13 @@
 //!    `EncryptedSessionKey` message. Both keys travel base64-encoded
 //!    (MS-PSRP 2.2.2.3 and 2.2.2.4).
 //! 4. Both sides use that AES key in CBC mode with PKCS#7 padding to
-//!    wrap every `<SS>` (SecureString) element. The IV is a fresh
-//!    random 16-byte value prefixed to the ciphertext.
+//!    wrap every `<SS>` (SecureString) element: the plaintext is
+//!    UTF-16LE, the IV is fixed at 16 zero bytes and never sent, and the
+//!    element carries the base64 of the bare ciphertext (PowerShell's
+//!    `utils/CryptoUtils.cs`; MS-PSRP 2.2.5.1.24 is silent on the IV).
+//!    With a fixed IV that encryption is deterministic and, like any
+//!    bare CBC, unauthenticated: see
+//!    [`SessionKey::encrypt_secure_string`].
 //!
 //! This module implements the **pure-Rust** crypto (no OpenSSL) needed
 //! for that exchange plus a [`SessionKey`] helper that encrypts and
@@ -46,6 +51,13 @@ const SESSION_KEY_UNWRAP_FAILED: &str = "session key unwrap failed";
 
 /// Size of the RSA block that follows the header (2048-bit key).
 const SESSION_KEY_BLOCK_LEN: usize = 256;
+
+/// The IV of every `SecureString` encryption: 16 zero bytes.
+///
+/// PowerShell sets it once (`_aes.IV = new byte[16]; // iv should be 0`,
+/// `utils/CryptoUtils.cs`) and never transmits it; MS-PSRP 2.2.5.1.24
+/// does not name an IV, so PowerShell's source is the reference.
+const SECURE_STRING_IV: [u8; 16] = [0; 16];
 
 /// Client-side RSA key used for PSRP session-key negotiation.
 pub struct ClientSessionKey {
@@ -217,11 +229,21 @@ impl SessionKey {
         Self { key }
     }
 
-    /// Encrypt a plaintext string and return `IV || ciphertext`.
+    /// Encrypt a plaintext string into the bytes of an `<SS>` body.
     ///
-    /// PSRP transports `SecureString` values by UTF-16LE-encoding the
-    /// plaintext, AES-CBC encrypting with PKCS#7 padding, and prefixing
-    /// the 16-byte IV.
+    /// This is PowerShell's layout (`PSRSACryptoServiceProvider` in
+    /// `utils/CryptoUtils.cs`): the plaintext is UTF-16LE encoded, padded
+    /// with PKCS#7 and encrypted with AES-256-CBC under the session key and
+    /// a fixed IV of 16 zero bytes. The result is the bare ciphertext, with
+    /// no IV in front; the `<SS>` element carries its base64 (MS-PSRP
+    /// 2.2.5.1.24).
+    ///
+    /// Because the protocol fixes the IV, the encryption is deterministic:
+    /// under one session key, the same plaintext always gives the same
+    /// ciphertext, and two plaintexts that share their first 8 UTF-16 code
+    /// units share their first block. It is also unauthenticated: a tampered
+    /// ciphertext is noticed only when it breaks the padding or the
+    /// UTF-16, otherwise it decrypts to different text.
     pub fn encrypt_secure_string(&self, plaintext: &str) -> Vec<u8> {
         // UTF-16LE encode + PKCS#7 pad to 16 bytes.
         let mut padded: Vec<u8> = plaintext
@@ -231,15 +253,12 @@ impl SessionKey {
         let pad = 16 - (padded.len() % 16);
         padded.extend(std::iter::repeat_n(pad as u8, pad));
 
-        let mut iv = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut iv);
         let cipher = Aes256::new(&Array::from(self.key));
 
-        // CBC: for each block, XOR with previous ciphertext (or IV for
+        // CBC: for each block, XOR with previous ciphertext (or the IV for
         // the first block) then encrypt.
-        let mut out = Vec::with_capacity(16 + padded.len());
-        out.extend_from_slice(&iv);
-        let mut prev: [u8; 16] = iv;
+        let mut out = Vec::with_capacity(padded.len());
+        let mut prev: [u8; 16] = SECURE_STRING_IV;
         for chunk in padded.as_chunks::<16>().0 {
             let mut block = [0u8; 16];
             for i in 0..16 {
@@ -253,17 +272,28 @@ impl SessionKey {
         out
     }
 
-    /// Decrypt `IV || ciphertext` back into the plaintext string.
+    /// Decrypt the bytes of an `<SS>` body back into the plaintext string.
+    ///
+    /// The inverse of [`encrypt_secure_string`](Self::encrypt_secure_string):
+    /// the whole payload is AES-256-CBC ciphertext under the zero IV, at
+    /// least one block long.
+    ///
+    /// # Errors
+    ///
+    /// [`PsrpError::Protocol`] when the payload is not a whole, non-zero
+    /// number of 16-byte blocks, when the PKCS#7 padding is invalid, or
+    /// when the plaintext is not valid UTF-16LE. A wrong key almost always
+    /// fails one of these checks, but nothing guarantees it (see the
+    /// unauthenticated CBC note on `encrypt_secure_string`).
     pub fn decrypt_secure_string(&self, payload: &[u8]) -> Result<String> {
-        if payload.len() < 32 || (payload.len() - 16) % 16 != 0 {
+        if payload.len() < 16 || payload.len() % 16 != 0 {
             return Err(PsrpError::protocol("secure string payload malformed"));
         }
-        let (iv, ct) = payload.split_at(16);
         let cipher = Aes256::new(&Array::from(self.key));
 
-        let mut prev: [u8; 16] = iv.try_into().unwrap();
-        let mut pt = Vec::with_capacity(ct.len());
-        for chunk in ct.as_chunks::<16>().0 {
+        let mut prev: [u8; 16] = SECURE_STRING_IV;
+        let mut pt = Vec::with_capacity(payload.len());
+        for chunk in payload.as_chunks::<16>().0 {
             let mut ga = Array::from(*chunk);
             cipher.decrypt_block(&mut ga);
             let mut block = [0u8; 16];
@@ -338,6 +368,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clixml::encode::{base64_decode, base64_encode};
 
     #[test]
     fn session_key_roundtrip_ascii() {
@@ -367,7 +398,156 @@ mod tests {
     #[test]
     fn decrypt_too_short() {
         let key = SessionKey::random();
-        assert!(key.decrypt_secure_string(&[0u8; 4]).is_err());
+        // One AES block is the minimum: PKCS#7 always adds a byte.
+        for len in [0, 4, 15] {
+            let err = key.decrypt_secure_string(&vec![0u8; len]).unwrap_err();
+            assert!(err.to_string().contains("malformed"), "{len}: {err}");
+        }
+        // A single block is enough: `pw` is one block on the wire.
+        let one_block = base64_decode(KNOWN_ANSWERS[0].1).unwrap();
+        assert_eq!(one_block.len(), 16);
+        assert_eq!(kat_key().decrypt_secure_string(&one_block).unwrap(), "pw");
+    }
+
+    /// The key of [`KNOWN_ANSWERS`]: the bytes `0x01..=0x20`.
+    fn kat_key() -> SessionKey {
+        let mut key = [0u8; 32];
+        for (b, v) in key.iter_mut().zip(1u8..) {
+            *b = v;
+        }
+        SessionKey::from_bytes(key)
+    }
+
+    /// `<SS>` bodies produced by PowerShell's own `PSRSACryptoServiceProvider`
+    /// under [`kat_key`], cross-checked with
+    /// `openssl enc -aes-256-cbc -iv 00000000000000000000000000000000`:
+    /// AES-256-CBC of the UTF-16LE plaintext with PKCS#7 padding and a zero
+    /// IV, base64 of the bare ciphertext.
+    const KNOWN_ANSWERS: [(&str, &str); 3] = [
+        ("pw", "yi84WiunSgv/41msG+Cefg=="),
+        (
+            "password123!",
+            "AtBP5ctXaBlD9lUKXipy0b6yXrVO0UiQ/BFbE9o2zXc=",
+        ),
+        (
+            "héllo 🌍 world, long secret",
+            "GF601hMKzNEwzPbSTwmiUE7PobW5mWNgTt71Lh4Kt0j4yqdn3ZQ7kzq6frECCxwU+GYit26BCXBEU5kLhywvpQ==",
+        ),
+    ];
+
+    /// Regression (#21): psrp-rs used a random IV and sent it in front of
+    /// the ciphertext, so PowerShell (zero IV, no prefix) decrypted the IV
+    /// block as 8 garbage characters before the plaintext.
+    #[test]
+    fn encrypt_matches_powershell_known_answers() {
+        let key = kat_key();
+        for (plaintext, body) in KNOWN_ANSWERS {
+            let sealed = key.encrypt_secure_string(plaintext);
+            assert_eq!(base64_encode(&sealed), body, "{plaintext:?}");
+        }
+    }
+
+    /// Regression (#21): the other way, the first block of PowerShell's
+    /// ciphertext was taken for an IV, which lost the first 8 characters
+    /// (and rejected a one-block payload outright).
+    #[test]
+    fn decrypt_matches_powershell_known_answers() {
+        let key = kat_key();
+        for (plaintext, body) in KNOWN_ANSWERS {
+            let sealed = base64_decode(body).unwrap();
+            assert_eq!(
+                key.decrypt_secure_string(&sealed).unwrap(),
+                plaintext,
+                "{body}"
+            );
+        }
+    }
+
+    /// The ciphertext is the padded plaintext and nothing else: no IV in
+    /// front, PKCS#7 adding 1 to 16 bytes.
+    #[test]
+    fn ciphertext_is_the_padded_plaintext_only() {
+        let key = SessionKey::random();
+        for n in 0..=20 {
+            let plaintext = "a".repeat(n);
+            let utf16_len = 2 * n;
+            let expected = (utf16_len / 16 + 1) * 16;
+            assert_eq!(
+                key.encrypt_secure_string(&plaintext).len(),
+                expected,
+                "{n} chars"
+            );
+        }
+    }
+
+    /// AES-256-CBC with the protocol's zero IV over `padded`, which must
+    /// already be a whole number of blocks: lets a test choose the exact
+    /// plaintext bytes, padding included.
+    fn seal_raw(key: &[u8; 32], padded: &[u8]) -> Vec<u8> {
+        assert_eq!(padded.len() % 16, 0);
+        let cipher = Aes256::new(&Array::from(*key));
+        let mut prev = [0u8; 16];
+        let mut out = Vec::new();
+        for chunk in padded.as_chunks::<16>().0 {
+            let mut block = [0u8; 16];
+            for i in 0..16 {
+                block[i] = chunk[i] ^ prev[i];
+            }
+            let mut ga = Array::from(block);
+            cipher.encrypt_block(&mut ga);
+            prev.copy_from_slice(ga.as_ref());
+            out.extend_from_slice(&prev);
+        }
+        out
+    }
+
+    /// Every malformed plaintext under the right key is an error, never a
+    /// panic and never a string.
+    #[test]
+    fn decrypt_rejects_malformed_plaintext() {
+        let raw = [0x11u8; 32];
+        let key = SessionKey::from_bytes(raw);
+        // Sanity: `seal_raw` agrees with the real encryption.
+        let mut good = vec![b'o', 0, b'k', 0];
+        good.extend([12u8; 12]);
+        assert_eq!(
+            key.decrypt_secure_string(&seal_raw(&raw, &good)).unwrap(),
+            "ok"
+        );
+
+        let cases: [(&str, Vec<u8>, &str); 5] = [
+            (
+                "pad byte 0",
+                [[0x41; 15].as_slice(), &[0]].concat(),
+                "PKCS#7",
+            ),
+            (
+                "pad byte 17",
+                [[0x41; 15].as_slice(), &[17]].concat(),
+                "PKCS#7",
+            ),
+            (
+                "inconsistent pad",
+                [[0x41; 13].as_slice(), &[3, 2, 3]].concat(),
+                "PKCS#7",
+            ),
+            (
+                "odd byte count",
+                [[0x41; 15].as_slice(), &[1]].concat(),
+                "UTF-16 aligned",
+            ),
+            (
+                "lone surrogate",
+                [[0x00, 0xD8].as_slice(), &[14; 14]].concat(),
+                "UTF-16",
+            ),
+        ];
+        for (what, padded, needle) in cases {
+            let err = key
+                .decrypt_secure_string(&seal_raw(&raw, &padded))
+                .unwrap_err();
+            assert!(err.to_string().contains(needle), "{what}: {err}");
+        }
     }
 
     #[test]
@@ -417,9 +597,10 @@ mod tests {
     #[test]
     fn decrypt_misaligned_payload() {
         let key = SessionKey::random();
-        // 16 (IV) + 17 (not a multiple of 16)
-        let bad = vec![0u8; 33];
-        assert!(key.decrypt_secure_string(&bad).is_err());
+        // Not a whole number of AES blocks.
+        for len in [17, 31, 33] {
+            assert!(key.decrypt_secure_string(&vec![0u8; len]).is_err(), "{len}");
+        }
     }
 
     #[test]
