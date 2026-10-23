@@ -15,6 +15,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   change; the `ssh` feature keeps `sha1` 0.11 for hashed `known_hosts`
   entries.
 
+### Fixed
+
+- **`RunspacePoolStateMachine::open` is accepted from `BeforeOpen` only.**
+  It refused a closed or broken pool, but from `Closing`, `Opened` or
+  `Disconnected` it reset the machine to `NegotiationSent` and sent the
+  handshake again, so `close` then `open` let the server drive the pool back
+  to `Opened`. PowerShell refuses it too (`CannotOpenAgain`). `RunspacePool`
+  was not affected (it opens a fresh machine); only code driving the public
+  state machine directly was.
+
 ## [3.1.0] — 2026-10-23
 
 Eight defects of the CLIXML codec and the session-key exchange, each found

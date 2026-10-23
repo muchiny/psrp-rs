@@ -131,15 +131,18 @@ impl RunspacePoolStateMachine {
     ///
     /// Transitions the state from `BeforeOpen` to `NegotiationSent`.
     ///
-    /// A machine that has already reached a terminal state (`Closed` or
-    /// `Broken`) refuses: it returns no actions and stays where it is.
-    /// The server-driven path is guarded by the crate-private
-    /// `is_legal_server_transition`; this is the matching guard for the
-    /// client-driven one, so a pool cannot be resurrected from either
-    /// side. Every caller inside the crate drives a freshly
-    /// constructed machine, so nothing legitimate hits this.
+    /// Only a machine in `BeforeOpen` opens. In any other state (`Closing`,
+    /// `Opened`, `Disconnected`, and the terminal `Closed` and `Broken`)
+    /// it returns no actions and stays where it is, as PowerShell does
+    /// (`AssertIfStateIsBeforeOpen` throws `CannotOpenAgain`). Without
+    /// this, `close` then `open` restarted the handshake and the server
+    /// could drive a closed pool back to `Opened`. The server-driven path
+    /// is guarded by the crate-private `is_legal_server_transition`; this
+    /// is the matching guard for the client-driven one. Every caller inside
+    /// the crate drives a freshly constructed machine, so nothing
+    /// legitimate hits this.
     pub fn open(&mut self) -> Vec<Action> {
-        if self.is_terminal() {
+        if self.state != RunspacePoolState::BeforeOpen {
             return Vec::new();
         }
         self.state = RunspacePoolState::Opening;
@@ -805,6 +808,51 @@ mod tests {
                 "close() acted on a {terminal:?} pool"
             );
         }
+    }
+
+    /// `open` is accepted from `BeforeOpen` only, as in PowerShell
+    /// (`AssertIfStateIsBeforeOpen`): from any other state it used to reset
+    /// the machine to `NegotiationSent` and send the handshake again.
+    #[test]
+    fn open_is_refused_outside_before_open() {
+        use RunspacePoolState::*;
+        for state in [
+            Opening,
+            Opened,
+            Closed,
+            Closing,
+            Broken,
+            Disconnecting,
+            Disconnected,
+            Connecting,
+            NegotiationSent,
+            NegotiationSucceeded,
+        ] {
+            let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+            m.state = state;
+            assert!(m.open().is_empty(), "open() acted on a {state:?} pool");
+            assert_eq!(m.state(), state, "open() moved a {state:?} pool");
+        }
+        let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+        assert_eq!(m.open().len(), 2, "a fresh machine still opens");
+        assert_eq!(m.state(), NegotiationSent);
+        assert!(m.open().is_empty(), "a second open() acted");
+    }
+
+    /// The sequence the `runspace_state_machine` target could not rule out:
+    /// open, server `Opened`, close, open, server `Opened` went back to
+    /// `Opened` because the second `open` restarted the handshake.
+    #[test]
+    fn a_closing_pool_cannot_be_reopened() {
+        let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+        let _ = m.open();
+        m.on_message(&state_msg(RunspacePoolState::Opened)).unwrap();
+        assert!(!m.close().is_empty());
+        assert_eq!(m.state(), RunspacePoolState::Closing);
+
+        assert!(m.open().is_empty());
+        let _ = m.on_message(&state_msg(RunspacePoolState::Opened));
+        assert_ne!(m.state(), RunspacePoolState::Opened);
     }
 
     #[test]
