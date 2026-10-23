@@ -53,9 +53,7 @@ confidence-threshold = 0.9
 multiple-versions = "deny"
 wildcards = "deny"
 skip = [
-    { crate = "block-buffer@0.10.4", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
     { crate = "const-oid@0.9.6", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
-    { crate = "cpufeatures@0.2.17", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
     { crate = "crypto-common@0.1.7", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
     { crate = "der@0.7.10", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
     { crate = "digest@0.10.7", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
@@ -66,7 +64,6 @@ skip = [
     { crate = "rand@0.8.8", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
     { crate = "rand_core@0.6.4", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
     { crate = "rsa@0.9.10", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
-    { crate = "sha1@0.10.7", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
     { crate = "signature@2.2.0", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
     { crate = "spki@0.7.3", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
     { crate = "syn@2.0.119", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
