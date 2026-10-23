@@ -21,12 +21,14 @@ use psrp_rs::clixml::{PsObject, PsValue};
 /// ourselves, so there is no reason to generate 1000-deep trees here.
 pub const MAX_DEPTH: u32 = 6;
 
-/// Characters used by [`SafeValue`] strings.
+/// Characters that [`SafeValue`] strings draw from three times out of four
+/// (the fourth is an arbitrary Unicode scalar value).
 ///
 /// Everything in here is chosen to hit a lossy path the codec has
 /// actually had: the XML metacharacters, `\t` / `\n` / `\r` (attribute
-/// value normalisation), and `_` + `x` + hex digits, which can spell a
-/// literal `_xHHHH_` that the decoder would otherwise read as an escape.
+/// value normalisation, line-ending normalisation), and `_` + `x` + hex
+/// digits, which can spell a literal `_xHHHH_` that the decoder would
+/// otherwise read as an escape.
 const SAFE_CHARS: &[u8] =
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .-/:+<>&\"'_x\t\n\r";
 
@@ -45,10 +47,12 @@ pub struct ArbValue(pub PsValue);
 ///
 /// The restrictions, and why each one exists:
 ///
-/// * strings draw from [`SAFE_CHARS`] — `escape` turns control chars
-///   into `_xHHHH_` and the decoder turns `_xHHHH_` back into a char, so
-///   a string that *already* contains such a sequence is not a fixed
-///   point of the codec;
+/// * strings are any Unicode text (control characters, surrogate-pair
+///   characters, U+FFFD, the XML metacharacters, `_xHHHH_` look-alikes):
+///   the encoder escapes what XML or PowerShell cannot carry and the
+///   decoder gives it back, which these targets assert;
+/// * `PsValue::Char` is a BMP character that is not a surrogate, because a
+///   `[char]` is one UTF-16 unit on the wire;
 /// * `PsValue::Decimal` bodies never start or end with whitespace,
 ///   because the decoder trims `<D>`;
 /// * objects never carry a `to_string` (the encoder writes `<ToString>`,
@@ -77,8 +81,12 @@ fn gen_string(u: &mut Unstructured<'_>, safe: bool) -> ArbResult<String> {
     let len = u.int_in_range(0..=16usize)?;
     let mut s = String::with_capacity(len);
     for _ in 0..len {
-        let idx = u.int_in_range(0..=SAFE_CHARS.len() - 1)?;
-        s.push(SAFE_CHARS[idx] as char);
+        if u.int_in_range(0..=3u8)? == 0 {
+            s.push(u.arbitrary::<char>()?);
+        } else {
+            let idx = u.int_in_range(0..=SAFE_CHARS.len() - 1)?;
+            s.push(SAFE_CHARS[idx] as char);
+        }
     }
     Ok(s)
 }
