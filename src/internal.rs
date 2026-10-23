@@ -48,6 +48,11 @@ pub mod parse {
         crate::pipeline::describe_errors(errors)
     }
 
+    /// The `PipelineFailed` message (`pipeline::failure_message`).
+    pub fn failure_message(state_data: &str, errors: &[PsValue]) -> String {
+        crate::pipeline::failure_message(state_data, errors)
+    }
+
     /// Best-effort `PipelineState` extraction used by the metadata helper.
     #[must_use]
     pub fn state_from_xml(xml: &str) -> Option<PipelineState> {

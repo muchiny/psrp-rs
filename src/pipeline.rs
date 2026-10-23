@@ -700,65 +700,86 @@ pub(crate) fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
     Err(PsrpError::protocol("missing PipelineState property"))
 }
 
-/// How many errors of the error stream a failure message quotes.
-const MAX_DESCRIBED_ERRORS: usize = 8;
-
 /// Why a pipeline failed: the exception the server attached to the
 /// `PipelineState` message (a terminating error such as `throw` is reported
 /// there, not in the error stream), then the errors written to the error
-/// stream, whichever there are. Everything the server wrote is escaped and
-/// bounded.
+/// stream, whichever there are, the same text not repeated. Everything the
+/// server wrote is escaped and bounded.
 pub(crate) fn failure_message(state_data: &str, errors: &[PsValue]) -> String {
     let reason = crate::runspace::state::terminal_state_reason(state_data);
-    let streamed = (!errors.is_empty()).then(|| describe_errors(errors));
-    match (reason, streamed) {
-        (Some(reason), Some(streamed)) if !streamed.contains(&reason) => {
-            format!("{reason}; {streamed}")
-        }
-        (Some(reason), _) => reason,
-        (None, Some(streamed)) => streamed,
-        (None, None) => "unknown error".into(),
+    let (mut parts, more) = describe_parts(errors);
+    // Both are trimmed, escaped and cut the same way, so the same error
+    // reads the same in each; an error that merely contains the reason
+    // (`File not found: foo` and `foo`) is a different error.
+    if let Some(reason) = reason
+        && !parts.contains(&reason)
+    {
+        parts.insert(0, reason);
     }
+    join_parts(parts, more)
 }
+
+/// How many errors of the error stream a failure message quotes.
+const MAX_DESCRIBED_ERRORS: usize = 8;
 
 /// One line for each of the first [`MAX_DESCRIBED_ERRORS`] errors, joined
 /// with `; `: the exception message of an `ErrorRecord`, else the text of
-/// the value. Each is escaped and cut at [`MAX_SERVER_MESSAGE_CHARS`]; the
-/// rest is counted, not quoted.
+/// the value. Each is trimmed, escaped and cut at
+/// [`MAX_SERVER_MESSAGE_CHARS`]; the rest is counted, not quoted.
+#[cfg(any(test, feature = "__internal"))]
 pub(crate) fn describe_errors(errors: &[PsValue]) -> String {
-    if errors.is_empty() {
+    let (parts, more) = describe_parts(errors);
+    join_parts(parts, more)
+}
+
+fn join_parts(mut parts: Vec<String>, more: usize) -> String {
+    if more > 0 {
+        parts.push(format!("… and {more} more"));
+    }
+    if parts.is_empty() {
         return "unknown error".into();
     }
-    let mut parts: Vec<String> = errors
+    parts.join("; ")
+}
+
+/// The quoted errors, and how many were left out.
+fn describe_parts(errors: &[PsValue]) -> (Vec<String>, usize) {
+    let parts = errors
         .iter()
         .take(MAX_DESCRIBED_ERRORS)
-        .map(|v| {
-            let text = match v {
-                PsValue::String(s) => s.clone(),
-                other => ErrorRecord::from_ps_object(other)
-                    .and_then(|record| record.exception?.message)
-                    .filter(|m| !m.trim().is_empty())
-                    .or_else(|| match other {
-                        PsValue::Object(o) => o
-                            .get("Exception")
-                            .and_then(PsValue::as_str)
-                            .or_else(|| o.get("ErrorRecord_Exception").and_then(PsValue::as_str))
-                            .or_else(|| o.get("Exception_Message").and_then(PsValue::as_str))
-                            .map(str::to_string),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| format!("{other:?}")),
-            };
-            escape_remote_text(&text, MAX_SERVER_MESSAGE_CHARS)
-        })
+        .map(|v| escape_remote_text(error_text(v).trim(), MAX_SERVER_MESSAGE_CHARS))
         .collect();
-    if errors.len() > MAX_DESCRIBED_ERRORS {
-        parts.push(format!(
-            "… and {} more",
-            errors.len() - MAX_DESCRIBED_ERRORS
-        ));
+    (parts, errors.len().saturating_sub(MAX_DESCRIBED_ERRORS))
+}
+
+/// What to say of one error of the error stream: its exception message,
+/// else the identifier of the error, else the value itself.
+fn error_text(v: &PsValue) -> String {
+    if let PsValue::String(s) = v {
+        return s.clone();
     }
-    parts.join("; ")
+    let record = ErrorRecord::from_ps_object(v);
+    let message = record
+        .as_ref()
+        .and_then(|r| r.exception.as_ref()?.message.clone())
+        .filter(|m| !m.trim().is_empty());
+    let legacy = || match v {
+        PsValue::Object(o) => o
+            .get("Exception")
+            .and_then(PsValue::as_str)
+            .or_else(|| o.get("ErrorRecord_Exception").and_then(PsValue::as_str))
+            .or_else(|| o.get("Exception_Message").and_then(PsValue::as_str))
+            .map(str::to_string),
+        _ => None,
+    };
+    message
+        .or_else(legacy)
+        .or_else(|| {
+            record?
+                .fully_qualified_error_id
+                .filter(|id| !id.trim().is_empty())
+        })
+        .unwrap_or_else(|| format!("{v:?}"))
 }
 
 #[cfg(test)]
@@ -1399,6 +1420,54 @@ mod tests {
         ));
         assert_eq!(failure_message(&bare, &[error_record("first")]), "first");
         assert_eq!(failure_message(&bare, &[]), "unknown error");
+    }
+
+    /// The reason is compared with each error, not searched for in their
+    /// text: `File not found: foo` does not say `foo` (review of #28).
+    #[test]
+    fn failure_message_only_drops_an_identical_error() {
+        let data = state_data_with_reason("foo");
+        assert_eq!(
+            failure_message(&data, &[PsValue::String("File not found: foo".into())]),
+            "foo; File not found: foo"
+        );
+        // Padding does not make the same error two: both sides are trimmed
+        // before they are cut at 1024 characters.
+        let long = format!("  {}", "x".repeat(1100));
+        let data = state_data_with_reason(&long);
+        let message = failure_message(&data, &[error_record(&long)]);
+        assert_eq!(message.matches('…').count(), 1, "{message}");
+        assert!(!message.contains("; "), "{message}");
+    }
+
+    /// An `ErrorRecord` with no usable message is named by its error id,
+    /// not dumped.
+    #[test]
+    fn describe_errors_falls_back_to_the_error_id_of_a_record() {
+        let record = PsObject::new()
+            .with("Exception", PsValue::Object(PsObject::new()))
+            .with(
+                "FullyQualifiedErrorId",
+                PsValue::String("NativeCommandFailed".into()),
+            );
+        assert_eq!(
+            describe_errors(&[PsValue::Object(record)]),
+            "NativeCommandFailed"
+        );
+    }
+
+    /// `ExceptionAsErrorRecord` sent as a bare string still gives the reason.
+    #[test]
+    fn failure_message_reads_a_bare_string_exception() {
+        let data = to_clixml(&PsValue::Object(
+            PsObject::new()
+                .with("PipelineState", PsValue::I32(PipelineState::Failed as i32))
+                .with(
+                    "ExceptionAsErrorRecord",
+                    PsValue::String("plain \u{1b}reason".into()),
+                ),
+        ));
+        assert_eq!(failure_message(&data, &[]), "plain \\u{1b}reason");
     }
 
     /// Live (pwsh 7.6.7, WinRM): `throw 'boom'` is reported only in the

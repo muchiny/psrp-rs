@@ -156,7 +156,12 @@ impl<T: PsrpTransport> RunspacePool<T> {
                         if state.is_terminal() {
                             if state == PipelineState::Failed {
                                 return Err(PsrpError::PipelineFailed(
-                                    "GetCommandMetadata pipeline failed".into(),
+                                    match crate::runspace::state::terminal_state_reason(&msg.data) {
+                                        Some(reason) => {
+                                            format!("GetCommandMetadata pipeline failed: {reason}")
+                                        }
+                                        None => "GetCommandMetadata pipeline failed".into(),
+                                    },
                                 ));
                             }
                             return Ok(out);
@@ -366,6 +371,43 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0].name, "Get-Date");
         assert_eq!(cmds[1].name, "Get-Process");
+        let _ = pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn get_command_metadata_failure_carries_the_server_reason() {
+        let t = MockTransport::new();
+        t.push_incoming(encode_message(1, &opened_state()));
+        let exception = PsObject::new().with("Message", PsValue::String("no such module".into()));
+        let record = PsObject::new().with("Exception", PsValue::Object(exception));
+        let body = to_clixml(&PsValue::Object(
+            PsObject::new()
+                .with("PipelineState", PsValue::I32(PipelineState::Failed as i32))
+                .with("ExceptionAsErrorRecord", PsValue::Object(record)),
+        ));
+        t.push_incoming(encode_message(
+            10,
+            &PsrpMessage {
+                destination: Destination::Client,
+                message_type: MessageType::PipelineState,
+                rpid: Uuid::nil(),
+                pid: Uuid::nil(),
+                data: body,
+            }
+            .encode(),
+        ));
+        let mut pool = crate::runspace::RunspacePool::open_with_transport(t)
+            .await
+            .unwrap();
+        let err = pool
+            .get_command_metadata(&["Nothing"], CommandType::ALL)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, crate::error::PsrpError::PipelineFailed(m)
+                if m == "GetCommandMetadata pipeline failed: no such module"),
+            "{err:?}"
+        );
         let _ = pool.close().await;
     }
 
