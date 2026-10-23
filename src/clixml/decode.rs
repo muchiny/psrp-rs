@@ -615,6 +615,12 @@ fn skip_to_end(reader: &mut Reader<&[u8]>) -> Result<()> {
 /// surrogate without its other half becomes U+FFFD: .NET's
 /// `XmlConvert.DecodeName` yields the lone code unit, which a Rust
 /// `String` cannot hold.
+///
+/// An escape is exactly `_x`, four hex digits of either case, and `_`.
+/// A leading `+` in place of the first digit is tolerated (`_x+041_` is
+/// `A`, an accident of `from_str_radix` kept for compatibility). `_X` and
+/// the eight-digit form `_xHHHHHHHH_`, which `DecodeName` also accepts
+/// but PowerShell never emits, are left as text.
 fn decode_pwsh_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut units: Vec<u16> = Vec::new();
@@ -626,16 +632,25 @@ fn decode_pwsh_escapes(s: &str) -> String {
             continue;
         }
         // Not an escape: the run so far ends here. Decode it, then copy
-        // the next character verbatim.
-        out.extend(
-            char::decode_utf16(units.drain(..)).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
-        );
+        // the text up to the next `_`, the only character that can open
+        // an escape (the first one goes whatever it is: it opens none).
+        if !units.is_empty() {
+            out.extend(
+                char::decode_utf16(units.drain(..))
+                    .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
+            );
+        }
         let mut chars = rest.chars();
-        let Some(c) = chars.next() else {
+        let Some(first) = chars.next() else {
             break;
         };
-        out.push(c);
-        rest = chars.as_str();
+        let after = chars.as_str();
+        let (text, tail) = after
+            .split_at_checked(after.find('_').unwrap_or(after.len()))
+            .unwrap_or((after, ""));
+        out.push(first);
+        out.push_str(text);
+        rest = tail;
     }
     out
 }
@@ -805,6 +820,9 @@ mod tests {
             ("_xD83D_xDE00_", "\u{FFFD}xDE00_"),
             // Unchanged around them.
             ("_x0041__x0042_", "AB"),
+            // Deliberately preserves an existing quirk (`from_str_radix`
+            // accepts a leading `+`; see the "Related" note of #18), so
+            // that a future fix has to change this test on purpose.
             ("_x+041_", "A"),
             ("_X0041_", "_X0041_"),
         ] {
