@@ -90,7 +90,7 @@ pub(crate) fn write_value_with(
         PsValue::Version(s) => write_simple(out, "Version", &escape(s), name, false),
         PsValue::Uri(s) => write_simple(out, "URI", &escape(s), name, false),
         PsValue::Xml(s) => write_simple(out, "XD", &escape(s), name, false),
-        PsValue::ScriptBlock(s) => write_simple(out, "SCT", &escape(s), name, false),
+        PsValue::ScriptBlock(s) => write_simple(out, "SBK", &escape(s), name, false),
         PsValue::SecureString(s) => write_simple(out, "SS", &escape(s), name, false),
         PsValue::List(_) | PsValue::Dict(_) => {
             open_obj(out, name, alloc);
@@ -841,7 +841,7 @@ mod tests {
             .with("Version", PsValue::Version(cr.clone()))
             .with("URI", PsValue::Uri(cr.clone()))
             .with("XD", PsValue::Xml(cr.clone()))
-            .with("SCT", PsValue::ScriptBlock(cr.clone()))
+            .with("SBK", PsValue::ScriptBlock(cr.clone()))
             .with("SS", PsValue::SecureString(cr.clone()))
             .with_type_names([cr.clone()]);
         obj.to_string = Some(cr.clone());
@@ -931,9 +931,11 @@ mod tests {
             to_clixml(&PsValue::Xml("<a/>".into())),
             "<XD>&lt;a/&gt;</XD>"
         );
+        // #19: PowerShell's tag is `SBK`; it rejects `SCT` as an invalid
+        // element and fails the whole message.
         assert_eq!(
             to_clixml(&PsValue::ScriptBlock("Get-Date".into())),
-            "<SCT>Get-Date</SCT>"
+            "<SBK>Get-Date</SBK>"
         );
         assert_eq!(to_clixml(&PsValue::SecureString("x".into())), "<SS>x</SS>");
     }

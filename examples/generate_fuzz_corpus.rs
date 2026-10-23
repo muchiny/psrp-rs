@@ -137,6 +137,17 @@ fn clixml_seeds() -> Vec<(&'static str, String)> {
             r#"<Obj RefId="0"><MS><S N="_xD83D__xDE00_">a_xD83D__xDE00_b _xD83D_</S></MS></Obj>"#
                 .into(),
         ),
+        // A script block as PowerShell writes it (`SBK`, not the `SCT`
+        // psrp-rs used to expect): top level, property value, list item.
+        (
+            "script_block.xml",
+            concat!(
+                r#"<SBK> Get-Date "a&amp;b&lt;c&gt;" _x005F_x000D_ </SBK>"#,
+                r#"<Obj RefId="0"><MS><SBK N="Action"> 1 </SBK><Obj N="L" RefId="1">"#,
+                r#"<LST><SBK> 2 </SBK><I32>3</I32></LST></Obj></MS></Obj>"#,
+            )
+            .into(),
+        ),
         ("bom.xml", "\u{feff}<S>bom</S>".into()),
         ("empty_string.xml", "<S></S><S/>".into()),
     ]

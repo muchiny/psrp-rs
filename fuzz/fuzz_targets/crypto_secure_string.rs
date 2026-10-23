@@ -5,7 +5,8 @@
 //!
 //! * `decrypt_session_key` unwraps the SIMPLEBLOB (header + RSAES-PKCS1-v1_5
 //!   block) carried by an `EncryptedSessionKey` message;
-//! * `decrypt_secure_string` parses an `IV || ciphertext` payload.
+//! * `decrypt_secure_string` parses a `<SS>` payload: bare AES-256-CBC
+//!   ciphertext under the protocol's fixed zero IV.
 //!
 //! Neither may panic, read out of bounds, or accept something it should
 //! not. The encrypt→decrypt direction has to be exact for every string.
@@ -60,11 +61,20 @@ fuzz_target!(init: { client_key(); }, |input: Input| {
     let _ = key.decrypt_secure_string(&input.payload);
 
     // 2. Our own ciphertext must decrypt back to exactly the input.
+    //    PowerShell's layout: the UTF-16LE plaintext plus 1 to 16 bytes of
+    //    PKCS#7 padding, no IV in front, and (the IV being fixed) the same
+    //    bytes every time.
     let sealed = key.encrypt_secure_string(&input.plaintext);
-    assert!(
-        sealed.len() >= 32 && (sealed.len() - 16) % 16 == 0,
-        "encrypt produced a malformed blob of {} bytes",
-        sealed.len()
+    let utf16_len = input.plaintext.encode_utf16().count() * 2;
+    assert_eq!(
+        sealed.len(),
+        (utf16_len / 16 + 1) * 16,
+        "encrypt produced a malformed blob for {utf16_len} plaintext bytes"
+    );
+    assert_eq!(
+        key.encrypt_secure_string(&input.plaintext),
+        sealed,
+        "encryption with the fixed IV must be deterministic"
     );
     let opened = key
         .decrypt_secure_string(&sealed)

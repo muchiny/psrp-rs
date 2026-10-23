@@ -31,6 +31,9 @@
 "<Version>"
 "<URI>"
 "<XD>"
+"<SBK>"
+"</SBK>"
+# what psrp-rs wrote before #19; still decoded
 "<SCT>"
 "<SS>"
 

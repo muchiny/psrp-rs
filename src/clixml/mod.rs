@@ -6,7 +6,7 @@
 //! * Full primitive set from MS-PSRP §2.2.5.1 — `<S>`, `<C>`, `<B>`,
 //!   `<DT>`, `<TS>`, `<By>`/`<SB>`, `<U16>`/`<I16>`, `<U32>`/`<I32>`,
 //!   `<U64>`/`<I64>`, `<Sg>`/`<Db>`, `<D>`, `<BA>`, `<G>`, `<URI>`,
-//!   `<Version>`, `<XD>`, `<SCT>`, `<SS>`, `<Nil/>`.
+//!   `<Version>`, `<XD>`, `<SBK>`, `<SS>`, `<Nil/>`.
 //! * Complex types — `<Obj>` with member sets (`<MS>` / `<Props>`),
 //!   `<LST>` / `<IE>` / `<QUE>` / `<STK>`, `<DCT>`.
 //! * Reference resolution — `<Ref>` and `<TNRef>` look up previously
@@ -81,15 +81,36 @@ pub enum PsValue {
     Uri(String),
     /// `<XD>…</XD>` — `System.Xml.XmlDocument` or fragment.
     Xml(String),
-    /// `<SCT>…</SCT>` — PowerShell script block source.
+    /// `<SBK>…</SBK>` — PowerShell script block source.
+    ///
+    /// The body is escaped like `<S>`, `_xHHHH_` escapes included. Over
+    /// remoting a script block arrives on the server as a plain
+    /// **string**, not a `ScriptBlock`: PowerShell never sets
+    /// `DeserializationOptions.DeserializeScriptBlocks` there, so a
+    /// parameter typed `[scriptblock]` has to rebuild it with
+    /// `[scriptblock]::Create($s)`. The decoder also accepts `<SCT>`,
+    /// which is not a PowerShell tag but what psrp-rs itself used to
+    /// write.
     ScriptBlock(String),
     /// `<SS>…</SS>` — a `SecureString`.
     ///
-    /// When transmitted to a server that has negotiated a session key,
-    /// the value is encrypted client-side via AES-CBC + base64 before
-    /// hitting the wire. Decoding an `<SS>` that arrived from a server
-    /// without a session key yields a [`PsValue::SecureString`] whose
-    /// contents are the raw bytes (undecryptable).
+    /// The string is the element's body as it travels: the codec never
+    /// encrypts or decrypts it. PowerShell puts there the base64 of the
+    /// value encrypted with the session key (AES-256-CBC, see
+    /// [`SessionKey::encrypt_secure_string`](crate::crypto::SessionKey::encrypt_secure_string)),
+    /// so, once [`request_session_key`](crate::RunspacePool::request_session_key)
+    /// has negotiated that key:
+    ///
+    /// * a decoded `SecureString` holds that base64; turn it into the
+    ///   plaintext with
+    ///   [`decrypt_secure_string`](crate::RunspacePool::decrypt_secure_string);
+    /// * to send one, put in the variant the base64 that
+    ///   [`encrypt_secure_string`](crate::RunspacePool::encrypt_secure_string)
+    ///   returns. The encoder writes whatever the variant holds, so a
+    ///   plaintext put here crosses the wire in clear and PowerShell
+    ///   cannot decrypt it. That is also what happens today to the
+    ///   `SecureString`s a [`PsHost`](crate::PsHost) returns for
+    ///   `Read-Host -AsSecureString` or `Get-Credential`.
     SecureString(String),
     /// `<LST>` / `<IE>` / `<QUE>` / `<STK>`.
     List(Vec<PsValue>),
