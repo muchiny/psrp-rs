@@ -22,14 +22,22 @@ pub(crate) struct OutOfProcTransport<P: Pipe> {
 }
 
 impl<P: Pipe> OutOfProcTransport<P> {
+    #[cfg(test)]
     pub(crate) fn new(pipe: P) -> Self {
         Self {
             session: Mutex::new(OutOfProcSession::new(pipe)),
         }
     }
 
+    /// As [`Self::new`], bounding every acknowledgement by `timeout`.
+    pub(crate) fn with_ack_timeout(pipe: P, timeout: std::time::Duration) -> Self {
+        Self {
+            session: Mutex::new(OutOfProcSession::new(pipe).with_ack_timeout(timeout)),
+        }
+    }
+
     /// Closes the open command, then the session. Bounded, since every
-    /// wait for an acknowledgement is ([`ACK_TIMEOUT`](super::session::ACK_TIMEOUT)).
+    /// wait for an acknowledgement is ([`ACK_TIMEOUT`](super::session::ACK_TIMEOUT) unless configured).
     ///
     /// Leaves the pipe open: the caller tears it down.
     pub(crate) async fn close_session(&self) -> Result<()> {

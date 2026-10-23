@@ -165,6 +165,12 @@ pub struct SshConfig {
     pub subsystem: String,
     /// TCP connect timeout.
     pub connect_timeout: Duration,
+    /// How long to wait for `pwsh` to acknowledge a request (default 60 s),
+    /// the opening of the runspace pool included: the server acknowledges
+    /// the pool's first message only once the pool is built, which a heavy
+    /// session configuration, an antivirus scan on a cold start or an
+    /// overloaded host can delay. Must not be zero.
+    pub ack_timeout: Duration,
     /// Host-key validation policy. Defaults to
     /// [`HostKeyPolicy::default`] which checks `~/.ssh/known_hosts`.
     pub host_key_policy: HostKeyPolicy,
@@ -179,6 +185,7 @@ impl Default for SshConfig {
             auth: SshAuth::Agent,
             subsystem: "powershell".into(),
             connect_timeout: Duration::from_secs(30),
+            ack_timeout: crate::out_of_proc::ACK_TIMEOUT,
             host_key_policy: HostKeyPolicy::default(),
         }
     }
@@ -220,6 +227,15 @@ impl SshConfig {
     #[must_use]
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
+        self
+    }
+
+    /// Override how long to wait for `pwsh` to acknowledge a request
+    /// (default 60s). Raise it when opening the runspace is slow; a zero
+    /// timeout is refused by [`SshPsrpTransport::connect`].
+    #[must_use]
+    pub fn with_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.ack_timeout = timeout;
         self
     }
 
@@ -419,6 +435,11 @@ impl SshPsrpTransport {
                  a control character or one of '`\"$\\;&<>|(){},",
             ));
         }
+        if config.ack_timeout.is_zero() {
+            return Err(PsrpError::protocol(
+                "invalid SSH config: ack_timeout must not be zero",
+            ));
+        }
         let ssh_config = russh::client::Config::default();
         let addr = format!("{}:{}", config.host, config.port);
         debug!(%addr, "SSH: connecting");
@@ -512,7 +533,7 @@ impl SshPsrpTransport {
             exit_status: None,
         };
         Ok(Self {
-            inner: OutOfProcTransport::new(pipe),
+            inner: OutOfProcTransport::with_ack_timeout(pipe, config.ack_timeout),
             handle,
             closed: false,
         })
@@ -936,6 +957,7 @@ mod tests {
             .with_port(2222)
             .with_subsystem("pwsh")
             .with_connect_timeout(Duration::from_secs(5))
+            .with_ack_timeout(Duration::from_secs(120))
             .with_host_key_policy(HostKeyPolicy::AcceptAny);
 
         assert_eq!(cfg.host, "host.example");
@@ -944,7 +966,23 @@ mod tests {
         assert_eq!(cfg.port, 2222);
         assert_eq!(cfg.subsystem, "pwsh");
         assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.ack_timeout, Duration::from_secs(120));
         assert!(matches!(cfg.host_key_policy, HostKeyPolicy::AcceptAny));
+    }
+
+    #[test]
+    fn ack_timeout_defaults_to_sixty_seconds() {
+        let cfg = SshConfig::new("host.example", "admin", SshAuth::Agent);
+        assert_eq!(cfg.ack_timeout, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_a_zero_ack_timeout_before_any_network() {
+        let config = SshConfig::new("host.example", "u", SshAuth::Agent)
+            .with_connect_timeout(Duration::from_secs(2))
+            .with_ack_timeout(Duration::ZERO);
+        let err = SshPsrpTransport::connect(config).await.unwrap_err();
+        assert!(err.to_string().contains("ack_timeout"), "{err}");
     }
 
     #[test]
