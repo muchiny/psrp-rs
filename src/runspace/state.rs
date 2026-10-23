@@ -249,7 +249,16 @@ impl RunspacePoolStateMachine {
     }
 
     /// Produce the actions required to close the pool.
+    ///
+    /// Like [`open`](Self::open), a terminal machine refuses: it returns no
+    /// actions and stays where it is. Moving it to `Closing`, which is not
+    /// terminal, would let a later `open` restart the handshake and
+    /// resurrect the pool. PowerShell's `RemoteRunspacePoolInternal.BeginClose`
+    /// likewise skips closing a `Closed` or `Broken` pool.
     pub fn close(&mut self) -> Vec<Action> {
+        if self.is_terminal() {
+            return Vec::new();
+        }
         self.state = RunspacePoolState::Closing;
         vec![Action::SendMessage {
             message_type: MessageType::CloseRunspacePool,
@@ -633,6 +642,35 @@ mod tests {
             );
             assert_eq!(m.state(), terminal, "connect() moved a {terminal:?} pool");
             assert!(!m.is_opened());
+        }
+    }
+
+    /// Regression (found by the `runspace_state_machine` fuzz target):
+    /// `close` overwrote a terminal state with `Closing`, which is not
+    /// terminal, so a later `open` restarted the handshake and the server
+    /// could drive the pool back to `Opened`. Crash sequence: open,
+    /// server `Broken`, close, open, server `Opened`.
+    #[test]
+    fn close_keeps_a_terminal_pool_terminal() {
+        for terminal in [RunspacePoolState::Closed, RunspacePoolState::Broken] {
+            let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+            let _ = m.open();
+            assert!(m.on_message(&state_msg(terminal)).is_err());
+            assert_eq!(m.state(), terminal);
+
+            let close_actions = m.close();
+            let _ = m.open();
+            let _ = m.on_message(&state_msg(RunspacePoolState::Opened));
+
+            assert_eq!(
+                m.state(),
+                terminal,
+                "{terminal:?} pool resurrected through close() + open()"
+            );
+            assert!(
+                close_actions.is_empty(),
+                "close() acted on a {terminal:?} pool"
+            );
         }
     }
 
