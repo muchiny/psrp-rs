@@ -21,7 +21,8 @@
 //! `server/OutOfProcServerMediator.cs` (what the server rejects, 102-107 and 347-416).
 //!
 //! Layers: `packet` (pure, synchronous codec), `session` (the stop-and-wait
-//! engine, generic over a `Pipe`) and, in tests only, `fake` (a fake `pwsh`).
+//! engine, generic over a `Pipe`), `transport` (the `PsrpTransport` adapter
+//! over a session) and, in tests only, `fake` (a fake `pwsh`).
 //! This module never touches `russh` or `winrm_rs`.
 
 #[cfg(test)]
@@ -30,11 +31,12 @@ mod packet;
 mod session;
 mod transport;
 
+#[cfg(feature = "__internal")]
+pub(crate) use packet::LineSplitter;
 #[cfg(test)]
 pub(crate) use packet::Packet;
 #[cfg(any(test, feature = "__internal"))]
 pub(crate) use packet::parse_line;
-#[cfg(feature = "__internal")]
-pub(crate) use packet::{LineSplitter, MAX_LINE_BYTES};
+pub(crate) use packet::{MAX_LINE_BYTES, escape_remote_text, quote_bytes};
 pub(crate) use session::Pipe;
 pub(crate) use transport::OutOfProcTransport;

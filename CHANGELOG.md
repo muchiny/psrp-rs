@@ -6,13 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [3.0.0] — 2026-10-22
+## [3.0.0] — 2026-10-23
 
 SSH host-key checks now follow OpenSSH: several `known_hosts` lines that
 OpenSSH applies, revocations among them, were ignored. The SSH password
 and key passphrase are kept in `SecretString`s, which breaks code that
-builds `SshAuth` from a `String`; no other public item changed. `winrm-rs`
-1.3.0 or later is now required.
+builds `SshAuth` from a `String`; `ClientSessionKey::public_blob_hex` is
+deprecated. The SSH transport did not work against PowerShell: it wrote raw
+PSRP fragments to the `powershell` subsystem, which `pwsh -sshs` does not
+read that way. It now speaks PowerShell's out-of-process protocol. The
+`SecureString` session-key exchange used hex and RSA-OAEP where MS-PSRP
+specifies base64 and RSAES-PKCS1-v1_5; it now follows the specification.
+`winrm-rs` 1.3.0 or later is now required.
 
 ### Upgrading from 2.x
 
@@ -22,12 +27,25 @@ builds `SshAuth` from a `String`; no other public item changed. `winrm-rs`
   (`ExposeSecret` is re-exported from `psrp_rs::ssh`).
 - `SshPsrpTransport::connect` refuses a host ssh(1) refuses (see
   Security), before any network access.
+- The SSH server needs PowerShell 7 or later and a
+  `Subsystem powershell <path without space>/pwsh -sshs -NoLogo` line in
+  `sshd_config` (on Windows, the short 8.3 path); see the `psrp_rs::ssh`
+  documentation.
+- `ClientSessionKey::public_blob_hex` is deprecated: use
+  `public_blob_base64`. `ClientSessionKey::decrypt_session_key` now takes
+  the base64-decoded `SIMPLEBLOB` of the `EncryptedSessionKey` message,
+  not a bare RSA ciphertext. `RunspacePool::request_session_key` needs no
+  change.
 - A hand-written `[host]:22` line in `known_hosts` no longer matches;
   write `host`.
 - Through `winrm-rs` 1.3: NTLM over HTTP now seals every message and
   fails closed (`WinrmError::Ntlm`, the pool has to be reopened), and
   Kerberos under `EncryptionMode::Auto` seals over HTTP (a realm with RC4
   keys only needs `EncryptionMode::Never`).
+- A `PsrpTransport` that wraps or forwards to another one must forward the
+  new `send_pipeline_fragment` too: its default goes through
+  `send_fragment`, to the pool, so around `SshPsrpTransport` every pipeline
+  message would go out on `Guid.Empty`.
 
 ### Changed
 
@@ -55,9 +73,69 @@ builds `SshAuth` from a `String`; no other public item changed. `winrm-rs`
   features of russh's default set, with `ring` in place of `aws-lc-rs`, so
   the `ssh` feature brings no `aws-lc-sys` either. **`hmac` 0.12 → 0.13**;
   the HMAC-SHA1 of hashed `known_hosts` entries now runs on `sha1` 0.11
-  (renamed `sha1_hmac` in `Cargo.toml`), while `sha1` 0.10 stays for the
-  RSA-OAEP session-key exchange, since `rsa` 0.9 is built on digest 0.10.
-  No API change.
+  (renamed `sha1_hmac` in `Cargo.toml`). No API change. The `sha1` 0.10
+  dependency and the `sha1` feature of `rsa` were only there for the
+  RSA-OAEP session-key exchange; that exchange is RSAES-PKCS1-v1_5 now
+  (see Fixed), no code in `psrp-rs` uses either any more, and a follow-up
+  will remove them.
+- **`PsrpTransport::send_pipeline_fragment`** is a new method, with a
+  default implementation that forwards to `send_fragment`: existing
+  implementations compile and behave as before. The runspace pool calls it
+  for every message addressed to a pipeline, passing the pipeline id, so a
+  transport that multiplexes by pipeline (the SSH one) can route it.
+- **`ClientSessionKey::decrypt_session_key`** unwraps the RSA block with a
+  blinded operation, and reports every failure after the `SIMPLEBLOB`
+  checks (bad padding, wrong key length) with the one message
+  `session key unwrap failed`, so the error does not tell a padding
+  failure from a length failure.
+- **`RunspacePool::close` over SSH returns the error when the session had
+  already broken** (the server died, an acknowledgement timed out), where
+  it used to return `Ok`. The SSH channel and connection are torn down
+  either way.
+- **Over SSH, a request abandoned mid-write or between two `<Data>` lines
+  breaks the session.** A future dropped (by a timeout or `select!`) while
+  a line was being written, or before the last `<Data>` line of a message
+  above 32 KiB was acknowledged, could leave a partial line or a partial
+  PSRP fragment on the server: the next operation now fails with a
+  protocol error and writes nothing, and the pool has to be reopened.
+  `signal_stop` after such a drop (as `Pipeline::run_with_cancel` sends
+  it) may then report that protocol error instead of `Cancelled`.
+
+### Added
+
+- `ClientSessionKey::public_blob` (the raw `PUBLICKEYBLOB` bytes) and
+  `ClientSessionKey::public_blob_base64` (the `PublicKey` text MS-PSRP
+  2.2.2.3 sends).
+- The `out_of_proc_lines` fuzz target (seventeen targets now) for the
+  line codec of the out-of-process protocol, with a seed corpus and a
+  dictionary.
+
+### Fixed
+
+- **The SSH transport did not work against PowerShell.** It wrote raw PSRP
+  fragments to the `powershell` subsystem, while `pwsh -sshs` speaks the
+  out-of-process protocol: one XML element per line, PSRP fragments
+  base64-encoded in `<Data>` lines. The transport now speaks it, with an
+  acknowledgement awaited for every packet before the next is sent and a
+  `<Command/>` for each pipeline. Checked against Windows Server 2025 with
+  PowerShell 7.6.7.
+- **`signal_stop` over SSH stops the pipeline.** It used to log a warning
+  and do nothing; it now sends `<Signal/>`.
+- **A closed SSH channel or a dead `pwsh` is an error, not a hang.** The
+  error carries the message the server wrote
+  (`__NamedPipeError__:<message>`) when there is one.
+- **`SshPsrpTransport::connect` reports a refused subsystem** ("SSH server
+  refused the 'powershell' subsystem"), and a channel closed before the
+  subsystem started, as errors; it did not wait for the server's reply.
+- **`get_command_metadata` works over SSH.**
+- **The `SecureString` session-key exchange never completed against a real
+  server.** `RunspacePool::request_session_key` sent the public key as hex
+  and expected the session key as hex wrapped with RSA-OAEP. MS-PSRP
+  (2.2.2.3 and 2.2.2.4) specifies base64 in both directions, and the
+  server's answer is a CryptoAPI `SIMPLEBLOB` (a 12-byte header and the
+  AES key under RSAES-PKCS1-v1_5, little-endian). A real server answered
+  `Invalid public key data.` over SSH, and the WinRM call timed out. The
+  exchange now follows the specification and works over SSH and WinRM.
 
 ### Security
 
@@ -126,6 +204,14 @@ builds `SshAuth` from a `String`; no other public item changed. `winrm-rs`
   so did `SshConfig`'s, which derives `Debug`: logging a configuration with
   `{:?}` leaked the secret. Both now show `<redacted>`; the key path is
   still printed.
+- **The SSH transport bounds what a hostile server can cost.** A line
+  trickled in one byte per packet, an element with ~100k attributes or a
+  flood of one-byte `<Data>` lines costs linear CPU and bounded memory;
+  `connect` buffers at most 1 MiB of output before the subsystem reply,
+  then fails with "SSH server sent unexpected output before the subsystem
+  replied"; and the text the server controls (its `__NamedPipeError__:`
+  message, sshd's stderr in the debug log, a host certificate's key id in
+  a warning) is truncated, its control and bidi characters escaped.
 
 ### Known
 

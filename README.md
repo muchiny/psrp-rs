@@ -187,6 +187,24 @@ let result = pool.run_script("$PSVersionTable").await?;
 pool.close().await?;
 ```
 
+The transport speaks PowerShell's out-of-process protocol over the SSH
+`powershell` subsystem, the one `pwsh -sshs` serves. The server needs:
+
+- PowerShell 7 or later;
+- a subsystem line in `sshd_config`, with a path that holds no space:
+
+  ```text
+  Subsystem powershell /usr/bin/pwsh -sshs -NoLogo
+  ```
+
+  On Windows use the short (8.3) path of `pwsh.exe`, for example
+  `Subsystem powershell C:/PROGRA~1/POWERS~1/7/pwsh.exe -sshs -NoLogo`;
+- on Linux, a login shell that writes nothing to stdout (no banner, no
+  `echo` in a profile): any non-XML line there is rejected.
+
+See the [`psrp_rs::ssh` documentation](https://docs.rs/psrp-rs/latest/psrp_rs/ssh/index.html)
+for the protocol and the host-key policies.
+
 ### Shared pool for concurrent tasks
 
 ```rust
@@ -323,7 +341,7 @@ itself; it is now an iterative `O(n*m)` matcher.
 | Feature | Default | Description |
 |---|---|---|
 | *(default)* | -- | WinRM transport with NTLMv2/Basic/Kerberos/Certificate auth (via winrm-rs) |
-| `ssh` | no | SSH transport via `russh` |
+| `ssh` | no | SSH transport via `russh`, speaking PowerShell's out-of-process protocol (`pwsh -sshs`, PowerShell 7+) |
 | `serde` | no | `Serialize`/`Deserialize` derives on `PsValue` / `PsObject` |
 
 ## License

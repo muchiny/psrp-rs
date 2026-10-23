@@ -186,13 +186,17 @@ pub mod out_of_proc {
     }
 
     /// Feeds `chunks` in order to a fresh line splitter; `None` as soon as
-    /// it reports an error.
+    /// it reports an error, whatever lines it completed before that error.
     #[must_use]
     pub fn split(chunks: &[&[u8]]) -> Option<Vec<String>> {
         let mut splitter = crate::out_of_proc::LineSplitter::new();
         let mut lines = Vec::new();
         for chunk in chunks {
-            lines.extend(splitter.push(chunk).ok()?);
+            let (done, error) = splitter.push(chunk);
+            if error.is_some() {
+                return None;
+            }
+            lines.extend(done);
         }
         Some(lines)
     }

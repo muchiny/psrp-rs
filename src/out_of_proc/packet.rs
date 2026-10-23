@@ -114,9 +114,9 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<Packet>> {
         && head.eq_ignore_ascii_case(SERVER_ERROR_PREFIX)
     {
         let message = line.get(SERVER_ERROR_PREFIX.len()..).unwrap_or_default();
-        let message: String = message.chars().take(QUOTED_SERVER_ERROR_CHARS).collect();
         return Err(PsrpError::protocol(format!(
-            "PowerShell reported a protocol error: {message}"
+            "PowerShell reported a protocol error: {}",
+            escape_remote_text(message, QUOTED_SERVER_ERROR_CHARS)
         )));
     }
     parse_element(line.trim()).map(Some).map_err(|why| {
@@ -139,8 +139,57 @@ fn snippet(text: &str) -> String {
     out
 }
 
+/// The first `max_chars` characters of `text`, with the characters that
+/// could rewrite a terminal or a log line escaped as by `escape_debug`:
+/// controls (C0, DEL, C1: ESC, BEL, a lone CR...), line and paragraph
+/// separators, and the invisible format characters among them the bidi
+/// embeddings, overrides and isolates. Printable text, quotes and
+/// backslashes are kept as they are, so a message stays readable.
+pub(crate) fn escape_remote_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for c in text.chars().take(max_chars) {
+        if rewrites_output(c) {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    if text.chars().nth(max_chars).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Whether `c` can move the cursor, ring, reorder or hide text once printed.
+fn rewrites_output(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}' // soft hyphen
+            | '\u{061C}' // Arabic letter mark (bidi)
+            | '\u{180E}' // Mongolian vowel separator
+            | '\u{200B}'..='\u{200F}' // zero-width characters, LRM, RLM
+            | '\u{2028}'..='\u{202E}' // line and paragraph separators, bidi embeddings, overrides
+            | '\u{2060}'..='\u{206F}' // word joiner, invisible operators, bidi isolates
+            | '\u{FEFF}' // zero-width no-break space
+            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+            | '\u{E0000}'..='\u{E007F}' // tags
+        )
+}
+
 fn quote(line: &str) -> String {
     format!("\"{}\"", snippet(line))
+}
+
+/// Enough bytes for `QUOTED_LINE_CHARS + 1` characters, so that [`snippet`]
+/// still sees whether the text goes on.
+const QUOTED_LINE_BYTES: usize = (QUOTED_LINE_CHARS + 1) * 4;
+
+/// [`quote`] for bytes that may not be UTF-8: only a bounded prefix is
+/// decoded, lossily.
+pub(crate) fn quote_bytes(bytes: &[u8]) -> String {
+    let head = bytes.get(..QUOTED_LINE_BYTES).unwrap_or(bytes);
+    quote(&String::from_utf8_lossy(head))
 }
 
 /// Parse exactly one packet element, with nothing before or after it.
@@ -202,15 +251,24 @@ fn next_event<'a>(reader: &mut Reader<&'a [u8]>) -> std::result::Result<Event<'a
     reader.read_event().map_err(|e| snippet(&e.to_string()))
 }
 
-/// The attributes of an element, as `(name, value)` pairs. Duplicates are an error.
-fn attributes(element: &BytesStart<'_>) -> std::result::Result<Vec<(String, String)>, String> {
-    let mut out: Vec<(String, String)> = Vec::new();
+/// The attributes of an element, as `(name, value)` pairs; `Err(expected)`
+/// as soon as there are more than `max`.
+///
+/// Stops at the first attribute past `max`: a line may hold ~100k of them,
+/// and this runs synchronously, out of reach of any timeout. quick-xml
+/// rejects a duplicate name itself (its checks are on by default).
+fn attributes(
+    element: &BytesStart<'_>,
+    max: usize,
+    expected: &str,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(max);
     for attr in element.attributes() {
         let attr = attr.map_err(|e| snippet(&e.to_string()))?;
-        let name = attr.key.as_ref().to_owned();
-        if out.iter().any(|(n, _)| *n == name) {
-            return Err(format!("duplicate attribute {}", snippet(&name)));
+        if out.len() >= max {
+            return Err(expected.to_owned());
         }
+        let name = attr.key.as_ref().to_owned();
         let value = attr
             .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|e| snippet(&e.to_string()))?
@@ -226,22 +284,24 @@ fn parse_guid(value: &str) -> std::result::Result<Uuid, String> {
 
 /// The sole `PSGuid` attribute of an `*Ack` / `Command` / `Signal` / `Close` element.
 fn guid_attribute(element: &BytesStart<'_>) -> std::result::Result<Uuid, String> {
-    match attributes(element)?.as_slice() {
+    const EXPECTED: &str = "expected exactly one attribute, PSGuid";
+    match attributes(element, 1, EXPECTED)?.as_slice() {
         [(name, value)] if name == "PSGuid" => parse_guid(value),
-        _ => Err("expected exactly one attribute, PSGuid".to_owned()),
+        _ => Err(EXPECTED.to_owned()),
     }
 }
 
 /// The `Stream` and `PSGuid` attributes of a `<Data>` element, in either order.
 fn data_attributes(element: &BytesStart<'_>) -> std::result::Result<(Stream, Uuid), String> {
-    match attributes(element)?.as_slice() {
+    const EXPECTED: &str = "expected exactly the attributes Stream and PSGuid";
+    match attributes(element, 2, EXPECTED)?.as_slice() {
         [(a, x), (b, y)] if a == "Stream" && b == "PSGuid" => {
             Ok((parse_stream(x)?, parse_guid(y)?))
         }
         [(a, x), (b, y)] if a == "PSGuid" && b == "Stream" => {
             Ok((parse_stream(y)?, parse_guid(x)?))
         }
-        _ => Err("expected exactly the attributes Stream and PSGuid".to_owned()),
+        _ => Err(EXPECTED.to_owned()),
     }
 }
 
@@ -269,24 +329,44 @@ impl LineSplitter {
         }
     }
 
-    /// Appends `bytes`; returns every completed line without its `\n` or `\r\n`.
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
-        let mut data = std::mem::take(&mut self.buf);
-        data.extend_from_slice(bytes);
-
+    /// Appends `bytes`; returns every line they complete, without its `\n`
+    /// or `\r\n`, and the error that stopped the split, if any.
+    ///
+    /// The lines completed before an error are returned with it, in order:
+    /// a `__NamedPipeError__:` line followed, in the same chunk, by a line
+    /// that is not UTF-8 still reaches the caller.
+    ///
+    /// Linear in `bytes.len()`: only the new bytes are searched for `\n`,
+    /// and the partial line kept from earlier pushes is never rescanned.
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> (Vec<String>, Option<PsrpError>) {
         let mut lines = Vec::new();
-        let mut rest: &[u8] = &[];
-        for segment in data.split_inclusive(|b| *b == b'\n') {
-            match segment.strip_suffix(b"\n") {
-                Some(line) => lines.push(self.finish_line(line)?),
-                None => rest = segment,
+        let mut rest = bytes;
+        loop {
+            let mut parts = rest.splitn(2, |b| *b == b'\n');
+            let head = parts.next().unwrap_or_default();
+            let Some(tail) = parts.next() else {
+                // No `\n` left: `head` (all of `rest`) continues the partial line.
+                if self.buf.len().saturating_add(head.len()) > MAX_LINE_BYTES {
+                    return (lines, Some(too_long()));
+                }
+                self.buf.extend_from_slice(head);
+                return (lines, None);
+            };
+            let line = if self.buf.is_empty() {
+                self.finish_line(head)
+            } else if self.buf.len().saturating_add(head.len()) > MAX_LINE_BYTES {
+                Err(too_long())
+            } else {
+                let mut whole = std::mem::take(&mut self.buf);
+                whole.extend_from_slice(head);
+                self.finish_line(&whole)
+            };
+            match line {
+                Ok(line) => lines.push(line),
+                Err(e) => return (lines, Some(e)),
             }
+            rest = tail;
         }
-        if rest.len() > MAX_LINE_BYTES {
-            return Err(too_long());
-        }
-        self.buf = rest.to_vec();
-        Ok(lines)
     }
 
     /// Validate one complete line (its `\n` already removed) and turn it into a `String`.
@@ -295,8 +375,12 @@ impl LineSplitter {
             return Err(too_long());
         }
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let text = std::str::from_utf8(line)
-            .map_err(|e| PsrpError::protocol(format!("OutOfProc line is not valid UTF-8: {e}")))?;
+        let text = std::str::from_utf8(line).map_err(|e| {
+            PsrpError::protocol(format!(
+                "OutOfProc line is not valid UTF-8 ({e}): {}",
+                quote_bytes(line)
+            ))
+        })?;
         let text = if self.seen_first_line {
             text
         } else {
@@ -314,12 +398,21 @@ fn too_long() -> PsrpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     const G: &str = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
     const NIL: &str = "00000000-0000-0000-0000-000000000000";
 
     fn g() -> Uuid {
         Uuid::parse_str(G).unwrap()
+    }
+
+    /// `LineSplitter::push` as a `Result`: the lines, or the error alone.
+    fn push(s: &mut LineSplitter, bytes: &[u8]) -> Result<Vec<String>> {
+        match s.push(bytes) {
+            (lines, None) => Ok(lines),
+            (_, Some(e)) => Err(e),
+        }
     }
 
     #[test]
@@ -416,6 +509,44 @@ mod tests {
     }
 
     #[test]
+    fn server_error_message_is_escaped_but_keeps_its_text_and_quotes() {
+        let line = format!(
+            "{SERVER_ERROR_PREFIX}bad\u{1b}[2J\r\u{7}x\u{202e}y\u{2066}z \"q\" 'a' \\ é\u{a0}:"
+        );
+        let msg = parse_line(&line).unwrap_err().to_string();
+        assert!(
+            msg.contains("bad\\u{1b}[2J\\r\\u{7}x\\u{202e}y\\u{2066}z \"q\" 'a' \\ é\u{a0}:"),
+            "{msg}"
+        );
+        assert!(
+            !msg.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{202e}' | '\u{2066}')),
+            "{msg:?}"
+        );
+    }
+
+    #[test]
+    fn escape_remote_text_leaves_no_output_rewriting_character() {
+        let risky: String = ('\u{0}'..='\u{9f}')
+            .filter(|c| c.is_control())
+            .chain(['\u{ad}', '\u{61c}', '\u{180e}', '\u{feff}'])
+            .chain('\u{200b}'..='\u{200f}')
+            .chain('\u{2028}'..='\u{202e}')
+            .chain('\u{2060}'..='\u{206f}')
+            .chain('\u{fff9}'..='\u{fffb}')
+            .chain('\u{e0000}'..='\u{e007f}')
+            .collect();
+        let out = escape_remote_text(&risky, usize::MAX);
+        assert!(!out.chars().any(rewrites_output), "{out:?}");
+        assert_eq!(
+            escape_remote_text("keep \"this\" 'as' \\ is: é", 100),
+            "keep \"this\" 'as' \\ is: é"
+        );
+        assert_eq!(escape_remote_text("abcdef", 3), "abc…");
+        assert_eq!(escape_remote_text("abc", 3), "abc");
+    }
+
+    #[test]
     fn server_error_message_is_truncated() {
         let line = format!("{SERVER_ERROR_PREFIX}{}", "m".repeat(5000));
         let msg = parse_line(&line).unwrap_err().to_string();
@@ -459,6 +590,40 @@ mod tests {
     }
 
     #[test]
+    fn an_element_with_many_attributes_is_rejected_at_once() {
+        // One maximal line holds ~100k attributes; collecting them all, with
+        // a duplicate scan, was quadratic and synchronous (no timeout can
+        // interrupt it).
+        let mut attrs = String::new();
+        for i in 0..100_000 {
+            write!(attrs, " a{i}=''").unwrap();
+        }
+        let budget = std::time::Duration::from_secs(1);
+        for line in [
+            format!("<DataAck{attrs} />"),
+            format!("<Data{attrs}>AA==</Data>"),
+        ] {
+            let start = std::time::Instant::now();
+            let err = parse_line(&line).unwrap_err();
+            let took = start.elapsed();
+            assert!(took < budget, "took {took:?}");
+            assert!(err.to_string().contains("expected exactly"), "{err}");
+        }
+    }
+
+    #[test]
+    fn duplicate_attributes_are_rejected_by_quick_xml() {
+        for line in [
+            format!("<Data PSGuid='{G}' PSGuid='{G}'>AA==</Data>"),
+            format!("<Data Stream='Default' Stream='Default' PSGuid='{G}'>AA==</Data>"),
+            format!("<DataAck PSGuid='{G}' PSGuid='{G}' />"),
+        ] {
+            let msg = parse_line(&line).unwrap_err().to_string();
+            assert!(msg.contains("duplicated attribute"), "{msg}");
+        }
+    }
+
+    #[test]
     fn error_quotes_the_offending_line_truncated() {
         let msg = parse_line(&"x".repeat(500)).unwrap_err().to_string();
         assert!(msg.contains(&"x".repeat(80)));
@@ -495,7 +660,8 @@ mod tests {
     #[test]
     fn splitter_strips_crlf_and_lf() -> Result<()> {
         let mut s = LineSplitter::new();
-        let lines = s.push(
+        let lines = push(
+            &mut s,
             format!("<CloseAck PSGuid='{NIL}' />\r\n<DataAck PSGuid='{NIL}' />\n").as_bytes(),
         )?;
         assert_eq!(
@@ -511,12 +677,15 @@ mod tests {
     #[test]
     fn splitter_keeps_a_partial_line_until_its_newline() -> Result<()> {
         let mut s = LineSplitter::new();
-        assert_eq!(s.push(b"<DataAck")?, Vec::<String>::new());
+        assert_eq!(push(&mut s, b"<DataAck")?, Vec::<String>::new());
         assert_eq!(
-            s.push(format!(" PSGuid='{NIL}' />\r").as_bytes())?,
+            push(&mut s, format!(" PSGuid='{NIL}' />\r").as_bytes())?,
             Vec::<String>::new()
         );
-        assert_eq!(s.push(b"\n")?, [format!("<DataAck PSGuid='{NIL}' />")]);
+        assert_eq!(
+            push(&mut s, b"\n")?,
+            [format!("<DataAck PSGuid='{NIL}' />")]
+        );
         Ok(())
     }
 
@@ -528,13 +697,13 @@ mod tests {
         let bytes = transcript.as_bytes();
 
         let mut whole = LineSplitter::new();
-        let expected = whole.push(bytes)?;
+        let expected = push(&mut whole, bytes)?;
         assert_eq!(expected.len(), 3);
 
         let mut one_by_one = LineSplitter::new();
         let mut got = Vec::new();
         for b in bytes {
-            got.extend(one_by_one.push(std::slice::from_ref(b))?);
+            got.extend(push(&mut one_by_one, std::slice::from_ref(b))?);
         }
         assert_eq!(got, expected);
 
@@ -542,8 +711,8 @@ mod tests {
         let cr = bytes.iter().position(|b| *b == b'\r').unwrap();
         let (head, tail) = bytes.split_at(cr + 1);
         let mut split = LineSplitter::new();
-        let mut got = split.push(head)?;
-        got.extend(split.push(tail)?);
+        let mut got = push(&mut split, head)?;
+        got.extend(push(&mut split, tail)?);
         assert_eq!(got, expected);
         Ok(())
     }
@@ -553,30 +722,86 @@ mod tests {
         let mut ok = LineSplitter::new();
         let mut bytes = vec![b'a'; MAX_LINE_BYTES];
         bytes.push(b'\n');
-        assert_eq!(ok.push(&bytes)?.len(), 1);
+        assert_eq!(push(&mut ok, &bytes)?.len(), 1);
 
         let mut bad = LineSplitter::new();
-        assert!(bad.push(&vec![b'a'; MAX_LINE_BYTES + 1]).is_err());
+        assert!(push(&mut bad, &vec![b'a'; MAX_LINE_BYTES + 1]).is_err());
 
         // Overlong even though its terminator arrived in the same push.
         let mut bad = LineSplitter::new();
         let mut bytes = vec![b'a'; MAX_LINE_BYTES + 1];
         bytes.push(b'\n');
-        assert!(bad.push(&bytes).is_err());
+        assert!(push(&mut bad, &bytes).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn splitter_cost_stays_linear_when_a_line_trickles_in_byte_by_byte() {
+        // A hostile server may send one maximal line one byte per SSH packet;
+        // rescanning the partial line on every push made that quadratic
+        // (minutes of CPU). Linear, it takes milliseconds even in debug.
+        let budget = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        let mut s = LineSplitter::new();
+        for i in 0..MAX_LINE_BYTES {
+            let lines = push(&mut s, b"a").unwrap();
+            assert_eq!(lines, Vec::<String>::new());
+            assert!(
+                start.elapsed() < budget,
+                "{i} one-byte pushes took over {budget:?}: the splitter is not linear"
+            );
+        }
+        let lines = push(&mut s, b"\n").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn splitter_returns_the_lines_completed_before_an_error() {
+        let mut s = LineSplitter::new();
+        let (lines, error) = s.push(b"__NamedPipeError__:boom\r\n\xff\r\n<CloseAck");
+        assert_eq!(lines, ["__NamedPipeError__:boom"]);
+        assert!(matches!(error, Some(PsrpError::Protocol(_))), "{error:?}");
+
+        let mut s = LineSplitter::new();
+        let mut bytes = b"<DataAck/>\n".to_vec();
+        bytes.extend(vec![b'a'; MAX_LINE_BYTES + 1]);
+        let (lines, error) = s.push(&bytes);
+        assert_eq!(lines, ["<DataAck/>"]);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn invalid_utf8_error_quotes_the_line_escaped_and_truncated() {
+        let mut s = LineSplitter::new();
+        let msg = push(&mut s, b"bad \xff line\x1b[31m\r\n")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("\"bad \u{FFFD} line\\u{1b}[31m\""), "{msg}");
+        assert!(!msg.contains('\u{1b}'), "{msg:?}");
+
+        let mut long = vec![b'x'; 500];
+        long.extend_from_slice(b"\xff\n");
+        let msg = push(&mut LineSplitter::new(), &long)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(&format!("\"{}…\"", "x".repeat(80))), "{msg}");
+        assert!(!msg.contains(&"x".repeat(81)), "{msg}");
     }
 
     #[test]
     fn splitter_rejects_invalid_utf8() {
         let mut s = LineSplitter::new();
-        assert!(s.push(b"\xff\xfe<x>\n").is_err());
+        assert!(push(&mut s, b"\xff\xfe<x>\n").is_err());
     }
 
     #[test]
     fn splitter_strips_a_bom_on_the_first_line_only() -> Result<()> {
         let mut s = LineSplitter::new();
-        let lines =
-            s.push(format!("\u{FEFF}<CloseAck PSGuid='{NIL}' />\r\n\u{FEFF}x\n").as_bytes())?;
+        let lines = push(
+            &mut s,
+            format!("\u{FEFF}<CloseAck PSGuid='{NIL}' />\r\n\u{FEFF}x\n").as_bytes(),
+        )?;
         assert_eq!(
             lines,
             [

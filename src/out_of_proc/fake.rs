@@ -62,6 +62,8 @@ struct State {
 
     // Configuration.
     die_after: Option<usize>,
+    /// Replies to the client lines after this many are held.
+    hold_after: Option<usize>,
     chunk_size: Option<usize>,
     output: Vec<PsValue>,
     run_forever: bool,
@@ -134,6 +136,9 @@ impl State {
         if self.die_after == Some(self.lines_seen) {
             self.die();
             return;
+        }
+        if self.hold_after.is_some_and(|n| self.lines_seen > n) {
+            self.held.get_or_insert_with(Vec::new);
         }
         for (text, is_ack) in replies {
             self.emit(&text);
@@ -316,11 +321,15 @@ impl State {
     }
 
     fn emit(&mut self, text: &str) {
-        self.queued += text.len();
+        self.emit_bytes(text.as_bytes());
+    }
+
+    fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.queued += bytes.len();
         if let Some(held) = &mut self.held {
-            held.extend_from_slice(text.as_bytes());
+            held.extend_from_slice(bytes);
         } else {
-            self.out.extend(text.as_bytes());
+            self.out.extend(bytes);
         }
     }
 
@@ -458,16 +467,26 @@ impl FakeHandle {
     }
 
     /// While on, replies (and injected text) are buffered, invisible to `read`.
+    /// Turning it off also cancels [`Self::hold_replies_after_writes`].
     pub(crate) fn hold_replies(&self, on: bool) {
         {
             let mut state = lock(&self.state);
             if on {
                 state.held.get_or_insert_with(Vec::new);
-            } else if let Some(held) = state.held.take() {
-                state.out.extend(held);
+            } else {
+                state.hold_after = None;
+                if let Some(held) = state.held.take() {
+                    state.out.extend(held);
+                }
             }
         }
         self.notify.notify_one();
+    }
+
+    /// Replies to the first `n` client lines go out as usual; from the next
+    /// one on, replies are held as by [`Self::hold_replies`].
+    pub(crate) fn hold_replies_after_writes(&self, n: usize) {
+        lock(&self.state).hold_after = Some(n);
     }
 
     /// While on, `write` hands the first half of its bytes to the server and
@@ -478,7 +497,12 @@ impl FakeHandle {
 
     /// Queues raw stdout text: an error line, junk, a BOM, a stray `<Data>`.
     pub(crate) fn inject(&self, raw: &str) {
-        lock(&self.state).emit(raw);
+        self.inject_bytes(raw.as_bytes());
+    }
+
+    /// Queues raw stdout bytes, not necessarily UTF-8.
+    pub(crate) fn inject_bytes(&self, raw: &[u8]) {
+        lock(&self.state).emit_bytes(raw);
         self.notify.notify_one();
     }
 
