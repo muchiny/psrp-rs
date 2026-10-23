@@ -4,7 +4,7 @@
 //! [`PsValue::Null`]; leading whitespace / BOM / `<Objs>` wrappers are
 //! accepted transparently.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -23,7 +23,11 @@ pub fn parse_clixml(xml: &str) -> Result<Vec<PsValue>> {
     let mut reader = Reader::from_str(cleaned);
     reader.config_mut().trim_text(false);
 
-    let mut state = DecoderState::default();
+    let mut state = DecoderState {
+        referenced: referenced_ids(cleaned),
+        budget: ref_budget(cleaned.len()),
+        ..DecoderState::default()
+    };
     let mut out: Vec<PsValue> = Vec::new();
     let mut buf = Vec::new();
 
@@ -40,12 +44,6 @@ pub fn parse_clixml(xml: &str) -> Result<Vec<PsValue>> {
             Event::Empty(e) => {
                 if let Some(value) = parse_empty(&e, &mut state)? {
                     out.push(value);
-                } else if e.name().as_ref() == "Ref" {
-                    let rid = ref_ref_id_attr(&e)?;
-                    out.push(
-                        rid.and_then(|r| state.refs.get(&r).cloned())
-                            .unwrap_or(PsValue::Null),
-                    );
                 }
             }
             Event::Eof => break,
@@ -70,12 +68,78 @@ pub fn parse_clixml(xml: &str) -> Result<Vec<PsValue>> {
 /// emits (`Serialization.MaximumDepth` defaults to 1).
 pub const MAX_NESTING_DEPTH: u32 = 64;
 
+/// Floor, ceiling and per-byte allowance of the weight (see [`measure`]) that
+/// the references of one document may materialize.
+///
+/// A reference is resolved by cloning the object it points to, so a server
+/// can chain a few dozen objects that each hold two references to the
+/// previous one: ~1 KiB of XML then expands to 2^n values and exhausts the
+/// memory (the process aborts, it is not a catchable error). Legitimate
+/// sharing grows with the document (a collection whose elements share one
+/// object), hence an allowance per byte of XML on top of the floor, and the
+/// ceiling keeps the worst case near a gigabyte (a value costs at most
+/// ~112 bytes per unit of weight; text is cheaper).
+const REF_BUDGET_FLOOR: u64 = 1 << 20;
+const REF_BUDGET_CEILING: u64 = 8 << 20;
+const REF_BUDGET_PER_BYTE: u64 = 8;
+
+fn ref_budget(xml_len: usize) -> u64 {
+    REF_BUDGET_FLOOR
+        .saturating_add((xml_len as u64).saturating_mul(REF_BUDGET_PER_BYTE))
+        .min(REF_BUDGET_CEILING)
+}
+
+/// The `RefId`s that some `<Ref>` of the document points to.
+///
+/// Only those objects are kept for a later reference, so that an object
+/// nobody references is not cloned (once per enclosing object that has a
+/// `RefId`, which is all of them in PowerShell's output). A malformed
+/// document ends the scan early; the real parse reports the error.
+fn referenced_ids(xml: &str) -> HashSet<String> {
+    let mut reader = Reader::from_str(xml);
+    let mut ids = HashSet::new();
+    let mut buf = Vec::new();
+    while let Ok(event) = reader.read_event_into(&mut buf) {
+        match event {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == "Ref" => {
+                if let Ok(Some(id)) = ref_ref_id_attr(&e) {
+                    ids.insert(id);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    ids
+}
+
 #[derive(Default)]
 struct DecoderState {
+    /// Objects that a `<Ref>` points to, by `RefId` (see [`referenced_ids`]).
     refs: HashMap<String, PsValue>,
+    referenced: HashSet<String>,
+    /// Weight materialized by references so far, bounded by `budget`.
+    expanded: u64,
+    budget: u64,
     type_names: HashMap<String, Vec<String>>,
     /// Current nesting level, maintained by [`parse_element`].
     depth: u32,
+}
+
+impl DecoderState {
+    /// Charge `weight` to the reference budget, or fail when it is spent.
+    fn charge(&mut self, weight: u64) -> Result<()> {
+        let expanded = self.expanded.saturating_add(weight);
+        if expanded > self.budget {
+            return Err(PsrpError::clixml(format!(
+                "CLIXML <Ref> expansion exceeds {}",
+                self.budget
+            )));
+        }
+        self.expanded = expanded;
+        Ok(())
+    }
 }
 
 /// Read the `N="…"` property-name attribute.
@@ -116,9 +180,80 @@ fn ref_ref_id_attr(e: &BytesStart) -> Result<Option<String>> {
     ref_id_attr(e)
 }
 
-fn parse_empty(e: &BytesStart, _state: &mut DecoderState) -> Result<Option<PsValue>> {
+/// Resolve a `<Ref RefId="…"/>` against the objects decoded so far.
+///
+/// PowerShell writes a second occurrence of an object already serialized
+/// in the same graph as exactly this self-closed element
+/// (`WritePSObjectReference`), in a list item, a dictionary key or value,
+/// a member or at the top level, so every one of those goes through here.
+/// A reference with no `RefId`, or to an id not decoded yet (a dangling
+/// one, or a cycle back to an object still being built), is `Null`.
+///
+/// The copy is bounded: by the reference budget over the whole document,
+/// and so that, planted `level` containers below the current element, it
+/// stays within [`MAX_NESTING_DEPTH`] (a chain of references would
+/// otherwise build a value deep enough to overflow the stack of whatever
+/// walks it next).
+fn resolve_ref(e: &BytesStart, state: &mut DecoderState, level: u32) -> Result<PsValue> {
+    let Some(target) = ref_ref_id_attr(e)?.and_then(|r| state.refs.get(&r)) else {
+        return Ok(PsValue::Null);
+    };
+    let (weight, height) = measure(target);
+    if state.depth.saturating_add(level).saturating_add(height) > MAX_NESTING_DEPTH {
+        return Err(PsrpError::clixml(format!(
+            "CLIXML <Ref> would nest deeper than {MAX_NESTING_DEPTH} levels"
+        )));
+    }
+    let value = target.clone();
+    state.charge(weight)?;
+    Ok(value)
+}
+
+/// Rough memory weight and container nesting of a decoded value.
+///
+/// Every node weighs 1, plus the length of its text or bytes and of the
+/// names it carries; the height counts `Object` / `List` / `Dict` levels.
+/// Both are over-estimates on purpose: they only bound a copy.
+fn measure(v: &PsValue) -> (u64, u32) {
+    match v {
+        PsValue::String(s)
+        | PsValue::Decimal(s)
+        | PsValue::DateTime(s)
+        | PsValue::Duration(s)
+        | PsValue::Version(s)
+        | PsValue::Uri(s)
+        | PsValue::Xml(s)
+        | PsValue::ScriptBlock(s)
+        | PsValue::SecureString(s) => (1 + s.len() as u64, 0),
+        PsValue::Bytes(b) => (1 + b.len() as u64, 0),
+        PsValue::List(items) => items.iter().fold((1, 1), |(w, h), i| {
+            let (iw, ih) = measure(i);
+            (w + iw, h.max(1 + ih))
+        }),
+        PsValue::Dict(entries) => entries.iter().fold((1, 1), |(w, h), (k, val)| {
+            let (kw, kh) = measure(k);
+            let (vw, vh) = measure(val);
+            (w + kw + vw, h.max(1 + kh.max(vh)))
+        }),
+        PsValue::Object(o) => {
+            let mut weight = 1 + o.to_string.as_ref().map_or(0, |s| s.len() as u64);
+            weight += o.type_names.iter().map(|t| 1 + t.len() as u64).sum::<u64>();
+            let mut height = 1;
+            for (name, val) in &o.properties {
+                let (vw, vh) = measure(val);
+                weight += 1 + name.len() as u64 + vw;
+                height = height.max(1 + vh);
+            }
+            (weight, height)
+        }
+        _ => (1, 0),
+    }
+}
+
+fn parse_empty(e: &BytesStart, state: &mut DecoderState) -> Result<Option<PsValue>> {
     match e.name().as_ref() {
         "Nil" => Ok(Some(PsValue::Null)),
+        "Ref" => resolve_ref(e, state, 1).map(Some),
         "S" => Ok(Some(PsValue::String(String::new()))),
         // PowerShell normally writes an empty value self-closed
         // (`<S N="x" />`, `<SBK N="x" />`: the .NET writer shortens an element
@@ -286,8 +421,10 @@ fn parse_element_inner(
         "Obj" => {
             let ref_id = ref_id_attr(e)?;
             let obj = parse_obj_body(reader, state)?;
-            let value = PsValue::Object(obj.clone());
-            if let Some(rid) = ref_id {
+            let value = PsValue::Object(obj);
+            if let Some(rid) = ref_id.filter(|r| state.referenced.contains(r)) {
+                // A kept copy is memory too: it is charged like the others.
+                state.charge(measure(&value).0)?;
                 state.refs.insert(rid, value.clone());
             }
             // Flatten: if the object has no properties and no type names
@@ -296,13 +433,10 @@ fn parse_element_inner(
             Ok(Some(value))
         }
         "Ref" => {
-            let rid = ref_ref_id_attr(e)?;
-            // self-closing `<Ref/>` handled by parse_empty; otherwise drain.
+            // The self-closed form is `parse_empty`'s; this is `<Ref ..>…</Ref>`.
+            let value = resolve_ref(e, state, 0)?;
             skip_to_end(reader)?;
-            Ok(Some(
-                rid.and_then(|r| state.refs.get(&r).cloned())
-                    .unwrap_or(PsValue::Null),
-            ))
+            Ok(Some(value))
         }
         _ => {
             // Unknown top-level element — skip.
@@ -408,14 +542,6 @@ fn parse_member_set(
                     if let Some(name) = name_attr(&e)? {
                         obj.properties.insert(name, PsValue::Null);
                     }
-                }
-                "Ref" => {
-                    let name = name_attr(&e)?.unwrap_or_default();
-                    let rid = ref_ref_id_attr(&e)?;
-                    let value = rid
-                        .and_then(|r| state.refs.get(&r).cloned())
-                        .unwrap_or(PsValue::Null);
-                    obj.properties.insert(name, value);
                 }
                 _ => {
                     if let Some(v) = parse_empty(&e, state)? {
@@ -1476,5 +1602,162 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    /// PowerShell writes the second occurrence of an object in one graph as a
+    /// self-closed `<Ref RefId="…" />` (`WritePSObjectReference`): in a list
+    /// item, a dict key or value, a property, or at the top level. It used to
+    /// be dropped from a list (the items after it shifted) and read as `Null`
+    /// in a dict entry.
+    #[test]
+    fn self_closed_ref_resolves_wherever_it_appears() {
+        let o = |n: &str| {
+            let mut obj = PsObject::default();
+            obj.properties.insert("a".into(), PsValue::String(n.into()));
+            PsValue::Object(obj)
+        };
+        let first = r#"<Obj RefId="1"><MS><S N="a">x</S></MS></Obj>"#;
+        let decode = |xml: &str| {
+            let got = parse_clixml(xml).unwrap();
+            let [PsValue::Object(o)] = got.as_slice() else {
+                panic!("expected one object, got {got:?}");
+            };
+            o.get("_value").cloned().unwrap_or(PsValue::Null)
+        };
+
+        // `@($o, $o, 3)`: the reference keeps its position.
+        assert_eq!(
+            decode(&format!(
+                r#"<Obj RefId="0"><LST>{first}<Ref RefId="1" /><I32>3</I32></LST></Obj>"#
+            )),
+            PsValue::List(vec![o("x"), o("x"), PsValue::I32(3)])
+        );
+        // `@{a=$o; b=$o}`, and a reference used as a key.
+        assert_eq!(
+            decode(concat!(
+                r#"<Obj RefId="0"><DCT>"#,
+                r#"<En><S N="Key">a</S><Obj N="Value" RefId="1"><MS><S N="a">x</S></MS></Obj></En>"#,
+                r#"<En><S N="Key">b</S><Ref N="Value" RefId="1" /></En>"#,
+                r#"<En><Ref N="Key" RefId="1" /><I32 N="Value">9</I32></En>"#,
+                r#"</DCT></Obj>"#,
+            )),
+            PsValue::Dict(vec![
+                (PsValue::String("a".into()), o("x")),
+                (PsValue::String("b".into()), o("x")),
+                (o("x"), PsValue::I32(9)),
+            ])
+        );
+        // A property, and the top level.
+        let got = parse_clixml(&format!(
+            r#"{first}<Obj RefId="2"><MS><Ref N="p" RefId="1" /></MS></Obj><Ref RefId="1" />"#
+        ))
+        .unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[2], o("x"));
+        let PsValue::Object(holder) = &got[1] else {
+            panic!("{got:?}");
+        };
+        assert_eq!(holder.get("p"), Some(&o("x")));
+    }
+
+    /// A reference to an id that is not decoded (dangling, or a cycle back to
+    /// an object still being built) is `Null`, in a list as at the top level,
+    /// and does not shift its neighbours.
+    #[test]
+    fn dangling_or_cyclic_ref_is_null_in_place() {
+        assert_eq!(
+            decode_value(
+                r#"<Obj RefId="0"><LST><Ref RefId="nope" /><I32>2</I32><Ref RefId="0" /></LST></Obj>"#
+            ),
+            PsValue::List(vec![PsValue::Null, PsValue::I32(2), PsValue::Null])
+        );
+        // No RefId at all.
+        assert_eq!(
+            decode_value(r#"<Obj RefId="0"><LST><Ref /><I32>2</I32></LST></Obj>"#),
+            PsValue::List(vec![PsValue::Null, PsValue::I32(2)])
+        );
+    }
+
+    fn decode_value(xml: &str) -> PsValue {
+        let got = parse_clixml(xml).unwrap();
+        let [PsValue::Object(o)] = got.as_slice() else {
+            panic!("expected one object, got {got:?}");
+        };
+        o.get("_value").cloned().unwrap_or(PsValue::Null)
+    }
+
+    /// A server can chain objects that each hold two references to the
+    /// previous one: a few KiB of XML then expands to 2^n values. That used to
+    /// exhaust the memory and abort the process; now it is a parse error.
+    #[test]
+    fn doubling_refs_are_a_bounded_error_not_an_oom() {
+        let mut xml = String::from(r#"<Obj RefId="0"><LST><S>x</S></LST></Obj>"#);
+        for k in 1..=40 {
+            xml.push_str(&format!(
+                r#"<Obj RefId="{k}"><LST><Ref RefId="{p}" /><Ref RefId="{p}" /></LST></Obj>"#,
+                p = k - 1
+            ));
+        }
+        let err = parse_clixml(&xml).expect_err("2^40 values must not decode");
+        assert!(err.to_string().contains("expansion"), "{err}");
+    }
+
+    /// Chaining one reference per level also builds a value deeper than the
+    /// parser itself would accept; it is refused the same way.
+    #[test]
+    fn chained_refs_cannot_outgrow_the_nesting_limit() {
+        let mut xml = String::from(r#"<Obj RefId="0"><LST><S>x</S></LST></Obj>"#);
+        for k in 1..=200 {
+            xml.push_str(&format!(
+                r#"<Obj RefId="{k}"><LST><Ref RefId="{p}" /></LST></Obj>"#,
+                p = k - 1
+            ));
+        }
+        let err = parse_clixml(&xml).expect_err("a 400-level value must not decode");
+        assert!(err.to_string().contains("deeper"), "{err}");
+    }
+
+    /// Ordinary sharing stays far below both limits.
+    #[test]
+    fn ordinary_sharing_is_not_limited() {
+        let mut xml = String::from(
+            r#"<Obj RefId="0"><MS><S N="Name">svchost</S><I32 N="Id">42</I32></MS></Obj><Obj RefId="1"><LST>"#,
+        );
+        for _ in 0..1000 {
+            xml.push_str(r#"<Ref RefId="0" />"#);
+        }
+        xml.push_str("</LST></Obj>");
+        let got = parse_clixml(&xml).unwrap();
+        let PsValue::Object(list) = &got[1] else {
+            panic!("{got:?}");
+        };
+        let Some(PsValue::List(items)) = list.get("_value") else {
+            panic!("{list:?}");
+        };
+        assert_eq!(items.len(), 1000);
+        assert!(items.iter().all(|i| *i == got[0]));
+    }
+
+    /// Legitimate sharing grows with the document: 15 000 elements that point
+    /// at one 100-character object materialize ~1.6 M units of weight, past
+    /// the floor of the budget but within what the document's size allows.
+    #[test]
+    fn sharing_scales_with_the_document() {
+        let mut xml = format!(
+            r#"<Obj RefId="s"><MS><S N="Name">{}</S></MS></Obj><Obj RefId="l"><LST>"#,
+            "x".repeat(100)
+        );
+        for _ in 0..15_000 {
+            xml.push_str(r#"<Ref RefId="s" />"#);
+        }
+        xml.push_str("</LST></Obj>");
+        let got = parse_clixml(&xml).unwrap();
+        let PsValue::Object(list) = &got[1] else {
+            panic!("expected the list object");
+        };
+        let Some(PsValue::List(items)) = list.get("_value") else {
+            panic!("{list:?}");
+        };
+        assert_eq!(items.len(), 15_000);
     }
 }

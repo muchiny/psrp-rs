@@ -340,6 +340,49 @@ async fn live_secure_string_round_trip() {
     let _ = pool.close().await;
 }
 
+/// An object that appears twice in one graph is serialized once and then
+/// referenced by a self-closed `<Ref />`: it used to vanish from a list (the
+/// items after it moved up) and read as `Null` in a dictionary.
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_shared_object_in_list_and_dict() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    let value = |out: &[PsValue]| match out {
+        [PsValue::Object(o)] => o.get("_value").cloned().expect("a collection"),
+        other => panic!("expected one collection, got {other:?}"),
+    };
+
+    let out = pool
+        .run_script("$o = [pscustomobject]@{a = 1}; ,@($o, $o, 5)")
+        .await
+        .expect("list");
+    let PsValue::List(items) = value(&out) else {
+        panic!("not a list: {out:?}");
+    };
+    assert_eq!(items.len(), 3, "{items:?}");
+    assert_eq!(items[0], items[1]);
+    assert_ne!(items[0], PsValue::Null);
+    assert_eq!(items[2], PsValue::I32(5));
+
+    let out = pool
+        .run_script("$o = [pscustomobject]@{a = 1}; ,@{x = $o; y = $o}")
+        .await
+        .expect("dict");
+    let PsValue::Dict(entries) = value(&out) else {
+        panic!("not a dict: {out:?}");
+    };
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(entries[0].1, entries[1].1);
+    assert_ne!(entries[0].1, PsValue::Null, "{entries:?}");
+
+    let _ = pool.close().await;
+}
+
 // ---- SSH transport tests ----
 
 /// Build the SSH config from `PSRP_INTEGRATION_SSH_{HOST,PORT,USER,PASS}`.
