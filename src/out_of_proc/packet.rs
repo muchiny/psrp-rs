@@ -811,4 +811,54 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn data_attributes_are_accepted_in_either_order() -> Result<()> {
+        let expected = Some(Packet::Data {
+            stream: Stream::PromptResponse,
+            guid: g(),
+            payload: vec![0],
+        });
+        for line in [
+            format!("<Data Stream='PromptResponse' PSGuid='{G}'>AA==</Data>"),
+            format!("<Data PSGuid='{G}' Stream='PromptResponse'>AA==</Data>"),
+        ] {
+            assert_eq!(parse_line(&line)?, expected, "{line}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn data_with_other_attribute_names_is_rejected_for_that_reason() {
+        // A valid value under a wrong name must not be taken for the right
+        // attribute, whichever position it is in.
+        for line in [
+            format!("<Data Foo='{G}' Stream='Default'>AA==</Data>"),
+            format!("<Data Stream='Default' Foo='{G}'>AA==</Data>"),
+            format!("<Data Foo='Default' Bar='{G}'>AA==</Data>"),
+            format!("<Data Foo='{G}' Bar='Default'>AA==</Data>"),
+            format!("<Data PSGuid='{G}' Foo='Default'>AA==</Data>"),
+            "<Data Foo='Default' Stream='Default'>AA==</Data>".to_owned(),
+        ] {
+            let err = parse_line(&line).unwrap_err().to_string();
+            assert!(
+                err.contains("expected exactly the attributes Stream and PSGuid"),
+                "{line}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn quote_bytes_quotes_exactly_the_first_80_characters_of_a_long_line() {
+        // 4-byte characters are the worst case for the byte budget: 81 of
+        // them must reach `snippet` so that it can see the line goes on.
+        let long = "\u{1F600}".repeat(100);
+        assert_eq!(
+            quote_bytes(long.as_bytes()),
+            format!("\"{}…\"", "\u{1F600}".repeat(QUOTED_LINE_CHARS))
+        );
+        // Exactly 80 characters: nothing is cut, so no ellipsis.
+        let exact = "\u{1F600}".repeat(QUOTED_LINE_CHARS);
+        assert_eq!(quote_bytes(exact.as_bytes()), format!("\"{exact}\""));
+    }
 }
