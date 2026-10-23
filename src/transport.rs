@@ -241,6 +241,58 @@ impl<'c> WinrmPsrpTransport<'c> {
     }
 }
 
+/// What one finished Receive means for `recv_chunk`.
+enum Poll {
+    /// Nothing to read yet (the long poll timed out): ask again.
+    Retry,
+    Chunk(ReceiveOutput),
+}
+
+/// Sort the outcome of one Receive.
+///
+/// `stop_signalled`: a stop signal was accepted for the command. The server
+/// then deletes the command and answers the Receive with `InvalidSelectors`
+/// instead of a final `PipelineState`, so that fault, and only then, is the
+/// end of the stop: `Err(Stopped)`. It is the same fault as "the shell is
+/// gone" (WinRM has one code for an unknown resource), so a shell reaped
+/// right after a stop also reads as stopped; the next command then fails
+/// with the real error.
+fn classify_receive(
+    polled: std::result::Result<ReceiveOutput, WinrmError>,
+    stop_signalled: bool,
+) -> Result<Poll> {
+    match polled {
+        Ok(out) => Ok(Poll::Chunk(out)),
+        Err(WinrmError::Timeout(_)) => Ok(Poll::Retry),
+        Err(WinrmError::Soap(SoapError::Fault {
+            ref code,
+            ref reason,
+        })) if code.contains("TimedOut") => {
+            // PSRP long-polling: the WinRM server returns a SOAP fault with
+            // code `w:TimedOut` when there's nothing to read yet. This is the
+            // normal long-poll cycle and MUST be retried (briefing §5 P7).
+            // Only fatal SOAP faults (e.g. shell died, access denied) should
+            // propagate.
+            debug!(%code, %reason, "PSRP recv_chunk: w:TimedOut — retrying");
+            Ok(Poll::Retry)
+        }
+        Err(WinrmError::Soap(SoapError::Fault { ref code, .. }))
+            if stop_signalled && code.contains("InvalidSelectors") =>
+        {
+            debug!(%code, "PSRP recv_chunk: command gone after the stop signal");
+            Err(PsrpError::Stopped)
+        }
+        Err(WinrmError::Soap(SoapError::Fault { code, reason })) => {
+            warn!(%code, %reason, "PSRP transport SOAP fault — shell likely dead");
+            Err(PsrpError::Winrm(WinrmError::Soap(SoapError::Fault {
+                code,
+                reason,
+            })))
+        }
+        Err(e) => Err(PsrpError::Winrm(e)),
+    }
+}
+
 #[async_trait]
 impl PsrpTransport for WinrmPsrpTransport<'_> {
     async fn send_fragment(&self, bytes: &[u8]) -> Result<()> {
@@ -264,8 +316,12 @@ impl PsrpTransport for WinrmPsrpTransport<'_> {
                     .drive(move || async move { shell.receive_next(&command_id).await })
                     .await
             };
-            match polled {
-                Ok(out) => {
+            let stop_signalled = self
+                .stop_signalled
+                .load(std::sync::atomic::Ordering::SeqCst);
+            match classify_receive(polled, stop_signalled)? {
+                Poll::Retry => continue,
+                Poll::Chunk(out) => {
                     if out.done {
                         self.done = true;
                     }
@@ -274,38 +330,6 @@ impl PsrpTransport for WinrmPsrpTransport<'_> {
                     }
                     return Ok(out.stdout);
                 }
-                Err(WinrmError::Timeout(_)) => continue,
-                Err(WinrmError::Soap(SoapError::Fault {
-                    ref code,
-                    ref reason,
-                })) if code.contains("TimedOut") => {
-                    // PSRP long-polling: the WinRM server returns a SOAP
-                    // fault with code `w:TimedOut` when there's nothing to
-                    // read yet. This is the normal long-poll cycle and MUST
-                    // be retried (briefing §5 P7). Only fatal SOAP faults
-                    // (e.g. shell died, access denied) should propagate.
-                    debug!(%code, %reason, "PSRP recv_chunk: w:TimedOut — retrying");
-                    continue;
-                }
-                Err(WinrmError::Soap(SoapError::Fault { ref code, .. }))
-                    if code.contains("InvalidSelectors")
-                        && self
-                            .stop_signalled
-                            .load(std::sync::atomic::Ordering::SeqCst) =>
-                {
-                    // The stop was accepted and the server deleted the
-                    // command: it will say nothing more about it.
-                    debug!(%code, "PSRP recv_chunk: command gone after the stop signal");
-                    return Err(PsrpError::Stopped);
-                }
-                Err(WinrmError::Soap(SoapError::Fault { code, reason })) => {
-                    warn!(%code, %reason, "PSRP transport SOAP fault — shell likely dead");
-                    return Err(PsrpError::Winrm(WinrmError::Soap(SoapError::Fault {
-                        code,
-                        reason,
-                    })));
-                }
-                Err(e) => return Err(PsrpError::Winrm(e)),
             }
         }
     }
@@ -573,5 +597,63 @@ mod parked_tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         parked.discard();
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::{Poll, classify_receive};
+    use crate::error::PsrpError;
+    use winrm_rs::{ReceiveOutput, SoapError, WinrmError};
+
+    fn fault(code: &str) -> WinrmError {
+        WinrmError::Soap(SoapError::Fault {
+            code: code.into(),
+            reason: "r".into(),
+        })
+    }
+
+    fn output() -> ReceiveOutput {
+        ReceiveOutput {
+            stdout: b"x".to_vec(),
+            stderr: Vec::new(),
+            exit_code: None,
+            done: false,
+        }
+    }
+
+    #[test]
+    fn data_and_long_poll_timeouts() {
+        assert!(matches!(
+            classify_receive(Ok(output()), false),
+            Ok(Poll::Chunk(c)) if c.stdout == b"x"
+        ));
+        assert!(matches!(
+            classify_receive(Err(fault("w:TimedOut")), false),
+            Ok(Poll::Retry)
+        ));
+        assert!(matches!(
+            classify_receive(Err(fault("w:TimedOut")), true),
+            Ok(Poll::Retry)
+        ));
+    }
+
+    /// The fault that follows an accepted stop signal is the stop (#27); the
+    /// same fault with no signal of ours is a dead shell, and any other
+    /// fault stays fatal either way.
+    #[test]
+    fn invalid_selectors_means_stopped_only_after_our_stop_signal() {
+        assert!(matches!(
+            classify_receive(Err(fault("w:InvalidSelectors")), true),
+            Err(PsrpError::Stopped)
+        ));
+        assert!(matches!(
+            classify_receive(Err(fault("w:InvalidSelectors")), false),
+            Err(PsrpError::Winrm(WinrmError::Soap(SoapError::Fault { .. })))
+        ));
+        assert!(matches!(
+            classify_receive(Err(fault("w:AccessDenied")), true),
+            Err(PsrpError::Winrm(WinrmError::Soap(SoapError::Fault { .. })))
+        ));
     }
 }

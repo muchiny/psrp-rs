@@ -1269,13 +1269,21 @@ mod tests {
         assert!(matches!(err, PsrpError::Cancelled), "{err:?}");
         assert!(*t.stopped.lock().unwrap(), "the stop signal was sent");
 
-        // The streaming variant has its own loop.
+        let _ = pool.close().await;
+    }
+
+    /// The same for the handle's own loop (`start` then `collect_with_cancel`).
+    #[tokio::test]
+    async fn a_command_gone_after_the_stop_signal_cancels_a_collected_handle() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let handle = Pipeline::new("slow").start(&mut pool).await.unwrap();
         *t.fail_recv.lock().unwrap() = Some(PsrpError::Stopped);
-        let err = Pipeline::new("slow")
-            .run_all_streams_with_cancel(&mut pool, token)
-            .await
-            .unwrap_err();
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let err = handle.collect_with_cancel(token).await.unwrap_err();
         assert!(matches!(err, PsrpError::Cancelled), "{err:?}");
+        assert!(*t.stopped.lock().unwrap(), "the stop signal was sent");
         let _ = pool.close().await;
     }
 
