@@ -291,10 +291,16 @@ pub fn ps_host_info_null() -> PsValue {
 
 /// Escape a string for XML **text** content.
 ///
-/// Control characters below 0x20 (except `\t`, `\n`, `\r`, which XML
-/// text preserves verbatim) are emitted as PowerShell's `_xHHHH_`
-/// escapes, and so is a `_` followed by `x` or `X` (as `_x005F_`), so
-/// that the decoder never mistakes the caller's text for an escape.
+/// Control characters below 0x20 are emitted as PowerShell's `_xHHHH_`
+/// escapes, except `\t` and `\n`, which XML text preserves verbatim. `\r`
+/// is escaped as well: XML end-of-line normalisation (XML 1.0 §2.11),
+/// which PowerShell's reader applies to text, turns a literal CR or CRLF
+/// into LF. A `_` followed by `x` or `X` is escaped too (as `_x005F_`),
+/// so that the decoder never mistakes the caller's text for an escape.
+///
+/// PowerShell's own encoder also escapes `\t` and `\n`. They are kept
+/// literal here because they reach the server unchanged, and escaping
+/// every newline would bloat a script and make it unreadable on the wire.
 #[must_use]
 pub fn escape(s: &str) -> String {
     escape_inner(s, false)
@@ -302,10 +308,10 @@ pub fn escape(s: &str) -> String {
 
 /// Escape a string for an XML **attribute value** (`N="…"`, `RefId="…"`).
 ///
-/// Same as [`escape`] plus `\t`, `\n` and `\r`, which a conforming XML
-/// parser replaces with a space during attribute-value normalisation
-/// (XML 1.0 §3.3.3). Emitting them literally would therefore silently
-/// turn a tab in a property name into a space on the way back.
+/// Same as [`escape`] plus `\t` and `\n`, which a conforming XML parser
+/// replaces with a space during attribute-value normalisation (XML 1.0
+/// §3.3.3), as it does `\r`. Emitting them literally would therefore
+/// silently turn a tab in a property name into a space on the way back.
 #[must_use]
 pub fn escape_attr(s: &str) -> String {
     escape_inner(s, true)
@@ -334,10 +340,13 @@ fn escape_inner(s: &str, attribute: bool) -> String {
             // covered because PowerShell decodes with
             // `XmlConvert.DecodeName`, which accepts `_X` too.
             '_' if matches!(bytes.get(i + 1), Some(b'x' | b'X')) => out.push_str("_x005F_"),
-            '\t' | '\n' | '\r' if attribute => {
+            // Tab and LF survive element text, not attribute values.
+            '\t' | '\n' if attribute => {
                 out.push_str(&format!("_x{:04X}_", c as u32));
             }
-            c if (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r' => {
+            // Every other control character, CR included: end-of-line
+            // normalisation turns a literal CR into LF even in text.
+            c if (c as u32) < 0x20 && c != '\t' && c != '\n' => {
                 out.push_str(&format!("_x{:04X}_", c as u32));
             }
             c => out.push(c),
@@ -730,7 +739,8 @@ mod tests {
 
     /// XML attribute-value normalisation turns a literal tab, CR or LF
     /// into a space, so those have to leave as `_xHHHH_` escapes when
-    /// they sit inside `N="…"` — but stay literal in element text.
+    /// they sit inside `N="…"` — but tab and LF stay literal in element
+    /// text (CR does not: see `carriage_return_in_text_is_escaped`).
     #[test]
     fn attribute_names_escape_whitespace_but_text_does_not() {
         use super::super::{PsObject, PsValue, parse_clixml, to_clixml};
@@ -743,6 +753,122 @@ mod tests {
 
         let decoded = parse_clixml(&xml).expect("decodes");
         assert_eq!(decoded[0], value);
+    }
+
+    /// Issue #17: PowerShell reads CLIXML with an `XmlReader`, which
+    /// applies XML end-of-line normalisation to element text (CRLF and a
+    /// lone CR both become LF), so a literal CR sent as `"a\r\nb"` arrived
+    /// as `"a\nb"`. CR leaves as `_x000D_`; tab and LF stay literal.
+    #[test]
+    fn carriage_return_in_text_is_escaped() {
+        use super::super::{PsValue, parse_clixml, to_clixml};
+
+        assert_eq!(escape("a\r\n\tb"), "a_x000D_\n\tb");
+        assert_eq!(escape_attr("a\r\n\tb"), "a_x000D__x000A__x0009_b");
+        for (text, xml) in [
+            ("a\rb", "<S>a_x000D_b</S>"),
+            ("a\r\nb", "<S>a_x000D_\nb</S>"),
+            ("\r", "<S>_x000D_</S>"),
+            ("\t\n", "<S>\t\n</S>"),
+        ] {
+            assert_eq!(to_clixml(&PsValue::String(text.into())), xml, "{text:?}");
+        }
+
+        // Exact round trip, `_x` neighbours included (the PR #15 invariant).
+        let mut failures = Vec::new();
+        for text in [
+            "a\rb",
+            "a\r\nb",
+            "\r",
+            "\r\r\n\n\r",
+            "line 1\r\nline 2\r\n",
+            "_x\r",
+            "_\r",
+            "\r_x",
+            "_x000D_",
+            "_x000D_\r",
+            "\r_x000D_",
+            "_x0041\r",
+            "__x000d\r_",
+        ] {
+            let value = PsValue::String(text.into());
+            let xml = to_clixml(&value);
+            if xml.contains('\r') {
+                failures.push(format!("{text:?}: literal CR in {xml:?}"));
+            }
+            let decoded = parse_clixml(&xml).expect("decodes");
+            if decoded[0] != value {
+                failures.push(format!(
+                    "{text:?} came back as {:?} via {xml:?}",
+                    decoded[0]
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Whitespace-only strings: tab, LF and space stay literal (XML keeps
+    /// them in text), CR is escaped, and each comes back exactly.
+    #[test]
+    fn whitespace_only_strings_round_trip() {
+        use super::super::{PsValue, parse_clixml, to_clixml};
+
+        for (text, xml) in [
+            ("\n", "<S>\n</S>"),
+            ("\t\n", "<S>\t\n</S>"),
+            ("  ", "<S>  </S>"),
+            ("\r\n", "<S>_x000D_\n</S>"),
+            (" \r ", "<S> _x000D_ </S>"),
+        ] {
+            let value = PsValue::String(text.into());
+            assert_eq!(to_clixml(&value), xml, "{text:?}");
+            assert_eq!(parse_clixml(xml).expect("decodes"), vec![value], "{text:?}");
+        }
+    }
+
+    /// Every writer of element text goes through `escape`, so none of them
+    /// leaves a CR for PowerShell's reader to turn into LF.
+    #[test]
+    fn no_text_writer_leaves_a_carriage_return() {
+        use super::super::{PsObject, PsValue, to_clixml};
+
+        let cr = "a\r\nb".to_string();
+        let mut obj = PsObject::new()
+            .with("S", PsValue::String(cr.clone()))
+            .with("D", PsValue::Decimal(cr.clone()))
+            .with("DT", PsValue::DateTime(cr.clone()))
+            .with("TS", PsValue::Duration(cr.clone()))
+            .with("Version", PsValue::Version(cr.clone()))
+            .with("URI", PsValue::Uri(cr.clone()))
+            .with("XD", PsValue::Xml(cr.clone()))
+            .with("SCT", PsValue::ScriptBlock(cr.clone()))
+            .with("SS", PsValue::SecureString(cr.clone()))
+            .with_type_names([cr.clone()]);
+        obj.to_string = Some(cr.clone());
+        let xml = to_clixml(&PsValue::Object(obj));
+        assert!(!xml.contains('\r'), "literal CR in {xml:?}");
+        // One escape per value: 9 properties, the type name, the ToString.
+        assert_eq!(xml.matches("a_x000D_\nb").count(), 11, "{xml:?}");
+
+        let cmd = PsValue::String(cr.clone());
+        let pipeline = build_create_pipeline_xml(
+            true,
+            false,
+            false,
+            &[PipelineCommandSpec {
+                name: &cr,
+                is_script: true,
+                merge_errors_to_output: false,
+                args: vec![
+                    PipelineArgSpec::Named {
+                        name: "Path",
+                        value: &cmd,
+                    },
+                    PipelineArgSpec::Positional(&cmd),
+                ],
+            }],
+        );
+        assert!(!pipeline.contains('\r'), "literal CR in {pipeline:?}");
     }
 
     #[test]

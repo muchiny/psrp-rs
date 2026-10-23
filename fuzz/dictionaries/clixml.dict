@@ -77,6 +77,9 @@
 "_x0000_"
 "_x000A_"
 "_x005F_"
+# the two halves of a UTF-16 surrogate pair (U+1F600)
+"_xD83D_"
+"_xDE00_"
 "&lt;"
 "&gt;"
 "&amp;"
