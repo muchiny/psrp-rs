@@ -151,7 +151,7 @@ doc = false
 bench = false
 
 # ---------------------------------------------------------------------
-# Layer 5 — small codecs and the SSH known_hosts matcher
+# Layer 5 — small codecs, the SSH known_hosts matcher and the OutOfProc lines
 # ---------------------------------------------------------------------
 
 [[bin]]
@@ -164,6 +164,13 @@ bench = false
 [[bin]]
 name = "known_hosts_match"
 path = "fuzz_targets/known_hosts_match.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "out_of_proc_lines"
+path = "fuzz_targets/out_of_proc_lines.rs"
 test = false
 doc = false
 bench = false

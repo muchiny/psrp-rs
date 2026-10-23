@@ -1,0 +1,3 @@
+__NamedPipeError__:The pipe was closed.
+   at Server.Run()
+   at Program.Main()

@@ -285,12 +285,12 @@ PSRP_INTEGRATION_PASS=vagrant \
 ## Fuzzing
 
 Everything this crate parses comes from the remote host, so the decoders are
-fuzzed continuously. Sixteen [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
+fuzzed continuously. Seventeen [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
 targets live under [`fuzz/fuzz_targets/`](fuzz/fuzz_targets/), covering the
 fragment reassembler, the PSRP message header, the CLIXML parser and encoder,
 the typed record decoders, the host-call dispatcher, the session-key crypto,
-the runspace state machine, the async pool driven over a mock transport, and
-the SSH `known_hosts` matcher.
+the runspace state machine, the async pool driven over a mock transport, the
+SSH `known_hosts` matcher and the SSH OutOfProc line codec.
 
 ```sh
 rustup toolchain install nightly

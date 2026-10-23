@@ -60,6 +60,7 @@ jobs:
           - message_decode
           - pool_receive
           - known_hosts_match
+          - out_of_proc_lines
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
@@ -98,6 +99,7 @@ jobs:
           - message_decode
           - message_roundtrip
           - metadata_decode
+          - out_of_proc_lines
           - pool_receive
           - psrp_stream
           - records_decode
