@@ -14,6 +14,12 @@ use crate::error::{MAX_SERVER_MESSAGE_CHARS, PsrpError, Result, escape_remote_te
 use crate::message::{MessageType, PsrpMessage};
 use crate::records::{ErrorRecord, FromPsObject};
 
+// `SecureString` handling depends on this value. PowerShell 7.6.7
+// encrypts `<SS>` with the session key only for a peer below 2.4; from 2.4
+// on it sends the plain base64 of the UTF-16LE bytes instead
+// (`utils/CryptoUtils.cs` ~l.908, 934, 1051, 1064). `crate::crypto` and
+// `RunspacePool::{encrypt,decrypt}_secure_string` are only correct at 2.3:
+// bumping this requires revisiting `SecureString` handling.
 /// Minimum PSRP protocol version we advertise (`2.3` — matches Windows
 /// PowerShell 5.1 and PowerShell 7+).
 pub const PROTOCOL_VERSION: &str = "2.3";
