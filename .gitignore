@@ -23,3 +23,7 @@ Thumbs.db
 # Static analysis / MCP tool scratch dirs
 .scannerwork/
 .serena/
+
+# Produced by CI for SonarQube Cloud (also by a local run of the same commands)
+/cobertura.xml
+/clippy-report.json
