@@ -1,8 +1,31 @@
 //! SSH transport for MS-PSRP.
 //!
 //! Gated behind the `ssh` Cargo feature. Connects to a remote host via
-//! SSH, opens the `powershell` subsystem, and ferries raw PSRP fragments
-//! over stdin/stdout — no WinRM, no SOAP, no base64.
+//! SSH, opens the `powershell` subsystem and speaks PowerShell's
+//! out-of-process protocol over it: the same one `pwsh -sshs` serves.
+//!
+//! # Wire protocol
+//!
+//! The protocol is line-based. Every PSRP fragment travels base64-encoded
+//! in a `<Data Stream='Default' PSGuid='…'>…</Data>` line, and the client
+//! waits for the server's `<DataAck/>` before sending the next line. A
+//! pipeline is opened with a `<Command/>` line and closed with `<Close/>`;
+//! `signal_stop` sends `<Signal/>`, which really stops the running
+//! pipeline. Raw PSRP fragments are never written to the channel.
+//!
+//! # Server requirements
+//!
+//! * PowerShell 7 or later on the server.
+//! * A subsystem line in `sshd_config`, whose path must hold no space:
+//!
+//!   ```text
+//!   Subsystem powershell /usr/bin/pwsh -sshs -NoLogo
+//!   ```
+//!
+//!   On Windows use the short (8.3) path, for example
+//!   `Subsystem powershell C:/PROGRA~1/POWERS~1/7/pwsh.exe -sshs -NoLogo`.
+//! * On a Linux host the login shell must write nothing to stdout (no
+//!   banner, no `echo` in a profile): any non-XML line there is rejected.
 //!
 //! # Host-key validation
 //!
@@ -38,6 +61,7 @@
 //! # }
 //! ```
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,10 +77,11 @@ use russh::keys::ssh_key::{
 };
 pub use secrecy::{ExposeSecret, SecretString};
 use sha1_hmac::Sha1;
-use tokio::sync::Mutex;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::error::{PsrpError, Result};
+use crate::out_of_proc::{OutOfProcTransport, Pipe};
 use crate::transport::PsrpTransport;
 
 /// Host-key validation policy for [`SshPsrpTransport`].
@@ -297,13 +322,76 @@ impl russh::client::Handler for ClientHandler {
 
 /// PSRP transport over an SSH subsystem channel.
 ///
-/// Fragments are written raw to the channel's stdin and read raw from
-/// its stdout. The `Reassembler` in the runspace pool handles
-/// arbitrary byte boundaries.
+/// Speaks PowerShell's out-of-process protocol (`pwsh -sshs`): PSRP
+/// fragments travel base64-encoded in `<Data>` lines, each request is
+/// acknowledged before the next is sent, and `signal_stop` stops the
+/// running pipeline. The server needs PowerShell 7 or later and a
+/// `Subsystem powershell <path without space>/pwsh -sshs -NoLogo` line in
+/// `sshd_config` (on Windows, a short 8.3 path); see the module
+/// documentation.
 pub struct SshPsrpTransport {
-    channel: Arc<Mutex<russh::Channel<russh::client::Msg>>>,
-    handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
+    inner: OutOfProcTransport<RusshPipe>,
+    handle: russh::client::Handle<ClientHandler>,
     closed: bool,
+}
+
+/// The stdin and stdout of the remote `pwsh`, as an SSH channel.
+struct RusshPipe {
+    read: russh::ChannelReadHalf,
+    write: russh::ChannelWriteHalf<russh::client::Msg>,
+    /// Stdout received before the subsystem reply.
+    pending: Vec<u8>,
+    exit_status: Option<u32>,
+}
+
+impl RusshPipe {
+    /// Ends the channel: `eof()` then `close()`, errors ignored. Never
+    /// writes data, so it is safe after a write was abandoned mid-line.
+    async fn shutdown(&self) {
+        let _ = self.write.eof().await;
+        let _ = self.write.close().await;
+    }
+}
+
+#[async_trait]
+impl Pipe for RusshPipe {
+    /// Plain `data()`: it may be dropped mid-way (the session then fails
+    /// closed and never writes again), and `shutdown` still works after.
+    async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.write
+            .data(bytes)
+            .await
+            .map_err(|e| PsrpError::protocol(format!("SSH send: {e}")))
+    }
+
+    /// Cancel-safe: the russh channel is mpsc-backed and a message is
+    /// handled without any `.await` once received.
+    async fn read(&mut self) -> Result<Vec<u8>> {
+        if !self.pending.is_empty() {
+            return Ok(std::mem::take(&mut self.pending));
+        }
+        loop {
+            match self.read.wait().await {
+                Some(ChannelMsg::Data { data }) if !data.is_empty() => return Ok(data.to_vec()),
+                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                    // stderr: log and skip
+                    let text = String::from_utf8_lossy(&data);
+                    debug!(stderr = %text, "SSH stderr");
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    self.exit_status = Some(exit_status);
+                }
+                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                    let mut msg = String::from("PowerShell closed the SSH channel");
+                    if let Some(status) = self.exit_status {
+                        let _ = write!(msg, " (exit status {status})");
+                    }
+                    return Err(PsrpError::protocol(msg));
+                }
+                Some(_) => {}
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for SshPsrpTransport {
@@ -376,7 +464,7 @@ impl SshPsrpTransport {
         debug!("SSH: authenticated");
 
         // Open channel + request subsystem
-        let channel = handle
+        let mut channel = handle
             .channel_open_session()
             .await
             .map_err(|e| PsrpError::protocol(format!("SSH channel open: {e}")))?;
@@ -385,11 +473,44 @@ impl SshPsrpTransport {
             .request_subsystem(true, &config.subsystem)
             .await
             .map_err(|e| PsrpError::protocol(format!("SSH subsystem request: {e}")))?;
+
+        // `request_subsystem` does not wait for the reply: it arrives as a
+        // message on the channel, possibly after the first stdout bytes.
+        let mut pending = Vec::new();
+        tokio::time::timeout(config.connect_timeout, async {
+            loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Success) => return Ok(()),
+                    Some(ChannelMsg::Failure) => {
+                        return Err(PsrpError::protocol(format!(
+                            "SSH server refused the '{}' subsystem",
+                            config.subsystem
+                        )));
+                    }
+                    Some(ChannelMsg::Data { data }) => pending.extend_from_slice(&data),
+                    Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                        return Err(PsrpError::protocol(
+                            "SSH channel closed before the subsystem started",
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| PsrpError::protocol("SSH subsystem request timed out"))??;
         debug!(subsystem = %config.subsystem, "SSH: subsystem opened");
 
+        let (read, write) = channel.split();
+        let pipe = RusshPipe {
+            read,
+            write,
+            pending,
+            exit_status: None,
+        };
         Ok(Self {
-            channel: Arc::new(Mutex::new(channel)),
-            handle: Arc::new(Mutex::new(handle)),
+            inner: OutOfProcTransport::new(pipe),
+            handle,
             closed: false,
         })
     }
@@ -398,48 +519,19 @@ impl SshPsrpTransport {
 #[async_trait]
 impl PsrpTransport for SshPsrpTransport {
     async fn send_fragment(&self, bytes: &[u8]) -> Result<()> {
-        let channel = self.channel.lock().await;
-        channel
-            .data(bytes)
-            .await
-            .map_err(|e| PsrpError::protocol(format!("SSH send: {e}")))?;
-        Ok(())
+        self.inner.send_fragment(bytes).await
+    }
+
+    async fn send_pipeline_fragment(&mut self, bytes: &[u8], pipeline_id: Uuid) -> Result<()> {
+        self.inner.send_pipeline_fragment(bytes, pipeline_id).await
     }
 
     async fn recv_chunk(&mut self) -> Result<Vec<u8>> {
-        let mut channel = self.channel.lock().await;
-        loop {
-            match channel.wait().await {
-                Some(ChannelMsg::Data { data }) => {
-                    let bytes = data.to_vec();
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    return Ok(bytes);
-                }
-                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                    // stderr — log and skip
-                    let text = String::from_utf8_lossy(&data);
-                    debug!(stderr = %text, "SSH stderr");
-                    continue;
-                }
-                Some(ChannelMsg::Eof) | None => {
-                    // Channel closed — return empty to signal EOF
-                    return Ok(Vec::new());
-                }
-                Some(_other) => {
-                    continue;
-                }
-            }
-        }
+        self.inner.recv_chunk().await
     }
 
     async fn signal_stop(&self) -> Result<()> {
-        // SSH doesn't have a direct Ctrl+C equivalent via the protocol.
-        // The best approximation is sending a SIGINT via the "signal"
-        // SSH request, but not all servers honor it. Log a warning.
-        warn!("signal_stop on SSH transport is a no-op; close the channel to abort");
-        Ok(())
+        self.inner.signal_stop().await
     }
 
     async fn close_shell(&mut self) -> Result<()> {
@@ -447,18 +539,25 @@ impl PsrpTransport for SshPsrpTransport {
             return Ok(());
         }
         self.closed = true;
-        {
-            let channel = self.channel.lock().await;
-            let _ = channel.eof().await;
-            let _ = channel.close().await;
-        }
-        let handle = self.handle.lock().await;
-        handle
+        let result = self.inner.close_session().await;
+        // Whatever the session close said, tear the channel and the SSH
+        // connection down; a disconnect error never masks `result`.
+        self.inner.pipe_mut().shutdown().await;
+        if let Err(e) = self
+            .handle
             .disconnect(russh::Disconnect::ByApplication, "psrp-rs close", "en")
             .await
-            .map_err(|e| PsrpError::protocol(format!("SSH disconnect: {e}")))?;
+        {
+            debug!(error = %e, "SSH disconnect failed");
+        }
         debug!("SSH: session closed");
-        Ok(())
+        result
+    }
+
+    async fn execute_pipeline(&mut self, fragment_bytes: &[u8], pipeline_id: Uuid) -> Result<()> {
+        self.inner
+            .execute_pipeline(fragment_bytes, pipeline_id)
+            .await
     }
 }
 
