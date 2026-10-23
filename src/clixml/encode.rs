@@ -807,6 +807,25 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// Whitespace-only strings: tab, LF and space stay literal (XML keeps
+    /// them in text), CR is escaped, and each comes back exactly.
+    #[test]
+    fn whitespace_only_strings_round_trip() {
+        use super::super::{PsValue, parse_clixml, to_clixml};
+
+        for (text, xml) in [
+            ("\n", "<S>\n</S>"),
+            ("\t\n", "<S>\t\n</S>"),
+            ("  ", "<S>  </S>"),
+            ("\r\n", "<S>_x000D_\n</S>"),
+            (" \r ", "<S> _x000D_ </S>"),
+        ] {
+            let value = PsValue::String(text.into());
+            assert_eq!(to_clixml(&value), xml, "{text:?}");
+            assert_eq!(parse_clixml(xml).expect("decodes"), vec![value], "{text:?}");
+        }
+    }
+
     /// Every writer of element text goes through `escape`, so none of them
     /// leaves a CR for PowerShell's reader to turn into LF.
     #[test]
