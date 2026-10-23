@@ -2,15 +2,16 @@
 //!
 //! PSRP §3.1.2: to transmit a `SecureString` between the client and
 //! server, the two sides negotiate a symmetric session key protected by
-//! RSA-OAEP(SHA-1).
+//! RSA (RSAES-PKCS1-v1_5).
 //!
 //! 1. The client generates a 2048-bit RSA keypair.
 //! 2. The client sends its public key to the server in a `PublicKey`
 //!    message (CLIXML body: a single `<S>` containing the key
 //!    serialized as the Windows `BLOBHEADER` + modulus + exponent).
 //! 3. The server generates a 256-bit AES session key, encrypts it with
-//!    the client's public key (RSA-OAEP/SHA-1), and sends the ciphertext
-//!    back in an `EncryptedSessionKey` message.
+//!    the client's public key (RSAES-PKCS1-v1_5), and sends it back in an
+//!    `EncryptedSessionKey` message. Both keys travel base64-encoded
+//!    (MS-PSRP 2.2.2.3 and 2.2.2.4).
 //! 4. Both sides use that AES key in CBC mode with PKCS#7 padding to
 //!    wrap every `<SS>` (SecureString) element. The IV is a fresh
 //!    random 16-byte value prefixed to the ciphertext.
@@ -27,11 +28,24 @@ use aes::cipher::Array;
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use rand::RngCore;
 use rsa::traits::PublicKeyParts;
-use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
-use sha1::Sha1;
+use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{PsrpError, Result};
+
+/// Header of the `SIMPLEBLOB` that carries the encrypted session key
+/// (MS-PSRP 2.2.2.4): `bType` 0x01, `bVersion` 0x02, two reserved bytes,
+/// `aiKeyAlg` `CALG_AES_256` (0x6610), then the key-exchange algorithm
+/// `CALG_RSA_KEYX` (0xA400), all little-endian.
+const SESSION_KEY_BLOB_HEADER: [u8; 12] = [
+    0x01, 0x02, 0x00, 0x00, 0x10, 0x66, 0x00, 0x00, 0x00, 0xA4, 0x00, 0x00,
+];
+
+/// The only error text for a failed RSA unwrap or a wrong-sized key.
+const SESSION_KEY_UNWRAP_FAILED: &str = "session key unwrap failed";
+
+/// Size of the RSA block that follows the header (2048-bit key).
+const SESSION_KEY_BLOCK_LEN: usize = 256;
 
 /// Client-side RSA key used for PSRP session-key negotiation.
 pub struct ClientSessionKey {
@@ -58,7 +72,11 @@ impl ClientSessionKey {
     /// Return the Windows `PUBLICKEYBLOB` representation of the public
     /// key that PSRP expects to transport via the `PublicKey` message.
     ///
-    /// Layout — 276 bytes total, hex-encoded to 552 characters:
+    /// The `PublicKey` message carries these bytes base64-encoded
+    /// (MS-PSRP 2.2.2.3); [`public_blob_base64`](Self::public_blob_base64)
+    /// returns that text.
+    ///
+    /// Layout — 276 bytes total:
     /// ```text
     /// BLOBHEADER (8 bytes):
     ///   bType    = 0x06    (PUBLICKEYBLOB)   1 byte
@@ -72,7 +90,7 @@ impl ClientSessionKey {
     /// modulus (256 bytes, little-endian)
     /// ```
     #[must_use]
-    pub fn public_blob_hex(&self) -> String {
+    pub fn public_blob(&self) -> Vec<u8> {
         let public = RsaPublicKey::from(&self.private);
         let mut blob = Vec::with_capacity(8 + 12 + 256);
         // BLOBHEADER
@@ -98,28 +116,67 @@ impl ClientSessionKey {
             modulus.resize(256, 0);
         }
         blob.extend_from_slice(&modulus);
+        blob
+    }
 
+    /// The `PUBLICKEYBLOB` of [`public_blob`](Self::public_blob), base64
+    /// encoded: the text MS-PSRP 2.2.2.3 puts in the `PublicKey` property
+    /// of the `PUBLIC_KEY` message.
+    #[must_use]
+    pub fn public_blob_base64(&self) -> String {
+        crate::clixml::encode::base64_encode(&self.public_blob())
+    }
+
+    /// The `PUBLICKEYBLOB` as upper-case hexadecimal.
+    ///
+    /// Servers reject this form: MS-PSRP 2.2.2.3 specifies base64 (a real
+    /// pwsh 7 answers `Invalid public key data.`).
+    #[deprecated(
+        since = "3.0.0",
+        note = "MS-PSRP sends the key as base64: use `public_blob_base64`"
+    )]
+    #[must_use]
+    pub fn public_blob_hex(&self) -> String {
+        use std::fmt::Write as _;
+        let blob = self.public_blob();
         let mut hex = String::with_capacity(blob.len() * 2);
         for b in &blob {
-            hex.push_str(&format!("{b:02X}"));
+            let _ = write!(hex, "{b:02X}");
         }
         hex
     }
 
-    /// Decrypt an RSA-OAEP/SHA-1 wrapped session key and return the raw
-    /// 32-byte AES key.
-    pub fn decrypt_session_key(&self, ciphertext: &[u8]) -> Result<[u8; 32]> {
-        let padding = Oaep::new::<Sha1>();
+    /// Unwrap the `SIMPLEBLOB` of an `ENCRYPTED_SESSION_KEY` message and
+    /// return the raw 32-byte AES key.
+    ///
+    /// `blob` is the base64-decoded property (MS-PSRP 2.2.2.4): the 12-byte
+    /// header, then the 256-bit AES key encrypted with the public key of
+    /// the `PUBLIC_KEY` message using RSAES-PKCS1-v1_5 (RFC 8017 7.2).
+    /// CryptoAPI writes that ciphertext little-endian, so it is reversed
+    /// before decryption.
+    pub fn decrypt_session_key(&self, blob: &[u8]) -> Result<[u8; 32]> {
+        let ciphertext = blob
+            .strip_prefix(&SESSION_KEY_BLOB_HEADER)
+            .ok_or_else(|| PsrpError::protocol("session key: bad SIMPLEBLOB header"))?;
+        if ciphertext.len() != SESSION_KEY_BLOCK_LEN {
+            return Err(PsrpError::protocol(format!(
+                "session key: expected {SESSION_KEY_BLOCK_LEN} encrypted bytes, got {}",
+                ciphertext.len()
+            )));
+        }
+        let mut big_endian = ciphertext.to_vec();
+        big_endian.reverse();
         let mut decrypted = self
             .private
-            .decrypt(padding, ciphertext)
-            .map_err(|e| PsrpError::protocol(format!("session key unwrap: {e}")))?;
+            .decrypt_blinded(&mut rand::thread_rng(), Pkcs1v15Encrypt, &big_endian)
+            // One fixed message for every post-RSA failure: a bad padding
+            // and a wrong plaintext length must not be told apart (the
+            // Bleichenbacher oracle), so neither the cause nor the length
+            // is reported.
+            .map_err(|_| PsrpError::protocol(SESSION_KEY_UNWRAP_FAILED))?;
         if decrypted.len() != 32 {
             decrypted.zeroize();
-            return Err(PsrpError::protocol(format!(
-                "session key: expected 32 bytes, got {}",
-                decrypted.len()
-            )));
+            return Err(PsrpError::protocol(SESSION_KEY_UNWRAP_FAILED));
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(&decrypted);
@@ -247,6 +304,37 @@ impl SessionKey {
     }
 }
 
+/// What a PSRP server does with a `PUBLIC_KEY` message, for the tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
+
+    use super::SESSION_KEY_BLOB_HEADER;
+
+    /// Wrap `key` for the client whose `PUBLICKEYBLOB` is `public_blob`, as
+    /// the server's `ENCRYPTED_SESSION_KEY` carries it (MS-PSRP 2.2.2.4):
+    /// the 12-byte `SIMPLEBLOB` header, then the RSAES-PKCS1-v1_5
+    /// ciphertext in CryptoAPI's little-endian order.
+    pub(crate) fn server_wrap_raw(public_blob: &[u8], key: &[u8]) -> Vec<u8> {
+        assert_eq!(public_blob.len(), 8 + 12 + 256, "not a PUBLICKEYBLOB");
+        let e = u32::from_le_bytes(public_blob[16..20].try_into().unwrap());
+        let n = BigUint::from_bytes_le(&public_blob[20..]);
+        let public = RsaPublicKey::new(n, BigUint::from(e)).unwrap();
+        let mut ct = public
+            .encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, key)
+            .unwrap();
+        ct.reverse();
+        let mut out = SESSION_KEY_BLOB_HEADER.to_vec();
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    /// [`server_wrap_raw`] for a 256-bit AES session key.
+    pub(crate) fn server_wrap_session_key(public_blob: &[u8], key: &[u8; 32]) -> Vec<u8> {
+        server_wrap_raw(public_blob, key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,10 +392,26 @@ mod tests {
     fn client_session_key_generates_blob() {
         // RSA keygen is slow (~500 ms on modest hardware). Keep to one test.
         let k = ClientSessionKey::generate().unwrap();
-        let blob = k.public_blob_hex();
-        // Header is always 24 bytes (48 hex chars), modulus is 256 bytes.
-        assert!(blob.len() >= 48);
-        assert!(blob.starts_with("06020000"));
+        let b64 = k.public_blob_base64();
+        // MS-PSRP 2.2.2.3: the PUBLICKEYBLOB travels as base64, never hex.
+        assert_eq!(b64, crate::clixml::encode::base64_encode(&k.public_blob()));
+        let blob = crate::clixml::encode::base64_decode(&b64).expect("valid base64");
+        assert_eq!(blob.len(), 8 + 12 + 256);
+        // BLOBHEADER, "RSA1", bitlen 2048 -- the bytes of the spec example
+        // (`BgIAAACkAABSU0ExAAgAAAEAAQ...`).
+        assert_eq!(
+            &blob[..20],
+            &[
+                0x06, 0x02, 0x00, 0x00, 0x00, 0xA4, 0x00, 0x00, b'R', b'S', b'A', b'1', 0x00, 0x08,
+                0x00, 0x00, 0x01, 0x00, 0x01, 0x00
+            ]
+        );
+        assert!(b64.starts_with("BgIAAACkAABSU0ExAAgAAAEAAQ"), "{b64}");
+        // The modulus is the key's own, little-endian.
+        let public = RsaPublicKey::from(&k.private);
+        let mut n = public.n().to_bytes_le();
+        n.resize(256, 0);
+        assert_eq!(&blob[20..], n.as_slice());
     }
 
     #[test]
@@ -331,28 +435,65 @@ mod tests {
 
     #[test]
     fn full_rsa_aes_roundtrip() {
-        // Local simulation: client generates key, "server" uses its
-        // public key to RSA-OAEP encrypt a random AES key, client
-        // decrypts, both encrypt/decrypt a SecureString.
+        // Local simulation of the server (MS-PSRP 2.2.2.4): it reads the
+        // client's PUBLICKEYBLOB, wraps a random AES key in a SIMPLEBLOB,
+        // and the client unwraps it.
         let client = ClientSessionKey::generate().unwrap();
         let aes = {
             let mut k = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut k);
             k
         };
-        // Encrypt with the client's public key.
-        let public = RsaPublicKey::from(&client.private);
-        let padding = Oaep::new::<Sha1>();
-        let wrapped = public
-            .encrypt(&mut rand::thread_rng(), padding, &aes)
-            .unwrap();
-        // Client decrypts.
-        let unwrapped = client.decrypt_session_key(&wrapped).unwrap();
+        let blob = test_support::server_wrap_session_key(&client.public_blob(), &aes);
+        assert_eq!(blob.len(), 12 + 256, "SIMPLEBLOB is header + RSA block");
+        let unwrapped = client.decrypt_session_key(&blob).unwrap();
         assert_eq!(unwrapped, aes);
         let sk = SessionKey::from_bytes(unwrapped);
         let ct = sk.encrypt_secure_string("s3cret");
         let pt = sk.decrypt_secure_string(&ct).unwrap();
         assert_eq!(pt, "s3cret");
+    }
+
+    #[test]
+    fn decrypt_session_key_rejects_malformed_simpleblob() {
+        let client = ClientSessionKey::generate().unwrap();
+        let aes = [0x5Au8; 32];
+        let good = test_support::server_wrap_session_key(&client.public_blob(), &aes);
+        assert_eq!(client.decrypt_session_key(&good).unwrap(), aes);
+
+        // Too short, empty, and a bare RSA block without the header.
+        assert!(client.decrypt_session_key(&[]).is_err());
+        assert!(client.decrypt_session_key(&good[..11]).is_err());
+        assert!(client.decrypt_session_key(&good[12..]).is_err());
+        // Truncated and over-long ciphertext.
+        assert!(client.decrypt_session_key(&good[..good.len() - 1]).is_err());
+        let mut long = good.clone();
+        long.push(0);
+        assert!(client.decrypt_session_key(&long).is_err());
+        // Each header byte is fixed by the spec table.
+        for i in 0..12 {
+            let mut bad = good.clone();
+            bad[i] ^= 0x01;
+            assert!(
+                client.decrypt_session_key(&bad).is_err(),
+                "header byte {i} not checked"
+            );
+        }
+        // Ciphertext in the wrong byte order does not unwrap.
+        let mut swapped = good.clone();
+        swapped[12..].reverse();
+        assert!(client.decrypt_session_key(&swapped).is_err());
+        // A key of the wrong size is refused even if the padding is valid.
+        let short = test_support::server_wrap_raw(&client.public_blob(), &[1u8; 16]);
+        let wrong_len = client.decrypt_session_key(&short).unwrap_err().to_string();
+        // A padding failure (wrong byte order) and a wrong plaintext length
+        // must be indistinguishable: no Bleichenbacher-style oracle.
+        let bad_padding = client
+            .decrypt_session_key(&swapped)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(wrong_len, bad_padding, "unwrap failures must be uniform");
+        assert!(!wrong_len.contains("16"), "length leaked: {wrong_len}");
     }
 
     #[test]

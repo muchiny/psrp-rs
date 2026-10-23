@@ -3,8 +3,8 @@
 //!
 //! Both halves take bytes the *server* produced:
 //!
-//! * `decrypt_session_key` unwraps the RSA-OAEP(SHA-1) blob carried by an
-//!   `EncryptedSessionKey` message;
+//! * `decrypt_session_key` unwraps the SIMPLEBLOB (header + RSAES-PKCS1-v1_5
+//!   block) carried by an `EncryptedSessionKey` message;
 //! * `decrypt_secure_string` parses an `IV || ciphertext` payload.
 //!
 //! Neither may panic, read out of bounds, or accept something it should
@@ -24,10 +24,19 @@ struct Input {
     /// A second key, to confirm cross-key decryption is not accidentally
     /// accepted as valid UTF-16.
     other_key: [u8; 32],
-    /// Server-supplied RSA-OAEP blob, unwrapped with the shared client
-    /// key below.
+    /// Server-supplied SIMPLEBLOB, unwrapped with the shared client key
+    /// below.
     wrapped_session_key: Vec<u8>,
+    /// Put a valid SIMPLEBLOB header and a 256-byte block around
+    /// `wrapped_session_key`, so the RSA unwrap itself is reached (random
+    /// bytes almost never carry the 12-byte header).
+    framed: bool,
 }
+
+/// MS-PSRP 2.2.2.4 `SIMPLEBLOB` header: `CALG_AES_256` wrapped by `CALG_RSA_KEYX`.
+const SIMPLEBLOB_HEADER: [u8; 12] = [
+    0x01, 0x02, 0x00, 0x00, 0x10, 0x66, 0x00, 0x00, 0x00, 0xA4, 0x00, 0x00,
+];
 
 /// One 2048-bit RSA key pair for the whole process.
 ///
@@ -77,9 +86,17 @@ fuzz_target!(init: { client_key(); }, |input: Input| {
     }
 
     // 4. Hostile `EncryptedSessionKey` blob. A forged one must never be
-    //    unwrapped into a usable key: OAEP should reject it, and even if
-    //    it did not, the length check must.
-    if let Ok(unwrapped) = client_key().decrypt_session_key(&input.wrapped_session_key) {
+    //    unwrapped into a usable key: the header or the PKCS#1 v1.5 padding
+    //    check should reject it, and even if they did not, the length
+    //    check must.
+    let blob = if input.framed {
+        let mut block = input.wrapped_session_key.clone();
+        block.resize(256, 0);
+        [SIMPLEBLOB_HEADER.as_slice(), &block].concat()
+    } else {
+        input.wrapped_session_key.clone()
+    };
+    if let Ok(unwrapped) = client_key().decrypt_session_key(&blob) {
         assert_eq!(
             unwrapped.len(),
             32,
@@ -88,13 +105,16 @@ fuzz_target!(init: { client_key(); }, |input: Input| {
     }
 
     // The public blob is what the server keys off; it must stay a
-    // well-formed Windows PUBLICKEYBLOB whatever else happened.
-    let blob = client_key().public_blob_hex();
-    // 8-byte BLOBHEADER + 12-byte RSAPUBKEY + 256-byte modulus, hex.
-    assert_eq!(blob.len(), (8 + 12 + 256) * 2, "PUBLICKEYBLOB wrong size");
-    assert!(
-        blob.bytes().all(|b| b.is_ascii_hexdigit()),
-        "PUBLICKEYBLOB is not hex"
+    // well-formed Windows PUBLICKEYBLOB whatever else happened, and its
+    // base64 form (MS-PSRP 2.2.2.3) must carry exactly those bytes.
+    let key = client_key();
+    let blob = key.public_blob();
+    // 8-byte BLOBHEADER + 12-byte RSAPUBKEY + 256-byte modulus.
+    assert_eq!(blob.len(), 8 + 12 + 256, "PUBLICKEYBLOB wrong size");
+    assert_eq!(&blob[..2], &[0x06, 0x02], "bad BLOBHEADER");
+    assert_eq!(
+        psrp_rs::internal::base64::decode(&key.public_blob_base64()),
+        Some(blob),
+        "PublicKey base64 does not carry the PUBLICKEYBLOB"
     );
-    assert!(blob.starts_with("0602"), "bad BLOBHEADER: {}", &blob[..8]);
 });
