@@ -68,10 +68,6 @@ version = "0.11.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.block-buffer]]
-version = "0.10.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.block-buffer]]
 version = "0.12.1"
 criteria = "safe-to-deploy"
 
@@ -149,10 +145,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.cpubits]]
 version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.cpufeatures]]
-version = "0.2.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.cpufeatures]]
@@ -793,10 +785,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.serdect]]
 version = "0.4.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.sha1]]
-version = "0.10.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.sha1]]
