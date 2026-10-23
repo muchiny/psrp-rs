@@ -54,6 +54,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   four, and at most two `=` close the text. A payload that PowerShell would
   refuse is an error instead of being silently truncated; PowerShell writes
   canonical base64, so nothing it sends changes.
+- **A `SecureString` answered to a host call is encrypted, never sent as
+  plaintext.** What a `PsHost` returns for `Read-Host -AsSecureString` or
+  `Get-Credential` crossed the wire as `<SS>plaintext</SS>`, which
+  PowerShell cannot decrypt, and the password travelled in clear at the PSRP
+  layer. The host still returns the plaintext; the pool now encrypts it with
+  the session key (AES-256-CBC, base64, as `encrypt_secure_string`). With no
+  key yet it starts the key exchange itself and sends the answer when the
+  key arrives, and it answers the server's `PublicKeyRequest` (MS-PSRP
+  3.1.4.8), which used to be ignored. The `EncryptedSessionKey` is now taken
+  by whichever call reads it, not only by `request_session_key`, so a key
+  that arrives while a pipeline runs is no longer lost. Not yet reachable
+  against PowerShell: psrp-rs declares a null host, so the server never makes
+  these calls (tracked separately).
 
 ## [3.1.0] — 2026-10-23
 
