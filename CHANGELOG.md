@@ -8,6 +8,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A `[char]` that is half of a surrogate pair no longer fails the whole
+  pipeline.** PowerShell sends a `[char]` as its UTF-16 unit, so
+  `"😀".ToCharArray()` is `<C>55357</C><C>56832</C>`; the decoder rejected a
+  surrogate and the error discarded everything collected so far. Each one is
+  now `PsValue::Char('\u{FFFD}')`. In the other direction a `PsValue::Char`
+  outside the Basic Multilingual Plane was written as `<C>128512</C>`, which
+  PowerShell refuses (the whole message fails); it is now written as
+  U+FFFD. A `<C>` above 65535, which only older psrp-rs wrote, is still read
+  as that character. `PsValue::Char` keeps its type; use a string to carry
+  text.
 - **`RunspacePool::request_session_key` no longer waits forever when the
   server breaks the pool.** The exchange skipped every message except
   `EncryptedSessionKey`, including a `RunspacePoolState` saying `Broken` or

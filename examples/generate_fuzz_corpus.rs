@@ -162,6 +162,12 @@ fn clixml_seeds() -> Vec<(&'static str, String)> {
             )
             .into(),
         ),
+        // `"😀".ToCharArray()`: a `[char]` is one UTF-16 unit, so an emoji is
+        // two `<C>` of surrogates, which must not fail the document.
+        (
+            "char_surrogates.xml",
+            "<C>55357</C><C>56832</C><C>65535</C><C>65536</C><I32>1</I32>".into(),
+        ),
         ("bom.xml", "\u{feff}<S>bom</S>".into()),
         ("empty_string.xml", "<S></S><S/>".into()),
     ]
