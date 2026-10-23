@@ -309,6 +309,11 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// 2048-bit RSA public key and blocks until the server responds
     /// with an `EncryptedSessionKey` — the 256-bit AES key wrapped in
     /// RSAES-PKCS1-v1_5, base64-encoded.
+    ///
+    /// A server that rejects the key breaks or closes the pool instead:
+    /// the call then fails with the server's reason, when it gives one.
+    /// No timeout applies, so a server that never answers keeps the call
+    /// waiting.
     pub async fn request_session_key(&mut self) -> Result<()> {
         if self.session_key.is_some() {
             return Ok(());
@@ -331,7 +336,16 @@ impl<T: PsrpTransport> RunspacePool<T> {
         )));
         self.send_psrp_message(MessageType::PublicKey, body).await?;
 
-        // Drain until we get the EncryptedSessionKey.
+        // Drain until we get the EncryptedSessionKey. Every other message
+        // goes to the state machine, as in `drain_until_opened`: a server
+        // that rejects the key breaks or closes the pool instead of
+        // answering, and the machine turns that state into an error
+        // carrying the server's reason. Host calls are answered by
+        // `next_message` itself.
+        //
+        // No timeout bounds this wait: `WinrmPsrpTransport::recv_chunk` is
+        // not cancel-safe (dropping it mid-Receive loses the bytes that
+        // Receive returned), so timing out could corrupt the pool.
         loop {
             let msg = self.next_message().await?;
             if msg.message_type == MessageType::EncryptedSessionKey {
@@ -357,6 +371,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
                 self.session_key = Some(crate::crypto::SessionKey::from_bytes(raw));
                 return Ok(());
             }
+            self.machine.on_message(&msg)?;
         }
     }
 
@@ -1172,6 +1187,136 @@ mod tests {
         let err = pool.exchange_session_key(&key).await.unwrap_err();
         assert!(err.to_string().contains("base64"), "{err}");
         assert!(pool.session_key().is_none());
+        let _ = pool.close().await;
+    }
+
+    /// A `RunspacePoolState` message carrying the server's error as its
+    /// `ExceptionAsErrorRecord` (MS-PSRP 2.2.2.9).
+    fn terminal_state_reply(state: RunspacePoolState, message: &str) -> Vec<u8> {
+        let exception = PsObject::new()
+            .with("Message", PsValue::String(message.into()))
+            .with_type_names(["System.Security.Cryptography.CryptographicException"]);
+        let record = PsObject::new()
+            .with("Exception", PsValue::Object(exception))
+            .with(
+                "FullyQualifiedErrorId",
+                PsValue::String("ServerKeyExchangeFailed".into()),
+            )
+            .with_type_names(["System.Management.Automation.ErrorRecord"]);
+        let body = to_clixml(&PsValue::Object(
+            PsObject::new()
+                .with("RunspaceState", PsValue::I32(state as i32))
+                .with("ExceptionAsErrorRecord", PsValue::Object(record)),
+        ));
+        wire(
+            9,
+            &PsrpMessage {
+                destination: Destination::Client,
+                message_type: MessageType::RunspacePoolState,
+                rpid: Uuid::nil(),
+                pid: Uuid::nil(),
+                data: body,
+            }
+            .encode(),
+        )
+    }
+
+    /// An unrelated message the exchange must not consume after a terminal
+    /// state: it shows the wait ended as soon as the pool died.
+    fn trailing_message() -> Vec<u8> {
+        wire(
+            10,
+            &PsrpMessage {
+                destination: Destination::Client,
+                message_type: MessageType::ApplicationPrivateData,
+                rpid: Uuid::nil(),
+                pid: Uuid::nil(),
+                data: "<Obj RefId=\"0\"><MS/></Obj>".into(),
+            }
+            .encode(),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_key_exchange_reports_a_broken_pool() {
+        // Issue #22: a server that rejects the public key breaks the pool
+        // instead of answering with EncryptedSessionKey. The exchange used
+        // to drop that message and wait for a key that never came.
+        let (t, mut pool, key) = pool_for_key_exchange().await;
+        t.push_incoming(terminal_state_reply(
+            RunspacePoolState::Broken,
+            "Invalid public key data.",
+        ));
+        t.push_incoming(trailing_message());
+
+        let err = pool.exchange_session_key(&key).await.unwrap_err();
+
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("Broken"), "{text}");
+        assert!(text.contains("Invalid public key data."), "{text}");
+        assert_eq!(pool.state(), RunspacePoolState::Broken);
+        assert!(pool.session_key().is_none());
+        assert_eq!(t.inbox.lock().unwrap().len(), 1, "read past the state");
+        let _ = pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn session_key_exchange_reports_a_closed_pool() {
+        let (t, mut pool, key) = pool_for_key_exchange().await;
+        t.push_incoming(wire(9, &state_message_bytes(RunspacePoolState::Closed)));
+        t.push_incoming(trailing_message());
+
+        let err = pool.exchange_session_key(&key).await.unwrap_err();
+
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        assert!(err.to_string().contains("Closed"), "{err}");
+        assert_eq!(pool.state(), RunspacePoolState::Closed);
+        assert!(pool.session_key().is_none());
+        assert_eq!(t.inbox.lock().unwrap().len(), 1, "read past the state");
+        let _ = pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn session_key_exchange_skips_other_messages_and_answers_host_calls() {
+        // While waiting for the key, a non-terminal state message and
+        // informational messages are passed over, and a host call is
+        // answered, as on every other receive path.
+        let (t, mut pool, key) = pool_for_key_exchange().await;
+        t.push_incoming(wire(7, &state_message_bytes(RunspacePoolState::Opened)));
+        t.push_incoming(trailing_message());
+        t.push_incoming(wire(
+            8,
+            &host_call_bytes(
+                7,
+                crate::host::HostMethodId::ReadLine.to_i64(),
+                PsValue::List(Vec::new()),
+            ),
+        ));
+        let wrapped =
+            crate::crypto::test_support::server_wrap_session_key(&key.public_blob(), &[3; 32]);
+        t.push_incoming(encrypted_session_key_reply(
+            &crate::clixml::encode::base64_encode(&wrapped),
+        ));
+        let sent_before = t.sent().len();
+
+        pool.exchange_session_key(&key).await.unwrap();
+
+        assert!(pool.session_key().is_some());
+        assert_eq!(pool.state(), RunspacePoolState::Opened);
+        // PublicKey + the host response to ReadLine.
+        let sent = t.sent();
+        assert_eq!(sent.len(), sent_before + 2);
+        let mut reassembler = Reassembler::new();
+        let payload = reassembler
+            .feed(sent.last().expect("a message was sent"))
+            .unwrap()
+            .pop()
+            .expect("one complete message");
+        assert_eq!(
+            PsrpMessage::decode(&payload).unwrap().message_type,
+            MessageType::RunspacePoolHostResponse
+        );
         let _ = pool.close().await;
     }
 
