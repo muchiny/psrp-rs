@@ -27,6 +27,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Cancelling a pipeline over WinRM no longer loses the server's reply.** A
+  WS-Man Receive is a long poll, and dropping it (which `run_with_cancel`
+  does when the token fires) closes the connection and discards whatever
+  the server had produced for it. `WinrmPsrpTransport` now keeps the Receive
+  in flight and resumes it on the next read, so a cancelled `recv_chunk`
+  loses nothing (it also makes a `tokio::time::timeout` around a read safe on
+  this transport). Once the stop signal has been accepted, the server
+  deletes the command and answers the Receive with `InvalidSelectors`
+  instead of a final `Stopped`; that is now read as the end of the stop, and
+  `run_with_cancel` returns `Cancelled` with the pool usable, instead of a
+  SOAP error. Needs `winrm-rs` 1.4.1 for the stop signal itself, which
+  addressed a PSRP shell with the `cmd` `ResourceURI` and code (#35).
 - **The value of a .NET enum is no longer dropped.** PowerShell writes an
   enum as an `<Obj>` with its type names, a `<ToString>` and the number as
   a nameless child (`<I32>1</I32>`); the decoder skipped that child, so every
