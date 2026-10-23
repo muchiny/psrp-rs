@@ -182,6 +182,17 @@ const PID: [u8; 16] = [
 ];
 
 fn main() -> std::io::Result<()> {
+    // Start from an empty tree: the generator is the only source of the
+    // seeds, so one it no longer writes must not linger (CI compares the
+    // result with what is committed).
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fuzz")
+        .join("seeds");
+    match fs::remove_dir_all(&root) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+
     // ----- clixml_decoder / records_decode / metadata_decode ----------
     // All three take raw UTF-8 CLIXML, so they share a corpus.
     for (name, body) in clixml_seeds() {

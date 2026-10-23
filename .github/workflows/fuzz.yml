@@ -38,8 +38,17 @@ jobs:
       # The seed corpus is generated from the crate's own encoders, so a
       # wire-format change must regenerate it.
       - run: cargo run --example generate_fuzz_corpus
-      - run: git diff --exit-code fuzz/seeds
-        name: seeds are up to date
+      # `git diff` ignores untracked files and the generator starts from an
+      # empty `fuzz/seeds`, so `git status` is what sees a seed that was
+      # added, changed or removed.
+      - name: seeds are up to date
+        run: |
+          if [ -n "$(git status --porcelain --untracked-files=all -- fuzz/seeds)" ]; then
+            git status --short --untracked-files=all -- fuzz/seeds
+            git --no-pager diff --stat -- fuzz/seeds
+            echo "::error::fuzz/seeds differs from the generator output (run: cargo run --example generate_fuzz_corpus, commit the result)"
+            exit 1
+          fi
 
   smoke:
     # Short run on every pull request: catches a target broken by the
