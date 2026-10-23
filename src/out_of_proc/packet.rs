@@ -838,7 +838,7 @@ mod tests {
             format!("<Data Foo='Default' Bar='{G}'>AA==</Data>"),
             format!("<Data Foo='{G}' Bar='Default'>AA==</Data>"),
             format!("<Data PSGuid='{G}' Foo='Default'>AA==</Data>"),
-            format!("<Data Foo='Default' Stream='Default'>AA==</Data>"),
+            "<Data Foo='Default' Stream='Default'>AA==</Data>".to_owned(),
         ] {
             let err = parse_line(&line).unwrap_err().to_string();
             assert!(
