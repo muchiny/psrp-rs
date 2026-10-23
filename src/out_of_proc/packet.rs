@@ -5,7 +5,10 @@
 //! lines. No I/O happens here.
 
 use crate::clixml::encode::{base64_decode, base64_encode};
-use crate::error::{PsrpError, Result};
+pub(crate) use crate::error::escape_remote_text;
+#[cfg(test)]
+use crate::error::rewrites_output;
+use crate::error::{MAX_SERVER_MESSAGE_CHARS, PsrpError, Result};
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -23,9 +26,6 @@ pub(crate) const SERVER_ERROR_PREFIX: &str = "__NamedPipeError__:";
 
 /// How much of an offending line an error message quotes, in characters.
 const QUOTED_LINE_CHARS: usize = 80;
-
-/// How much of a `__NamedPipeError__:` message an error message quotes, in characters.
-const QUOTED_SERVER_ERROR_CHARS: usize = 1024;
 
 /// The `Stream` attribute of a `<Data>` element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +116,7 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<Packet>> {
         let message = line.get(SERVER_ERROR_PREFIX.len()..).unwrap_or_default();
         return Err(PsrpError::protocol(format!(
             "PowerShell reported a protocol error: {}",
-            escape_remote_text(message, QUOTED_SERVER_ERROR_CHARS)
+            escape_remote_text(message, MAX_SERVER_MESSAGE_CHARS)
         )));
     }
     parse_element(line.trim()).map(Some).map_err(|why| {
@@ -137,44 +137,6 @@ fn snippet(text: &str) -> String {
         out.push('…');
     }
     out
-}
-
-/// The first `max_chars` characters of `text`, with the characters that
-/// could rewrite a terminal or a log line escaped as by `escape_debug`:
-/// controls (C0, DEL, C1: ESC, BEL, a lone CR...), line and paragraph
-/// separators, and the invisible format characters among them the bidi
-/// embeddings, overrides and isolates. Printable text, quotes and
-/// backslashes are kept as they are, so a message stays readable.
-pub(crate) fn escape_remote_text(text: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for c in text.chars().take(max_chars) {
-        if rewrites_output(c) {
-            out.extend(c.escape_debug());
-        } else {
-            out.push(c);
-        }
-    }
-    if text.chars().nth(max_chars).is_some() {
-        out.push('…');
-    }
-    out
-}
-
-/// Whether `c` can move the cursor, ring, reorder or hide text once printed.
-fn rewrites_output(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00AD}' // soft hyphen
-            | '\u{061C}' // Arabic letter mark (bidi)
-            | '\u{180E}' // Mongolian vowel separator
-            | '\u{200B}'..='\u{200F}' // zero-width characters, LRM, RLM
-            | '\u{2028}'..='\u{202E}' // line and paragraph separators, bidi embeddings, overrides
-            | '\u{2060}'..='\u{206F}' // word joiner, invisible operators, bidi isolates
-            | '\u{FEFF}' // zero-width no-break space
-            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
-            | '\u{E0000}'..='\u{E007F}' // tags
-        )
 }
 
 fn quote(line: &str) -> String {

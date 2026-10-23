@@ -10,7 +10,7 @@
 use uuid::Uuid;
 
 use crate::clixml::{PsObject, PsValue, parse_clixml, to_clixml};
-use crate::error::{PsrpError, Result};
+use crate::error::{MAX_SERVER_MESSAGE_CHARS, PsrpError, Result, escape_remote_text};
 use crate::message::{MessageType, PsrpMessage};
 use crate::records::{ErrorRecord, FromPsObject};
 
@@ -198,8 +198,9 @@ impl RunspacePoolStateMachine {
     ///
     /// Returns `Ok(())` on a valid transition. Unknown message types are
     /// silently ignored. A `RunspacePoolState=Broken/Closed` is reported as
-    /// a protocol error, which ends with the server's reason when the
-    /// message carries an `ExceptionAsErrorRecord`.
+    /// a protocol error. When the message carries an
+    /// `ExceptionAsErrorRecord` and that record has an exception message,
+    /// the error ends with it, escaped and truncated to 1024 characters.
     /// Server-driven transitions that violate the MS-PSRP §2.2.3.4
     /// lifecycle are rejected with `PsrpError::Protocol` so a malicious
     /// or buggy server cannot push the client into an arbitrary state.
@@ -386,16 +387,20 @@ pub(crate) fn extract_runspace_state(xml: &str) -> Result<RunspacePoolState> {
 ///
 /// MS-PSRP 2.2.2.9 lets a `RUNSPACEPOOL_STATE` message carry the error
 /// that ended the pool as an `ExceptionAsErrorRecord` property; the reason
-/// is the message of that record's exception.
+/// is the message of that record's exception. The server writes it, so it
+/// is trimmed, escaped and bounded like any server text quoted in an
+/// error, and a blank one counts as none.
 fn terminal_state_reason(xml: &str) -> Option<String> {
-    parse_clixml(xml).ok()?.into_iter().find_map(|value| {
+    let message = parse_clixml(xml).ok()?.into_iter().find_map(|value| {
         let PsValue::Object(obj) = value else {
             return None;
         };
         ErrorRecord::from_ps_object(obj.get("ExceptionAsErrorRecord")?)?
             .exception?
             .message
-    })
+    })?;
+    let message = message.trim();
+    (!message.is_empty()).then(|| escape_remote_text(message, MAX_SERVER_MESSAGE_CHARS))
 }
 
 #[cfg(test)]
@@ -519,6 +524,57 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "PSRP protocol: runspace pool entered terminal state Closed"
+        );
+    }
+
+    /// The error a `Broken` state whose record's exception says `message`
+    /// produces.
+    fn broken_with_reason(message: &str) -> String {
+        let exception = PsObject::new().with("Message", PsValue::String(message.into()));
+        let record = PsObject::new().with("Exception", PsValue::Object(exception));
+        let mut m = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+        m.open();
+        m.on_message(&state_msg_with_record(RunspacePoolState::Broken, record))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn on_message_terminal_state_escapes_the_server_reason() {
+        // The reason is server-controlled: whatever could rewrite a
+        // terminal or a log line is escaped, readable text is kept.
+        assert_eq!(
+            broken_with_reason("bad\u{1b}[2J key\r\nforged \u{202e}txt \"quoted\" \\ é"),
+            "PSRP protocol: runspace pool entered terminal state Broken: \
+             bad\\u{1b}[2J key\\r\\nforged \\u{202e}txt \"quoted\" \\ é"
+        );
+    }
+
+    #[test]
+    fn on_message_terminal_state_truncates_the_server_reason() {
+        let err = broken_with_reason(&"m".repeat(5000));
+        let reason = err
+            .strip_prefix("PSRP protocol: runspace pool entered terminal state Broken: ")
+            .expect("a reason");
+        // 1024 characters, then an ellipsis.
+        let kept = reason.strip_suffix('…').expect("an ellipsis");
+        assert_eq!(kept.len(), 1024);
+        assert!(kept.bytes().all(|b| b == b'm'));
+    }
+
+    #[test]
+    fn on_message_terminal_state_drops_a_blank_server_reason() {
+        for blank in ["", "   ", "\r\n\t"] {
+            assert_eq!(
+                broken_with_reason(blank),
+                "PSRP protocol: runspace pool entered terminal state Broken",
+                "{blank:?}"
+            );
+        }
+        // Surrounding whitespace is not part of the reason.
+        assert_eq!(
+            broken_with_reason("  Invalid public key data.\r\n"),
+            "PSRP protocol: runspace pool entered terminal state Broken: Invalid public key data."
         );
     }
 
