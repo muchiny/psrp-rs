@@ -56,6 +56,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   encrypt a `PsValue::SecureString` by itself, and the SecureStrings that a
   `PsHost` answers to `Read-Host -AsSecureString` and `Get-Credential` still
   travel in clear (tracked in #36).
+- **A repeated object is no longer lost from a list or a dictionary.**
+  PowerShell writes the second occurrence of an object in one graph
+  (`@($o, $o)`, `@{a=$o; b=$o}`) as a self-closed `<Ref RefId="…" />`. The
+  decoder dropped it from a list, so the items after it moved up, and read
+  it as `Null` in a dictionary. It is now resolved wherever it appears (list
+  item, dictionary key or value, property, top level). The copies a document
+  may make are bounded: a server could chain objects that each hold two
+  references to the previous one, and ~1 KiB of XML expanded to 2^n values
+  and aborted the process out of memory (properties already took that path);
+  that, or a reference that would nest deeper than `MAX_NESTING_DEPTH`, is
+  now a parse error.
 
 ## [3.0.0] — 2026-10-23
 
