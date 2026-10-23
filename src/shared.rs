@@ -308,7 +308,7 @@ mod tests {
         // fail to decrypt (random bytes) — the error path still
         // covers the code.
         let (t, shared, _rpid) = opened_shared().await;
-        // Seed a fake EncryptedSessionKey with garbage hex — decryption
+        // Seed a fake EncryptedSessionKey with garbage — decryption
         // will fail but the delegation + parse paths run.
         t.push_incoming(encode_message(
             9,

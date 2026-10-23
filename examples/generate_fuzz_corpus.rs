@@ -34,6 +34,25 @@ fn write(target: &str, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Standard-alphabet base64, as the OutOfProc `<Data>` element carries it.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for group in bytes.chunks(3) {
+        let n = group
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..=group.len() {
+            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 0x3F) as usize]));
+        }
+        for _ in group.len()..3 {
+            out.push('=');
+        }
+    }
+    out
+}
+
 /// A client-bound PSRP message, already fragment-framed.
 fn framed(object_id: u64, mt: MessageType, body: &str) -> Vec<u8> {
     let msg = PsrpMessage {
@@ -285,6 +304,47 @@ fn main() -> std::io::Result<()> {
     ] {
         write("known_hosts_match", name, text.as_bytes())?;
     }
+
+    // ----- out_of_proc_lines -----------------------------------------
+    // First byte = chunk size, the rest is the server's stdout.
+    let opened = framed(1, MessageType::RunspacePoolState, RUNSPACE_STATE_OPENED);
+    let nil = "00000000-0000-0000-0000-000000000000";
+    let pid = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
+    let output = framed(1, MessageType::PipelineOutput, "<I32>7</I32>");
+    let transcript = format!(
+        "<Data Stream='Default' PSGuid='{nil}'>{}</Data>\r\n\
+         <DataAck PSGuid='{nil}' />\r\n\
+         <CommandAck PSGuid='{pid}' />\r\n\
+         <DataAck PSGuid='{pid}' />\r\n\
+         <Data Stream='Default' PSGuid='{pid}'>{}</Data>\r\n\
+         <CloseAck PSGuid='{pid}' />\r\n\
+         <CloseAck PSGuid='{nil}' />\r\n",
+        base64_encode(&opened),
+        base64_encode(&output),
+    );
+    let with_chunk = |chunk: u8, text: &str| {
+        let mut bytes = vec![chunk];
+        bytes.extend_from_slice(text.as_bytes());
+        bytes
+    };
+    write(
+        "out_of_proc_lines",
+        "transcript.bin",
+        &with_chunk(16, &transcript),
+    )?;
+    write(
+        "out_of_proc_lines",
+        "error.bin",
+        &with_chunk(
+            7,
+            "__NamedPipeError__:The pipe was closed.\r\n   at Server.Run()\r\n   at Program.Main()\r\n",
+        ),
+    )?;
+    write(
+        "out_of_proc_lines",
+        "bom.bin",
+        &with_chunk(3, &format!("\u{FEFF}<CloseAck PSGuid='{nil}' />\n")),
+    )?;
 
     println!("\nSeeds written. `fuzz/run.sh` copies them into fuzz/corpus/ before fuzzing.");
     Ok(())

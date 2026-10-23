@@ -279,59 +279,56 @@ async fn live_pool_survives_multiple_pipelines() {
 
 // ---- SSH transport tests ----
 
+/// Build the SSH config from `PSRP_INTEGRATION_SSH_{HOST,PORT,USER,PASS}`.
+/// `None` when no host is configured, so the tests are no-ops by default.
 #[cfg(feature = "ssh")]
-#[tokio::test]
-#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
-async fn live_ssh_one_plus_one() {
-    let host = match std::env::var("PSRP_INTEGRATION_SSH_HOST") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
+async fn ssh_config() -> Option<psrp_rs::SshConfig> {
+    let host = std::env::var("PSRP_INTEGRATION_SSH_HOST").ok()?;
     let user = std::env::var("PSRP_INTEGRATION_SSH_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("PSRP_INTEGRATION_SSH_PASS").unwrap_or_else(|_| "vagrant".into());
     let port: u16 = std::env::var("PSRP_INTEGRATION_SSH_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(22);
-
-    let transport = psrp_rs::SshPsrpTransport::connect(
+    Some(
         psrp_rs::SshConfig::new(host, user, psrp_rs::SshAuth::Password(pass.into()))
             .with_port(port),
     )
-    .await
-    .expect("SSH connect");
+}
 
-    let mut pool = psrp_rs::RunspacePool::open_with_transport(transport)
+/// Connect over SSH and open a runspace pool, or `None` when unconfigured.
+#[cfg(feature = "ssh")]
+async fn ssh_pool() -> Option<RunspacePool<psrp_rs::SshPsrpTransport>> {
+    let config = ssh_config().await?;
+    let transport = psrp_rs::SshPsrpTransport::connect(config)
         .await
-        .expect("open pool over SSH");
+        .expect("SSH connect");
+    Some(
+        RunspacePool::open_with_transport(transport)
+            .await
+            .expect("open pool over SSH"),
+    )
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_one_plus_one() {
+    let Some(mut pool) = ssh_pool().await else {
+        return;
+    };
     let out = pool.run_script("1 + 1").await.expect("run_script");
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].as_i32(), Some(2));
-    let _ = pool.close().await;
+    assert_eq!(out, vec![PsValue::I32(2)]);
+    pool.close().await.expect("close");
 }
 
 #[cfg(feature = "ssh")]
 #[tokio::test]
 #[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
 async fn live_ssh_multiple_scripts() {
-    let host = match std::env::var("PSRP_INTEGRATION_SSH_HOST") {
-        Ok(h) => h,
-        Err(_) => return,
+    let Some(mut pool) = ssh_pool().await else {
+        return;
     };
-    let user = std::env::var("PSRP_INTEGRATION_SSH_USER").unwrap_or_else(|_| "vagrant".into());
-    let pass = std::env::var("PSRP_INTEGRATION_SSH_PASS").unwrap_or_else(|_| "vagrant".into());
-
-    let transport = psrp_rs::SshPsrpTransport::connect(psrp_rs::SshConfig::new(
-        host,
-        user,
-        psrp_rs::SshAuth::Password(pass.into()),
-    ))
-    .await
-    .expect("SSH connect");
-
-    let mut pool = psrp_rs::RunspacePool::open_with_transport(transport)
-        .await
-        .expect("open pool over SSH");
     for i in 1..=3i32 {
         let out = pool
             .run_script(&format!("{i} * 10"))
@@ -339,5 +336,151 @@ async fn live_ssh_multiple_scripts() {
             .expect("run_script");
         assert_eq!(out, vec![PsValue::I32(i * 10)]);
     }
-    let _ = pool.close().await;
+    pool.close().await.expect("close");
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_large_output() {
+    let Some(mut pool) = ssh_pool().await else {
+        return;
+    };
+    let out = pool.run_script("'x' * 200000").await.expect("run_script");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].as_str().map(str::len), Some(200_000));
+    pool.close().await.expect("close");
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_large_script() {
+    let Some(mut pool) = ssh_pool().await else {
+        return;
+    };
+    let script = format!("$a = '{}'; $a.Length", "y".repeat(100_000));
+    let out = pool.run_script(&script).await.expect("run_script");
+    assert_eq!(out, vec![PsValue::I32(100_000)]);
+    pool.close().await.expect("close");
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_pipeline_input() {
+    let Some(mut pool) = ssh_pool().await else {
+        return;
+    };
+    let mut handle = Pipeline::new("$input | ForEach-Object { $_ * 2 }")
+        .with_input(true)
+        .start(&mut pool)
+        .await
+        .expect("start");
+    for i in 1..=3i32 {
+        handle
+            .write_input(PsValue::I32(i))
+            .await
+            .expect("write_input");
+    }
+    handle.end_input().await.expect("end_input");
+    let result = handle.collect().await.expect("collect");
+    assert_eq!(
+        result.output,
+        vec![PsValue::I32(2), PsValue::I32(4), PsValue::I32(6)]
+    );
+    pool.close().await.expect("close");
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_cancel_then_reuse() {
+    let Some(mut pool) = ssh_pool().await else {
+        return;
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+    let canceller = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        canceller.cancel();
+    });
+    let started = std::time::Instant::now();
+    let res = Pipeline::new("Start-Sleep -Seconds 60")
+        .run_with_cancel(&mut pool, token)
+        .await;
+    let elapsed = started.elapsed();
+    eprintln!("cancel took {elapsed:?}");
+    assert!(
+        matches!(res, Err(psrp_rs::PsrpError::Cancelled)),
+        "expected Cancelled, got {res:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "cancel took {elapsed:?}"
+    );
+
+    let out = pool.run_script("7").await.expect("pool reusable");
+    assert_eq!(out, vec![PsValue::I32(7)]);
+    pool.close().await.expect("close");
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_command_metadata() {
+    let Some(mut pool) = ssh_pool().await else {
+        return;
+    };
+    let meta = pool
+        .get_command_metadata(&["Get-Date"], psrp_rs::CommandType::CMDLET)
+        .await
+        .expect("get_command_metadata");
+    // `any` below also proves the list is non-empty.
+    assert!(
+        meta.iter().any(|m| m.name == "Get-Date"),
+        "Get-Date not in non-empty metadata list: {meta:?}"
+    );
+    pool.close().await.expect("close");
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_session_key() {
+    let Some(mut pool) = ssh_pool().await else {
+        return;
+    };
+    pool.request_session_key().await.expect("session key");
+    pool.close().await.expect("close");
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_refused_subsystem() {
+    let Some(config) = ssh_config().await else {
+        return;
+    };
+    let err =
+        psrp_rs::SshPsrpTransport::connect(config.with_subsystem("psrp-rs-no-such-subsystem"))
+            .await
+            .expect_err("connect must fail for an unknown subsystem");
+    assert!(err.to_string().contains("refused"), "{err}");
+}
+
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_server_exit_is_an_error() {
+    let Some(mut pool) = ssh_pool().await else {
+        return;
+    };
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        pool.run_script("[Environment]::Exit(7)"),
+    )
+    .await
+    .expect("run_script must not hang when the server exits");
+    assert!(res.is_err(), "expected an error, got {res:?}");
 }

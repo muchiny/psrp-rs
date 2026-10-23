@@ -215,10 +215,15 @@ async fn live_run_get_date() {
     };
     let user = std::env::var("PSRP_INTEGRATION_USER").expect("PSRP_INTEGRATION_USER");
     let pass = std::env::var("PSRP_INTEGRATION_PASS").expect("PSRP_INTEGRATION_PASS");
+    let port: u16 = std::env::var("PSRP_INTEGRATION_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
 
     let client = psrp_rs::WinrmClient::new(
         psrp_rs::WinrmConfig {
             auth_method: psrp_rs::AuthMethod::Ntlm,
+            port,
             ..Default::default()
         },
         psrp_rs::WinrmCredentials::new(user, pass, ""),

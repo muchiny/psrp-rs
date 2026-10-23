@@ -187,6 +187,24 @@ let result = pool.run_script("$PSVersionTable").await?;
 pool.close().await?;
 ```
 
+The transport speaks PowerShell's out-of-process protocol over the SSH
+`powershell` subsystem, the one `pwsh -sshs` serves. The server needs:
+
+- PowerShell 7 or later;
+- a subsystem line in `sshd_config`, with a path that holds no space:
+
+  ```text
+  Subsystem powershell /usr/bin/pwsh -sshs -NoLogo
+  ```
+
+  On Windows use the short (8.3) path of `pwsh.exe`, for example
+  `Subsystem powershell C:/PROGRA~1/POWERS~1/7/pwsh.exe -sshs -NoLogo`;
+- on Linux, a login shell that writes nothing to stdout (no banner, no
+  `echo` in a profile): any non-XML line there is rejected.
+
+See the [`psrp_rs::ssh` documentation](https://docs.rs/psrp-rs/latest/psrp_rs/ssh/index.html)
+for the protocol and the host-key policies.
+
 ### Shared pool for concurrent tasks
 
 ```rust
@@ -285,12 +303,12 @@ PSRP_INTEGRATION_PASS=vagrant \
 ## Fuzzing
 
 Everything this crate parses comes from the remote host, so the decoders are
-fuzzed continuously. Sixteen [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
+fuzzed continuously. Seventeen [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
 targets live under [`fuzz/fuzz_targets/`](fuzz/fuzz_targets/), covering the
 fragment reassembler, the PSRP message header, the CLIXML parser and encoder,
 the typed record decoders, the host-call dispatcher, the session-key crypto,
-the runspace state machine, the async pool driven over a mock transport, and
-the SSH `known_hosts` matcher.
+the runspace state machine, the async pool driven over a mock transport, the
+SSH `known_hosts` matcher and the SSH OutOfProc line codec.
 
 ```sh
 rustup toolchain install nightly
@@ -323,7 +341,7 @@ itself; it is now an iterative `O(n*m)` matcher.
 | Feature | Default | Description |
 |---|---|---|
 | *(default)* | -- | WinRM transport with NTLMv2/Basic/Kerberos/Certificate auth (via winrm-rs) |
-| `ssh` | no | SSH transport via `russh` |
+| `ssh` | no | SSH transport via `russh`, speaking PowerShell's out-of-process protocol (`pwsh -sshs`, PowerShell 7+) |
 | `serde` | no | `Serialize`/`Deserialize` derives on `PsValue` / `PsObject` |
 
 ## License

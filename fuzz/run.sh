@@ -70,6 +70,8 @@ dict_for() {
       echo "fuzz/dictionaries/psrp.dict" ;;
     known_hosts_match)
       echo "fuzz/dictionaries/known_hosts.dict" ;;
+    out_of_proc_lines)
+      echo "fuzz/dictionaries/out_of_proc.dict" ;;
     *)
       echo "" ;;
   esac
