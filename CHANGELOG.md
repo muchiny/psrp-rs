@@ -24,6 +24,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   to `Opened`. PowerShell refuses it too (`CannotOpenAgain`). `RunspacePool`
   was not affected (it opens a fresh machine); only code driving the public
   state machine directly was.
+- **Base64 is read the way .NET reads it, and malformed input is refused.**
+  The decoder behind `<BA>`, the public key, the encrypted session key and
+  the SSH `<Data>` packets cut the text at the first `=`, accepted a missing
+  or incomplete padding, a length that is not a multiple of four and any
+  Unicode whitespace, so `AA==!!junk` and `Zg` decoded to `[0]` and `[102]`
+  where `Convert.FromBase64String` throws. It now accepts exactly what .NET
+  does: only space, tab, CR and LF are skipped, the length is a multiple of
+  four, and at most two `=` close the text. A payload that PowerShell would
+  refuse is an error instead of being silently truncated; PowerShell writes
+  canonical base64, so nothing it sends changes.
 
 ## [3.1.0] — 2026-10-23
 
