@@ -31,6 +31,31 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   surrogates (`_xD83D__xDE00_` for an emoji); the decoder left that text
   literal. A pair now decodes to the character, and a lone surrogate to
   U+FFFD.
+- **Script blocks use the tag PowerShell uses, `<SBK>`.** psrp-rs wrote and
+  read `<SCT>`, which PowerShell does not know: a script block in a server's
+  output was dropped without any error (a property missing, a list item
+  gone, shifting the ones after it), and one sent to a server made it
+  reject the whole message. It now writes `<SBK>` and reads both tags. The
+  server receives the body as a plain string (remoting never turns it back
+  into a script block), so a `[scriptblock]` parameter needs
+  `[scriptblock]::Create($s)`.
+- **An empty string or script block written self-closed is no longer
+  lost.** PowerShell normally writes an empty value as `<S N="x" />`; in an
+  object's properties it was dropped (so `get("x")` was `None`) and in a
+  dictionary it was read as `Null`. It is now an empty string.
+- **SecureStrings use PowerShell's zero IV.** `encrypt_secure_string` put a
+  random IV in front of the ciphertext and `decrypt_secure_string` took the
+  first 16 bytes for the IV, but PowerShell uses a zero IV and no prefix: a
+  server decrypting our SecureString got 8 garbage characters before the
+  text, and we lost the first 8 characters of the server's (a one-block
+  secret was rejected as malformed). Both directions now match PowerShell
+  (checked live against pwsh 7.6.7 over SSH and Windows PowerShell 5.1 over
+  WinRM). The ciphertext is now deterministic for a given session key, as
+  the protocol requires, and a ciphertext written by an older psrp-rs (with
+  its IV prefix) no longer decrypts correctly. The codec still does not
+  encrypt a `PsValue::SecureString` by itself, and the SecureStrings that a
+  `PsHost` answers to `Read-Host -AsSecureString` and `Get-Credential` still
+  travel in clear (tracked in #36).
 
 ## [3.0.0] — 2026-10-23
 
