@@ -57,6 +57,9 @@ fuzz_target!(|input: Input| {
 
     let mut ever_closed = false;
     let mut ever_broken = false;
+    // Set once `close()` has produced actions: from then on the pool is
+    // on its way out and must never be `Opened` again.
+    let mut close_issued = false;
 
     for step in input.steps.iter().take(64) {
         match step {
@@ -67,7 +70,7 @@ fuzz_target!(|input: Input| {
                 let _ = machine.connect();
             }
             Step::Close => {
-                let _ = machine.close();
+                close_issued |= !machine.close().is_empty();
             }
             Step::MarkClosed => machine.mark_closed(),
             Step::ServerState(code) => {
@@ -94,11 +97,12 @@ fuzz_target!(|input: Input| {
         );
         // A pool that has been closed, or that the server declared
         // broken, must never report itself as usable again.
-        if ever_closed || ever_broken {
+        if ever_closed || ever_broken || close_issued {
             assert_ne!(
                 state,
                 RunspacePoolState::Opened,
-                "pool resurrected into Opened after closed={ever_closed} broken={ever_broken}"
+                "pool resurrected into Opened after closed={ever_closed} broken={ever_broken} \
+                 close_issued={close_issued}"
             );
         }
         ever_closed |= state == RunspacePoolState::Closed;
