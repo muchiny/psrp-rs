@@ -61,12 +61,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   (`@($o, $o)`, `@{a=$o; b=$o}`) as a self-closed `<Ref RefId="…" />`. The
   decoder dropped it from a list, so the items after it moved up, and read
   it as `Null` in a dictionary. It is now resolved wherever it appears (list
-  item, dictionary key or value, property, top level). The copies a document
-  may make are bounded: a server could chain objects that each hold two
-  references to the previous one, and ~1 KiB of XML expanded to 2^n values
-  and aborted the process out of memory (properties already took that path);
-  that, or a reference that would nest deeper than `MAX_NESTING_DEPTH`, is
-  now a parse error.
+  item, dictionary key or value, property, top level). A reference to an
+  object that is not decoded yet (dangling, or back to an object still being
+  built) is `Null` in its place, as it already was in a property. The copies
+  a document may make are bounded, by a budget that grows with its size: a
+  server could chain objects that each hold two references to the previous
+  one, and ~1 KiB of XML expanded to 2^n values and aborted the process out
+  of memory (properties already took that path). Going over the budget, or
+  a reference that would nest deeper than `MAX_NESTING_DEPTH`, is now a
+  parse error. Only objects that a `<Ref>` points to are kept for it.
 
 ## [3.0.0] — 2026-10-23
 
