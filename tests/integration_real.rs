@@ -413,6 +413,39 @@ async fn live_char_surrogates_and_non_bmp() {
     let _ = pool.close().await;
 }
 
+/// A terminating error (`throw`, a failed `-ErrorAction Stop`) is reported
+/// in the `PipelineState` message only: `PipelineFailed` used to say
+/// "unknown error", and the message of an error-stream `ErrorRecord` was a
+/// dump of the whole record.
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_failed_pipeline_reports_its_reason() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    for (script, expected) in [
+        ("throw 'boom'", "boom"),
+        ("1/0", "divide by zero"),
+        ("Write-Error 'first'; throw 'second'", "second"),
+    ] {
+        let err = pool
+            .run_script(script)
+            .await
+            .expect_err("the pipeline must fail");
+        let psrp_rs::PsrpError::PipelineFailed(message) = &err else {
+            panic!("{script}: {err:?}");
+        };
+        assert!(message.contains(expected), "{script}: {message:?}");
+        assert!(!message.contains("PsObject"), "{script}: {message:?}");
+        assert!(message.len() < 1200, "{script}: {} bytes", message.len());
+    }
+
+    let _ = pool.close().await;
+}
+
 // ---- SSH transport tests ----
 
 /// Build the SSH config from `PSRP_INTEGRATION_SSH_{HOST,PORT,USER,PASS}`.

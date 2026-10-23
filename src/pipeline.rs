@@ -5,7 +5,7 @@ use uuid::Uuid;
 #[cfg(test)]
 use crate::clixml::PsObject;
 use crate::clixml::{PsValue, parse_clixml};
-use crate::error::{PsrpError, Result};
+use crate::error::{MAX_SERVER_MESSAGE_CHARS, PsrpError, Result, escape_remote_text};
 use crate::message::MessageType;
 use crate::records::{
     ErrorRecord, FromPsObject, InformationRecord, ProgressRecord, TraceRecord, WarningRecord,
@@ -448,7 +448,10 @@ impl Pipeline {
                     result.state = state;
                     if state.is_terminal() {
                         if state == PipelineState::Failed {
-                            return Err(PsrpError::PipelineFailed(describe_errors(&result.errors)));
+                            return Err(PsrpError::PipelineFailed(failure_message(
+                                &msg.data,
+                                &result.errors,
+                            )));
                         }
                         if state == PipelineState::Stopped {
                             if cancel_signalled {
@@ -665,7 +668,10 @@ impl<T: PsrpTransport> PipelineHandle<'_, T> {
                     result.state = state;
                     if state.is_terminal() {
                         if state == PipelineState::Failed {
-                            return Err(PsrpError::PipelineFailed(describe_errors(&result.errors)));
+                            return Err(PsrpError::PipelineFailed(failure_message(
+                                &msg.data,
+                                &result.errors,
+                            )));
                         }
                         if state == PipelineState::Stopped {
                             if cancel_signalled {
@@ -694,25 +700,86 @@ pub(crate) fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
     Err(PsrpError::protocol("missing PipelineState property"))
 }
 
+/// Why a pipeline failed: the exception the server attached to the
+/// `PipelineState` message (a terminating error such as `throw` is reported
+/// there, not in the error stream), then the errors written to the error
+/// stream, whichever there are, the same text not repeated. Everything the
+/// server wrote is escaped and bounded.
+pub(crate) fn failure_message(state_data: &str, errors: &[PsValue]) -> String {
+    let reason = crate::runspace::state::terminal_state_reason(state_data);
+    let (mut parts, more) = describe_parts(errors);
+    // Both are trimmed, escaped and cut the same way, so the same error
+    // reads the same in each; an error that merely contains the reason
+    // (`File not found: foo` and `foo`) is a different error.
+    if let Some(reason) = reason
+        && !parts.contains(&reason)
+    {
+        parts.insert(0, reason);
+    }
+    join_parts(parts, more)
+}
+
+/// How many errors of the error stream a failure message quotes.
+const MAX_DESCRIBED_ERRORS: usize = 8;
+
+/// One line for each of the first [`MAX_DESCRIBED_ERRORS`] errors, joined
+/// with `; `: the exception message of an `ErrorRecord`, else the text of
+/// the value. Each is trimmed, escaped and cut at
+/// [`MAX_SERVER_MESSAGE_CHARS`]; the rest is counted, not quoted.
+#[cfg(any(test, feature = "__internal"))]
 pub(crate) fn describe_errors(errors: &[PsValue]) -> String {
-    if errors.is_empty() {
+    let (parts, more) = describe_parts(errors);
+    join_parts(parts, more)
+}
+
+fn join_parts(mut parts: Vec<String>, more: usize) -> String {
+    if more > 0 {
+        parts.push(format!("… and {more} more"));
+    }
+    if parts.is_empty() {
         return "unknown error".into();
     }
-    errors
+    parts.join("; ")
+}
+
+/// The quoted errors, and how many were left out.
+fn describe_parts(errors: &[PsValue]) -> (Vec<String>, usize) {
+    let parts = errors
         .iter()
-        .filter_map(|v| match v {
-            PsValue::String(s) => Some(s.clone()),
-            PsValue::Object(o) => o
-                .get("Exception")
-                .and_then(PsValue::as_str)
-                .or_else(|| o.get("ErrorRecord_Exception").and_then(PsValue::as_str))
-                .or_else(|| o.get("Exception_Message").and_then(PsValue::as_str))
-                .map(str::to_string)
-                .or_else(|| Some(format!("{o:?}"))),
-            other => Some(format!("{other:?}")),
+        .take(MAX_DESCRIBED_ERRORS)
+        .map(|v| escape_remote_text(error_text(v).trim(), MAX_SERVER_MESSAGE_CHARS))
+        .collect();
+    (parts, errors.len().saturating_sub(MAX_DESCRIBED_ERRORS))
+}
+
+/// What to say of one error of the error stream: its exception message,
+/// else the identifier of the error, else the value itself.
+fn error_text(v: &PsValue) -> String {
+    if let PsValue::String(s) = v {
+        return s.clone();
+    }
+    let record = ErrorRecord::from_ps_object(v);
+    let message = record
+        .as_ref()
+        .and_then(|r| r.exception.as_ref()?.message.clone())
+        .filter(|m| !m.trim().is_empty());
+    let legacy = || match v {
+        PsValue::Object(o) => o
+            .get("Exception")
+            .and_then(PsValue::as_str)
+            .or_else(|| o.get("ErrorRecord_Exception").and_then(PsValue::as_str))
+            .or_else(|| o.get("Exception_Message").and_then(PsValue::as_str))
+            .map(str::to_string),
+        _ => None,
+    };
+    message
+        .or_else(legacy)
+        .or_else(|| {
+            record?
+                .fully_qualified_error_id
+                .filter(|id| !id.trim().is_empty())
         })
-        .collect::<Vec<_>>()
-        .join("; ")
+        .unwrap_or_else(|| format!("{v:?}"))
 }
 
 #[cfg(test)]
@@ -1272,6 +1339,164 @@ mod tests {
         assert!(p.add_to_history);
         let xml = p.__create_pipeline_xml_for_test();
         assert!(xml.contains("<B N=\"AddToHistory\">true</B>"));
+    }
+
+    /// An `ErrorRecord` as PowerShell serializes it: the message is in the
+    /// nested `Exception` object, not a string property.
+    fn error_record(message: &str) -> PsValue {
+        let exception = PsObject::new().with("Message", PsValue::String(message.into()));
+        PsValue::Object(PsObject::new().with("Exception", PsValue::Object(exception)))
+    }
+
+    /// Live (pwsh 7.6.7, WinRM): the error stream holds `ErrorRecord`
+    /// objects, whose message used to be buried in a `{:?}` dump of the
+    /// whole record, several KiB long.
+    #[test]
+    fn describe_errors_reads_the_message_of_an_error_record() {
+        assert_eq!(describe_errors(&[error_record("first")]), "first");
+        assert_eq!(
+            describe_errors(&[error_record("a"), PsValue::String("b".into())]),
+            "a; b"
+        );
+    }
+
+    #[test]
+    fn describe_errors_escapes_and_bounds_what_the_server_wrote() {
+        let desc = describe_errors(&[
+            PsValue::String("bad\u{1b}[2J\r\u{202e}text".into()),
+            error_record(&"x".repeat(5000)),
+        ]);
+        assert!(!desc.contains('\u{1b}') && !desc.contains('\r') && !desc.contains('\u{202e}'));
+        assert!(
+            desc.starts_with("bad\\u{1b}[2J\\r\\u{202e}text; "),
+            "{desc}"
+        );
+        assert!(desc.chars().count() < 1100, "not bounded: {}", desc.len());
+        assert!(desc.ends_with('…'));
+    }
+
+    #[test]
+    fn describe_errors_quotes_at_most_a_few_errors() {
+        let many: Vec<PsValue> = (0..1000)
+            .map(|i| PsValue::String(format!("e{i}")))
+            .collect();
+        let desc = describe_errors(&many);
+        assert!(desc.starts_with("e0; e1; "), "{desc}");
+        assert!(desc.ends_with("e7; … and 992 more"), "{desc}");
+        assert!(!desc.contains("e8;"), "{desc}");
+    }
+
+    #[test]
+    fn describe_errors_falls_back_to_a_bounded_dump() {
+        let weird =
+            PsValue::Object(PsObject::new().with("Blob", PsValue::String("y".repeat(5000))));
+        let desc = describe_errors(&[weird]);
+        assert!(desc.contains("Blob"));
+        assert!(desc.chars().count() <= MAX_SERVER_MESSAGE_CHARS + 1);
+    }
+
+    fn state_data_with_reason(message: &str) -> String {
+        let exception = PsObject::new().with("Message", PsValue::String(message.into()));
+        let record = PsObject::new().with("Exception", PsValue::Object(exception));
+        to_clixml(&PsValue::Object(
+            PsObject::new()
+                .with("PipelineState", PsValue::I32(PipelineState::Failed as i32))
+                .with("ExceptionAsErrorRecord", PsValue::Object(record)),
+        ))
+    }
+
+    #[test]
+    fn failure_message_prefers_the_state_exception_and_keeps_other_errors() {
+        let data = state_data_with_reason("boom");
+        assert_eq!(failure_message(&data, &[]), "boom");
+        // The same text in the error stream is not repeated.
+        assert_eq!(failure_message(&data, &[error_record("boom")]), "boom");
+        assert_eq!(
+            failure_message(&data, &[error_record("first")]),
+            "boom; first"
+        );
+        let bare = to_clixml(&PsValue::Object(
+            PsObject::new().with("PipelineState", PsValue::I32(PipelineState::Failed as i32)),
+        ));
+        assert_eq!(failure_message(&bare, &[error_record("first")]), "first");
+        assert_eq!(failure_message(&bare, &[]), "unknown error");
+    }
+
+    /// The reason is compared with each error, not searched for in their
+    /// text: `File not found: foo` does not say `foo` (review of #28).
+    #[test]
+    fn failure_message_only_drops_an_identical_error() {
+        let data = state_data_with_reason("foo");
+        assert_eq!(
+            failure_message(&data, &[PsValue::String("File not found: foo".into())]),
+            "foo; File not found: foo"
+        );
+        // Padding does not make the same error two: both sides are trimmed
+        // before they are cut at 1024 characters.
+        let long = format!("  {}", "x".repeat(1100));
+        let data = state_data_with_reason(&long);
+        let message = failure_message(&data, &[error_record(&long)]);
+        assert_eq!(message.matches('…').count(), 1, "{message}");
+        assert!(!message.contains("; "), "{message}");
+    }
+
+    /// An `ErrorRecord` with no usable message is named by its error id,
+    /// not dumped.
+    #[test]
+    fn describe_errors_falls_back_to_the_error_id_of_a_record() {
+        let record = PsObject::new()
+            .with("Exception", PsValue::Object(PsObject::new()))
+            .with(
+                "FullyQualifiedErrorId",
+                PsValue::String("NativeCommandFailed".into()),
+            );
+        assert_eq!(
+            describe_errors(&[PsValue::Object(record)]),
+            "NativeCommandFailed"
+        );
+    }
+
+    /// `ExceptionAsErrorRecord` sent as a bare string still gives the reason.
+    #[test]
+    fn failure_message_reads_a_bare_string_exception() {
+        let data = to_clixml(&PsValue::Object(
+            PsObject::new()
+                .with("PipelineState", PsValue::I32(PipelineState::Failed as i32))
+                .with(
+                    "ExceptionAsErrorRecord",
+                    PsValue::String("plain \u{1b}reason".into()),
+                ),
+        ));
+        assert_eq!(failure_message(&data, &[]), "plain \\u{1b}reason");
+    }
+
+    /// Live (pwsh 7.6.7, WinRM): `throw 'boom'` is reported only in the
+    /// `PipelineState` message, and used to come back as "unknown error".
+    #[tokio::test]
+    async fn failed_pipeline_reports_the_terminating_exception() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let rpid = pool.id();
+        let pid = Uuid::new_v4();
+        t.push_incoming(encode_message(
+            1,
+            &make_data_message(
+                MessageType::PipelineState,
+                state_data_with_reason("bad\u{1b}[31m thing"),
+                rpid,
+                pid,
+            ),
+        ));
+        let err = Pipeline::new("throw 'boom'")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await
+            .unwrap_err();
+        let PsrpError::PipelineFailed(message) = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(message, "bad\\u{1b}[31m thing");
+        let _ = pool.close().await;
     }
 
     #[test]

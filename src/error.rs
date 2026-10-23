@@ -50,8 +50,11 @@ impl PsrpError {
         Self::Protocol(msg.into())
     }
 
+    /// A CLIXML error. Its text can quote the document (an element name,
+    /// the value that failed to parse, an entity), which the server wrote,
+    /// so it is escaped and bounded here, once, for every call site.
     pub(crate) fn clixml(msg: impl Into<String>) -> Self {
-        Self::Clixml(msg.into())
+        Self::Clixml(escape_remote_text(&msg.into(), MAX_SERVER_MESSAGE_CHARS))
     }
 
     pub(crate) fn fragment(msg: impl Into<String>) -> Self {
@@ -136,6 +139,20 @@ mod tests {
                 .contains("boom")
         );
         assert_eq!(PsrpError::Cancelled.to_string(), "operation cancelled");
+    }
+
+    /// A CLIXML error can quote the document, which the server wrote.
+    #[test]
+    fn clixml_errors_escape_and_bound_the_document_text() {
+        let err = PsrpError::clixml(format!("B: bad bool '\u{1b}[2J{}'", "z".repeat(5000)));
+        let text = err.to_string();
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("\\u{1b}[2J"));
+        assert!(text.chars().count() < 1100);
+        assert_eq!(
+            PsrpError::clixml("EOF inside list").to_string(),
+            "CLIXML: EOF inside list"
+        );
     }
 
     #[test]

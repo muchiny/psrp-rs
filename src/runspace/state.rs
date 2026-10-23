@@ -394,19 +394,23 @@ pub(crate) fn extract_runspace_state(xml: &str) -> Result<RunspacePoolState> {
 
 /// The server's reason for a terminal state, if it gave one.
 ///
-/// MS-PSRP 2.2.2.9 lets a `RUNSPACEPOOL_STATE` message carry the error
-/// that ended the pool as an `ExceptionAsErrorRecord` property; the reason
-/// is the message of that record's exception. The server writes it, so it
-/// is trimmed, escaped and bounded like any server text quoted in an
-/// error, and a blank one counts as none.
-fn terminal_state_reason(xml: &str) -> Option<String> {
+/// MS-PSRP 2.2.2.9 and 2.2.2.21 let a `RUNSPACEPOOL_STATE` or a
+/// `PIPELINE_STATE` message carry the error that ended the pool or the
+/// pipeline as an `ExceptionAsErrorRecord` property; the reason is the
+/// message of that record's exception (or the property itself, when the
+/// server sent a bare string). The server writes it, so it is trimmed,
+/// escaped and bounded like any server text quoted in an error, and a
+/// blank one counts as none.
+pub(crate) fn terminal_state_reason(xml: &str) -> Option<String> {
     let message = parse_clixml(xml).ok()?.into_iter().find_map(|value| {
         let PsValue::Object(obj) = value else {
             return None;
         };
-        ErrorRecord::from_ps_object(obj.get("ExceptionAsErrorRecord")?)?
-            .exception?
-            .message
+        let record = obj.get("ExceptionAsErrorRecord")?;
+        match record.as_str() {
+            Some(text) => Some(text.to_string()),
+            None => ErrorRecord::from_ps_object(record)?.exception?.message,
+        }
     })?;
     let message = message.trim();
     (!message.is_empty()).then(|| escape_remote_text(message, MAX_SERVER_MESSAGE_CHARS))
