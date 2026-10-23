@@ -607,32 +607,45 @@ fn skip_to_end(reader: &mut Reader<&[u8]>) -> Result<()> {
     Ok(())
 }
 
-/// Decode `_xHHHH_` escapes that Windows PowerShell emits for control chars.
+/// Decode the `_xHHHH_` escapes PowerShell emits (`EncodeString`).
+///
+/// Each escape is one UTF-16 code unit, and a character outside the BMP is
+/// written as the escapes of its surrogate pair (`_xD83D__xDE00_` is
+/// U+1F600), so a run of consecutive escapes is decoded as UTF-16. A
+/// surrogate without its other half becomes U+FFFD: .NET's
+/// `XmlConvert.DecodeName` yields the lone code unit, which a Rust
+/// `String` cannot hold.
 fn decode_pwsh_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let len = bytes.len();
-    while i < len {
-        // Fast path: look for the `_xHHHH_` pattern at the current byte.
-        if i + 7 <= len
-            && bytes[i] == b'_'
-            && bytes[i + 1] == b'x'
-            && bytes[i + 6] == b'_'
-            && let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6])
-            && let Ok(code) = u32::from_str_radix(hex, 16)
-            && let Some(c) = char::from_u32(code)
-        {
-            out.push(c);
-            i += 7;
+    let mut units: Vec<u16> = Vec::new();
+    let mut rest = s;
+    loop {
+        if let Some((unit, tail)) = split_pwsh_escape(rest) {
+            units.push(unit);
+            rest = tail;
             continue;
         }
-        // Otherwise copy the next UTF-8 character verbatim.
-        let ch = s[i..].chars().next().expect("in-bounds char");
-        out.push(ch);
-        i += ch.len_utf8();
+        // Not an escape: the run so far ends here. Decode it, then copy
+        // the next character verbatim.
+        out.extend(
+            char::decode_utf16(units.drain(..)).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
+        );
+        let mut chars = rest.chars();
+        let Some(c) = chars.next() else {
+            break;
+        };
+        out.push(c);
+        rest = chars.as_str();
     }
     out
+}
+
+/// The code unit of the `_xHHHH_` escape that starts `s`, and the text
+/// after it.
+fn split_pwsh_escape(s: &str) -> Option<(u16, &str)> {
+    let hex = s.get(..7)?.strip_prefix("_x")?.strip_suffix('_')?;
+    let unit = u16::from_str_radix(hex, 16).ok()?;
+    Some((unit, s.get(7..)?))
 }
 
 #[cfg(test)]
@@ -764,6 +777,76 @@ mod tests {
     fn pwsh_escape_decode() {
         let got = parse_clixml("<S>ab_x0001_cd</S>").unwrap();
         assert_eq!(got[0], PsValue::String("ab\u{0001}cd".into()));
+    }
+
+    /// Issue #18: PowerShell writes a character outside the BMP as the
+    /// escapes of its two UTF-16 surrogates (`EncodeString`,
+    /// serialization.cs), so 😀 arrives as `_xD83D__xDE00_`.
+    #[test]
+    fn surrogate_pair_escapes_decode_to_one_char() {
+        let mut failures = Vec::new();
+        for (escaped, expected) in [
+            ("_xD83D__xDE00_", "\u{1F600}"),
+            ("a_xD83D__xDE00_b", "a\u{1F600}b"),
+            ("_xd83d__xde00_", "\u{1F600}"),
+            ("_xD83D__xde00_", "\u{1F600}"),
+            ("_xD83D__xDE00__xD83D__xDE01_", "\u{1F600}\u{1F601}"),
+            ("_xD800__xDC00_", "\u{10000}"),
+            ("_xDBFF__xDFFF_", "\u{10FFFF}"),
+            // A lone surrogate: .NET would yield the bare code unit, which
+            // a Rust `String` cannot hold, so it becomes U+FFFD.
+            ("_xD83D_", "\u{FFFD}"),
+            ("a_xD83D_b", "a\u{FFFD}b"),
+            ("_xDE00_", "\u{FFFD}"),
+            ("_xDE00__xD83D_", "\u{FFFD}\u{FFFD}"),
+            ("_xD83D_x_xDE00_", "\u{FFFD}x\u{FFFD}"),
+            ("_xD83D__x0041_", "\u{FFFD}A"),
+            ("_xD83D__xD83D__xDE00_", "\u{FFFD}\u{1F600}"),
+            ("_xD83D_xDE00_", "\u{FFFD}xDE00_"),
+            // Unchanged around them.
+            ("_x0041__x0042_", "AB"),
+            ("_x+041_", "A"),
+            ("_X0041_", "_X0041_"),
+        ] {
+            let got = decode_pwsh_escapes(escaped);
+            if got != expected {
+                failures.push(format!("{escaped:?} -> {got:?}, expected {expected:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn surrogate_pair_escapes_decode_in_text_and_property_names() {
+        let xml = r#"<Obj RefId="0"><MS><S N="k_xD83D__xDE00_">x_xD83D__xDE00_y</S><S N="_xDE00_">_xD83D_</S></MS></Obj>"#;
+        let got = parse_clixml(xml).unwrap();
+        let expected = PsValue::Object(
+            PsObject::new()
+                .with("k\u{1F600}", PsValue::String("x\u{1F600}y".into()))
+                .with("\u{FFFD}", PsValue::String("\u{FFFD}".into())),
+        );
+        assert_eq!(got, vec![expected]);
+    }
+
+    /// The encoder writes non-BMP characters as literal UTF-8, and escapes
+    /// a literal `_x`, so they still come back exactly.
+    #[test]
+    fn non_bmp_characters_round_trip() {
+        for text in [
+            "\u{1F600}",
+            "a\u{1F600}b\u{10000}\u{10FFFF}",
+            "\u{1F600}_xD83D_",
+            "_xD83D__xDE00_",
+            "\u{FFFD}",
+        ] {
+            let value = PsValue::Object(PsObject::new().with(text, PsValue::String(text.into())));
+            let xml = to_clixml(&value);
+            assert_eq!(
+                parse_clixml(&xml).unwrap(),
+                vec![value],
+                "{text:?} via {xml}"
+            );
+        }
     }
 
     #[test]

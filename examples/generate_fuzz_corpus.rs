@@ -130,6 +130,13 @@ fn clixml_seeds() -> Vec<(&'static str, String)> {
             "escapes.xml",
             r"<S>_x000A_&lt;tag&gt; &amp; <![CDATA[raw]]></S>".into(),
         ),
+        // A character outside the BMP leaves PowerShell as the escapes of
+        // its UTF-16 surrogate pair, in text and in a property name.
+        (
+            "surrogate_pair.xml",
+            r#"<Obj RefId="0"><MS><S N="_xD83D__xDE00_">a_xD83D__xDE00_b _xD83D_</S></MS></Obj>"#
+                .into(),
+        ),
         ("bom.xml", "\u{feff}<S>bom</S>".into()),
         ("empty_string.xml", "<S></S><S/>".into()),
     ]
