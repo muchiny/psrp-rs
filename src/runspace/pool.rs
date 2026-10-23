@@ -310,10 +310,21 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// with an `EncryptedSessionKey` — the 256-bit AES key wrapped in
     /// RSAES-PKCS1-v1_5, base64-encoded.
     ///
-    /// A server that rejects the key breaks or closes the pool instead:
-    /// the call then fails with the server's reason, when it gives one.
-    /// No timeout applies, so a server that never answers keeps the call
-    /// waiting.
+    /// # Errors
+    ///
+    /// A server that rejects the key breaks or closes the pool instead of
+    /// answering. The call then fails with [`PsrpError::Protocol`], whose
+    /// message ends with the server's reason when it gives one, and
+    /// [`state`](Self::state) reports `Broken` or `Closed`: the pool can no
+    /// longer be used and must be closed. Transport errors and a malformed
+    /// reply are returned as well.
+    ///
+    /// # No timeout
+    ///
+    /// A server that never answers keeps the call waiting. Wrapping it in
+    /// `tokio::time::timeout` is not safe over WinRM: dropping the call
+    /// mid-Receive loses the response that Receive returned. After a
+    /// timeout expires, close the pool; do not reuse it.
     pub async fn request_session_key(&mut self) -> Result<()> {
         if self.session_key.is_some() {
             return Ok(());
