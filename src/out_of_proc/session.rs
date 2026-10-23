@@ -940,4 +940,72 @@ mod tests {
         assert!(h.violations().is_empty(), "{:?}", h.violations());
         Ok(())
     }
+
+    #[tokio::test]
+    async fn a_payload_of_exactly_the_queue_limit_is_accepted_and_one_byte_more_is_not()
+    -> Result<()> {
+        // An entry costs its bytes plus QUEUE_ENTRY_OVERHEAD: 960 + 64 = 1024.
+        let (fake, h) = FakePwsh::new();
+        let mut s = OutOfProcSession::new(fake).with_max_queued_bytes(1024);
+        let fits = vec![1u8; 1024 - QUEUE_ENTRY_OVERHEAD];
+        h.inject(&server_line(&data(Uuid::nil(), &fits)));
+        s.send(Uuid::nil(), b"a").await?;
+        assert_eq!(s.recv().await?, fits);
+
+        let (fake, h) = FakePwsh::new();
+        let mut s = OutOfProcSession::new(fake).with_max_queued_bytes(1024);
+        h.inject(&server_line(&data(
+            Uuid::nil(),
+            &vec![1u8; 1024 - QUEUE_ENTRY_OVERHEAD + 1],
+        )));
+        let err = s.send(Uuid::nil(), b"a").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("PowerShell sent more than 1024 bytes of data that were not received"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_send_of_exactly_one_data_line_leaves_the_session_usable() -> Result<()> {
+        // A payload of MAX_DATA_PAYLOAD bytes is a single <Data> line: dropping
+        // it leaves no partial PSRP fragment on the server, unlike a payload of
+        // several lines.
+        let (mut s, h) = session();
+        h.hold_replies(true);
+        assert!(
+            timeout(
+                Duration::from_secs(1),
+                s.send(Uuid::nil(), &vec![7u8; MAX_DATA_PAYLOAD])
+            )
+            .await
+            .is_err()
+        );
+        h.hold_replies(false);
+
+        s.send(Uuid::nil(), b"b").await?;
+
+        let written = h.written();
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert_eq!(written[1], line(&data(Uuid::nil(), b"b")));
+        assert!(h.violations().is_empty(), "{:?}", h.violations());
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_ack_of_the_open_command_closes_it() {
+        // Through `send` / `close` a `<Close>` is only ever awaited for the
+        // open command (or the session), so this guard cannot be reached from
+        // outside; pin its contract directly.
+        let (mut s, _h) = session();
+        s.acknowledged(&Packet::CommandAck(P1));
+        assert_eq!(s.open_command, Some(P1));
+        s.acknowledged(&Packet::CloseAck(P2));
+        assert_eq!(s.open_command, Some(P1));
+        s.acknowledged(&Packet::CloseAck(Uuid::nil()));
+        assert_eq!(s.open_command, Some(P1));
+        s.acknowledged(&Packet::CloseAck(P1));
+        assert_eq!(s.open_command, None);
+    }
 }
