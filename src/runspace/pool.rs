@@ -1167,339 +1167,6 @@ mod tests {
         let _ = pool.close().await;
     }
 
-    /// Every PSRP message the pool has sent, decoded.
-    fn sent_messages(t: &MockTransport) -> Vec<PsrpMessage> {
-        let mut reassembler = Reassembler::new();
-        t.sent()
-            .iter()
-            .flat_map(|fragment| reassembler.feed(fragment).unwrap())
-            .map(|payload| PsrpMessage::decode(&payload).unwrap())
-            .collect()
-    }
-
-    /// The `mr` of the last host response sent, as the SecureString body.
-    fn sent_host_response_secret(t: &MockTransport) -> String {
-        let msg = sent_messages(t)
-            .into_iter()
-            .rfind(|m| m.message_type == MessageType::RunspacePoolHostResponse)
-            .expect("a host response was sent");
-        let PsValue::Object(o) = parse_clixml(&msg.data).unwrap().remove(0) else {
-            panic!("host response is not an object");
-        };
-        match o.get("mr") {
-            Some(PsValue::SecureString(body)) => body.clone(),
-            other => panic!("mr is not a SecureString: {other:?}"),
-        }
-    }
-
-    struct SecretHost;
-    #[async_trait::async_trait]
-    impl crate::host::PsHost for SecretHost {
-        async fn read_line_as_secure_string(&self) -> Result<String> {
-            Ok("hunter2".into())
-        }
-    }
-
-    fn secure_host_call() -> PsrpMessage {
-        PsrpMessage::decode(&host_call_bytes(
-            5,
-            crate::host::HostMethodId::ReadLineAsSecureString.to_i64(),
-            PsValue::List(Vec::new()),
-        ))
-        .unwrap()
-    }
-
-    /// #36: a `Read-Host -AsSecureString` answer went out as the plaintext
-    /// the host returned, which PowerShell cannot decrypt.
-    #[tokio::test]
-    async fn host_secure_string_answer_is_encrypted_with_the_session_key() {
-        let t = MockTransport::new();
-        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
-        let key = crate::crypto::SessionKey::from_bytes([3u8; 32]);
-        pool.set_session_key(key.clone());
-
-        pool.handle_host_call(&secure_host_call()).await.unwrap();
-
-        let body = sent_host_response_secret(&t);
-        assert_ne!(body, "hunter2");
-        let sealed = crate::clixml::encode::base64_decode(&body).expect("base64");
-        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "hunter2");
-        assert!(
-            !t.sent()
-                .iter()
-                .flatten()
-                .copied()
-                .collect::<Vec<u8>>()
-                .windows(7)
-                .any(|w| w == b"hunter2"),
-            "the plaintext crossed the transport"
-        );
-        let _ = pool.close().await;
-    }
-
-    /// With no key yet the answer is parked, the exchange is started, and
-    /// the answer goes out encrypted once the key arrives, without any
-    /// reader having to ask for the key.
-    #[tokio::test]
-    async fn host_secure_string_answer_waits_for_the_session_key() {
-        let t = MockTransport::new();
-        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
-
-        pool.handle_host_call(&secure_host_call()).await.unwrap();
-        let sent = sent_messages(&t);
-        assert_eq!(sent.last().unwrap().message_type, MessageType::PublicKey);
-        assert!(
-            !sent
-                .iter()
-                .any(|m| m.message_type == MessageType::RunspacePoolHostResponse),
-            "a response left before the key"
-        );
-
-        // A second answer meanwhile does not start a second exchange.
-        pool.handle_host_call(&secure_host_call()).await.unwrap();
-        let public_keys = sent_messages(&t)
-            .iter()
-            .filter(|m| m.message_type == MessageType::PublicKey)
-            .count();
-        assert_eq!(public_keys, 1);
-
-        let aes = [0x24u8; 32];
-        let blob = crate::clixml::encode::base64_decode(&sent_public_key(&t)).unwrap();
-        let wrapped = crate::crypto::test_support::server_wrap_session_key(&blob, &aes);
-        t.push_incoming(encrypted_session_key_reply(
-            &crate::clixml::encode::base64_encode(&wrapped),
-        ));
-        let msg = pool.next_message().await.unwrap();
-        assert_eq!(msg.message_type, MessageType::EncryptedSessionKey);
-
-        assert!(pool.session_key().is_some());
-        let responses: Vec<_> = sent_messages(&t)
-            .into_iter()
-            .filter(|m| m.message_type == MessageType::RunspacePoolHostResponse)
-            .collect();
-        assert_eq!(responses.len(), 2, "both parked answers are sent");
-        let sealed = crate::clixml::encode::base64_decode(&sent_host_response_secret(&t)).unwrap();
-        assert_eq!(
-            crate::crypto::SessionKey::from_bytes(aes)
-                .decrypt_secure_string(&sealed)
-                .unwrap(),
-            "hunter2"
-        );
-        assert!(
-            !t.sent()
-                .iter()
-                .flatten()
-                .copied()
-                .collect::<Vec<u8>>()
-                .windows(7)
-                .any(|w| w == b"hunter2"),
-            "the plaintext crossed the transport"
-        );
-        let _ = pool.close().await;
-    }
-
-    /// A reply that cannot be taken must not leave the server's host call
-    /// waiting for ever: it is answered with an error, never with the
-    /// plaintext, and the pool can try again.
-    #[tokio::test]
-    async fn a_failed_key_exchange_answers_the_parked_host_calls_with_an_error() {
-        let t = MockTransport::new();
-        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
-        pool.handle_host_call(&secure_host_call()).await.unwrap();
-
-        t.push_incoming(encrypted_session_key_reply("not base64 !!!"));
-        let err = pool.next_message().await.unwrap_err();
-        assert!(err.to_string().contains("invalid base64"), "{err}");
-        assert!(pool.session_key().is_none());
-
-        let response = sent_messages(&t)
-            .into_iter()
-            .rfind(|m| m.message_type == MessageType::RunspacePoolHostResponse)
-            .expect("the host call was answered");
-        assert!(response.data.contains("the SecureString could not be sent"));
-        assert!(!response.data.contains("hunter2"));
-        assert!(
-            !t.sent()
-                .iter()
-                .flatten()
-                .copied()
-                .collect::<Vec<u8>>()
-                .windows(7)
-                .any(|w| w == b"hunter2")
-        );
-
-        // A later host call starts a fresh exchange (the first key pair died).
-        pool.handle_host_call(&secure_host_call()).await.unwrap();
-        let public_keys = sent_messages(&t)
-            .iter()
-            .filter(|m| m.message_type == MessageType::PublicKey)
-            .count();
-        assert_eq!(public_keys, 2);
-        let _ = pool.close().await;
-    }
-
-    /// `PublicKeyRequest` while an exchange is in flight repeats nothing; with
-    /// a key already held it still answers (the server lost its copy).
-    #[tokio::test]
-    async fn public_key_request_while_pending_or_with_a_key() {
-        let public_keys = |t: &MockTransport| {
-            sent_messages(t)
-                .iter()
-                .filter(|m| m.message_type == MessageType::PublicKey)
-                .count()
-        };
-        let request = || {
-            wire(
-                4,
-                &PsrpMessage {
-                    destination: Destination::Client,
-                    message_type: MessageType::PublicKeyRequest,
-                    rpid: Uuid::nil(),
-                    pid: Uuid::nil(),
-                    data: to_clixml(&PsValue::Object(PsObject::new())),
-                }
-                .encode(),
-            )
-        };
-
-        let t = MockTransport::new();
-        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
-        t.push_incoming(request());
-        pool.next_message().await.unwrap();
-        t.push_incoming(request());
-        pool.next_message().await.unwrap();
-        assert_eq!(public_keys(&t), 1, "a pending exchange is not repeated");
-        let _ = pool.close().await;
-
-        let t = MockTransport::new();
-        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
-        pool.set_session_key(crate::crypto::SessionKey::from_bytes([1u8; 32]));
-        t.push_incoming(request());
-        pool.next_message().await.unwrap();
-        assert_eq!(public_keys(&t), 1, "a held key does not mute the request");
-        let _ = pool.close().await;
-    }
-
-    /// A key injected while answers are parked abandons the exchange and
-    /// releases them, encrypted with the injected key, at the next read.
-    #[tokio::test]
-    async fn set_session_key_releases_the_parked_host_answers() {
-        let t = MockTransport::new();
-        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
-        pool.handle_host_call(&secure_host_call()).await.unwrap();
-
-        let key = crate::crypto::SessionKey::from_bytes([8u8; 32]);
-        pool.set_session_key(key.clone());
-        // The reply of the abandoned exchange arrives: ignored, and the
-        // parked answer is released before it is read, under the injected key.
-        t.push_incoming(encrypted_session_key_reply("AAAA"));
-        let msg = pool.next_message().await.unwrap();
-        assert_eq!(msg.message_type, MessageType::EncryptedSessionKey);
-
-        let sealed = crate::clixml::encode::base64_decode(&sent_host_response_secret(&t)).unwrap();
-        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "hunter2");
-        let probe = pool.encrypt_secure_string("probe").unwrap();
-        let sealed = crate::clixml::encode::base64_decode(&probe).unwrap();
-        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "probe");
-        let _ = pool.close().await;
-    }
-
-    /// The server asks for the client's key when it has a
-    /// `SecureString` to send; it used to be ignored.
-    #[tokio::test]
-    async fn public_key_request_starts_the_exchange() {
-        let t = MockTransport::new();
-        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
-        t.push_incoming(wire(
-            4,
-            &PsrpMessage {
-                destination: Destination::Client,
-                message_type: MessageType::PublicKeyRequest,
-                rpid: Uuid::nil(),
-                pid: Uuid::nil(),
-                data: to_clixml(&PsValue::Object(PsObject::new())),
-            }
-            .encode(),
-        ));
-        let msg = pool.next_message().await.unwrap();
-        assert_eq!(msg.message_type, MessageType::PublicKeyRequest);
-        assert_eq!(
-            sent_messages(&t).last().unwrap().message_type,
-            MessageType::PublicKey
-        );
-
-        // The reply completes the exchange.
-        let aes = [0x31u8; 32];
-        let blob = crate::clixml::encode::base64_decode(&sent_public_key(&t)).unwrap();
-        let wrapped = crate::crypto::test_support::server_wrap_session_key(&blob, &aes);
-        t.push_incoming(encrypted_session_key_reply(
-            &crate::clixml::encode::base64_encode(&wrapped),
-        ));
-        pool.request_session_key().await.unwrap();
-        assert!(pool.session_key().is_some());
-        // ... without a second PublicKey.
-        let public_keys = sent_messages(&t)
-            .iter()
-            .filter(|m| m.message_type == MessageType::PublicKey)
-            .count();
-        assert_eq!(public_keys, 1);
-        let _ = pool.close().await;
-    }
-
-    #[tokio::test]
-    async fn an_unsolicited_session_key_is_ignored() {
-        let t = MockTransport::new();
-        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
-        t.push_incoming(encrypted_session_key_reply("AAAA"));
-        let msg = pool.next_message().await.unwrap();
-        assert_eq!(msg.message_type, MessageType::EncryptedSessionKey);
-        assert!(pool.session_key().is_none());
-        let _ = pool.close().await;
-    }
-
-    #[test]
-    fn secure_strings_are_found_and_encrypted_wherever_they_sit() {
-        let key = crate::crypto::SessionKey::from_bytes([5u8; 32]);
-        let credential = PsValue::Object(
-            PsObject::new()
-                .with("UserName", PsValue::String("alice".into()))
-                .with("Password", PsValue::SecureString("pw".into())),
-        );
-        let value = PsValue::List(vec![
-            PsValue::I32(1),
-            PsValue::Dict(vec![(PsValue::String("k".into()), credential)]),
-        ]);
-        assert!(contains_secure_string(&value));
-        // A SecureString used as a dictionary key is found and encrypted too.
-        let keyed = PsValue::Dict(vec![(PsValue::SecureString("k".into()), PsValue::I32(1))]);
-        assert!(contains_secure_string(&keyed));
-        let PsValue::Dict(entries) = encrypt_secure_strings(&keyed, &key) else {
-            panic!()
-        };
-        assert_ne!(entries[0].0, PsValue::SecureString("k".into()));
-        assert!(!contains_secure_string(&PsValue::List(vec![
-            PsValue::String("pw".into())
-        ])));
-
-        let encrypted = encrypt_secure_strings(&value, &key);
-        assert_ne!(encrypted, value);
-        let PsValue::List(items) = &encrypted else {
-            panic!()
-        };
-        let PsValue::Dict(entries) = &items[1] else {
-            panic!()
-        };
-        let PsValue::Object(cred) = &entries[0].1 else {
-            panic!()
-        };
-        assert_eq!(cred.get("UserName"), Some(&PsValue::String("alice".into())));
-        let Some(PsValue::SecureString(body)) = cred.get("Password") else {
-            panic!()
-        };
-        let sealed = crate::clixml::encode::base64_decode(body).unwrap();
-        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "pw");
-    }
-
     #[tokio::test]
     async fn host_call_read_line_with_custom_host_sends_value_response() {
         use async_trait::async_trait;
@@ -1923,6 +1590,339 @@ mod tests {
         pool.closed = true;
         let err = pool.disconnect().await.unwrap_err();
         assert!(err.to_string().contains("already closed"));
+    }
+
+    /// Every PSRP message the pool has sent, decoded.
+    fn sent_messages(t: &MockTransport) -> Vec<PsrpMessage> {
+        let mut reassembler = Reassembler::new();
+        t.sent()
+            .iter()
+            .flat_map(|fragment| reassembler.feed(fragment).unwrap())
+            .map(|payload| PsrpMessage::decode(&payload).unwrap())
+            .collect()
+    }
+
+    /// The `mr` of the last host response sent, as the SecureString body.
+    fn sent_host_response_secret(t: &MockTransport) -> String {
+        let msg = sent_messages(t)
+            .into_iter()
+            .rfind(|m| m.message_type == MessageType::RunspacePoolHostResponse)
+            .expect("a host response was sent");
+        let PsValue::Object(o) = parse_clixml(&msg.data).unwrap().remove(0) else {
+            panic!("host response is not an object");
+        };
+        match o.get("mr") {
+            Some(PsValue::SecureString(body)) => body.clone(),
+            other => panic!("mr is not a SecureString: {other:?}"),
+        }
+    }
+
+    struct SecretHost;
+    #[async_trait::async_trait]
+    impl crate::host::PsHost for SecretHost {
+        async fn read_line_as_secure_string(&self) -> Result<String> {
+            Ok("hunter2".into())
+        }
+    }
+
+    fn secure_host_call() -> PsrpMessage {
+        PsrpMessage::decode(&host_call_bytes(
+            5,
+            crate::host::HostMethodId::ReadLineAsSecureString.to_i64(),
+            PsValue::List(Vec::new()),
+        ))
+        .unwrap()
+    }
+
+    /// #36: a `Read-Host -AsSecureString` answer went out as the plaintext
+    /// the host returned, which PowerShell cannot decrypt.
+    #[tokio::test]
+    async fn host_secure_string_answer_is_encrypted_with_the_session_key() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        let key = crate::crypto::SessionKey::from_bytes([3u8; 32]);
+        pool.set_session_key(key.clone());
+
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+
+        let body = sent_host_response_secret(&t);
+        assert_ne!(body, "hunter2");
+        let sealed = crate::clixml::encode::base64_decode(&body).expect("base64");
+        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "hunter2");
+        assert!(
+            !t.sent()
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<u8>>()
+                .windows(7)
+                .any(|w| w == b"hunter2"),
+            "the plaintext crossed the transport"
+        );
+        let _ = pool.close().await;
+    }
+
+    /// With no key yet the answer is parked, the exchange is started, and
+    /// the answer goes out encrypted once the key arrives, without any
+    /// reader having to ask for the key.
+    #[tokio::test]
+    async fn host_secure_string_answer_waits_for_the_session_key() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+        let sent = sent_messages(&t);
+        assert_eq!(sent.last().unwrap().message_type, MessageType::PublicKey);
+        assert!(
+            !sent
+                .iter()
+                .any(|m| m.message_type == MessageType::RunspacePoolHostResponse),
+            "a response left before the key"
+        );
+
+        // A second answer meanwhile does not start a second exchange.
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+        let public_keys = sent_messages(&t)
+            .iter()
+            .filter(|m| m.message_type == MessageType::PublicKey)
+            .count();
+        assert_eq!(public_keys, 1);
+
+        let aes = [0x24u8; 32];
+        let blob = crate::clixml::encode::base64_decode(&sent_public_key(&t)).unwrap();
+        let wrapped = crate::crypto::test_support::server_wrap_session_key(&blob, &aes);
+        t.push_incoming(encrypted_session_key_reply(
+            &crate::clixml::encode::base64_encode(&wrapped),
+        ));
+        let msg = pool.next_message().await.unwrap();
+        assert_eq!(msg.message_type, MessageType::EncryptedSessionKey);
+
+        assert!(pool.session_key().is_some());
+        let responses: Vec<_> = sent_messages(&t)
+            .into_iter()
+            .filter(|m| m.message_type == MessageType::RunspacePoolHostResponse)
+            .collect();
+        assert_eq!(responses.len(), 2, "both parked answers are sent");
+        let sealed = crate::clixml::encode::base64_decode(&sent_host_response_secret(&t)).unwrap();
+        assert_eq!(
+            crate::crypto::SessionKey::from_bytes(aes)
+                .decrypt_secure_string(&sealed)
+                .unwrap(),
+            "hunter2"
+        );
+        assert!(
+            !t.sent()
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<u8>>()
+                .windows(7)
+                .any(|w| w == b"hunter2"),
+            "the plaintext crossed the transport"
+        );
+        let _ = pool.close().await;
+    }
+
+    /// A reply that cannot be taken must not leave the server's host call
+    /// waiting for ever: it is answered with an error, never with the
+    /// plaintext, and the pool can try again.
+    #[tokio::test]
+    async fn a_failed_key_exchange_answers_the_parked_host_calls_with_an_error() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+
+        t.push_incoming(encrypted_session_key_reply("not base64 !!!"));
+        let err = pool.next_message().await.unwrap_err();
+        assert!(err.to_string().contains("invalid base64"), "{err}");
+        assert!(pool.session_key().is_none());
+
+        let response = sent_messages(&t)
+            .into_iter()
+            .rfind(|m| m.message_type == MessageType::RunspacePoolHostResponse)
+            .expect("the host call was answered");
+        assert!(response.data.contains("the SecureString could not be sent"));
+        assert!(!response.data.contains("hunter2"));
+        assert!(
+            !t.sent()
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<u8>>()
+                .windows(7)
+                .any(|w| w == b"hunter2")
+        );
+
+        // A later host call starts a fresh exchange (the first key pair died).
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+        let public_keys = sent_messages(&t)
+            .iter()
+            .filter(|m| m.message_type == MessageType::PublicKey)
+            .count();
+        assert_eq!(public_keys, 2);
+        let _ = pool.close().await;
+    }
+
+    /// `PublicKeyRequest` while an exchange is in flight repeats nothing; with
+    /// a key already held it still answers (the server lost its copy).
+    #[tokio::test]
+    async fn public_key_request_while_pending_or_with_a_key() {
+        let public_keys = |t: &MockTransport| {
+            sent_messages(t)
+                .iter()
+                .filter(|m| m.message_type == MessageType::PublicKey)
+                .count()
+        };
+        let request = || {
+            wire(
+                4,
+                &PsrpMessage {
+                    destination: Destination::Client,
+                    message_type: MessageType::PublicKeyRequest,
+                    rpid: Uuid::nil(),
+                    pid: Uuid::nil(),
+                    data: to_clixml(&PsValue::Object(PsObject::new())),
+                }
+                .encode(),
+            )
+        };
+
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        t.push_incoming(request());
+        pool.next_message().await.unwrap();
+        t.push_incoming(request());
+        pool.next_message().await.unwrap();
+        assert_eq!(public_keys(&t), 1, "a pending exchange is not repeated");
+        let _ = pool.close().await;
+
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        pool.set_session_key(crate::crypto::SessionKey::from_bytes([1u8; 32]));
+        t.push_incoming(request());
+        pool.next_message().await.unwrap();
+        assert_eq!(public_keys(&t), 1, "a held key does not mute the request");
+        let _ = pool.close().await;
+    }
+
+    /// A key injected while answers are parked abandons the exchange and
+    /// releases them, encrypted with the injected key, at the next read.
+    #[tokio::test]
+    async fn set_session_key_releases_the_parked_host_answers() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+
+        let key = crate::crypto::SessionKey::from_bytes([8u8; 32]);
+        pool.set_session_key(key.clone());
+        // The reply of the abandoned exchange arrives: ignored, and the
+        // parked answer is released before it is read, under the injected key.
+        t.push_incoming(encrypted_session_key_reply("AAAA"));
+        let msg = pool.next_message().await.unwrap();
+        assert_eq!(msg.message_type, MessageType::EncryptedSessionKey);
+
+        let sealed = crate::clixml::encode::base64_decode(&sent_host_response_secret(&t)).unwrap();
+        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "hunter2");
+        let probe = pool.encrypt_secure_string("probe").unwrap();
+        let sealed = crate::clixml::encode::base64_decode(&probe).unwrap();
+        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "probe");
+        let _ = pool.close().await;
+    }
+
+    /// The server asks for the client's key when it has a
+    /// `SecureString` to send; it used to be ignored.
+    #[tokio::test]
+    async fn public_key_request_starts_the_exchange() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        t.push_incoming(wire(
+            4,
+            &PsrpMessage {
+                destination: Destination::Client,
+                message_type: MessageType::PublicKeyRequest,
+                rpid: Uuid::nil(),
+                pid: Uuid::nil(),
+                data: to_clixml(&PsValue::Object(PsObject::new())),
+            }
+            .encode(),
+        ));
+        let msg = pool.next_message().await.unwrap();
+        assert_eq!(msg.message_type, MessageType::PublicKeyRequest);
+        assert_eq!(
+            sent_messages(&t).last().unwrap().message_type,
+            MessageType::PublicKey
+        );
+
+        // The reply completes the exchange.
+        let aes = [0x31u8; 32];
+        let blob = crate::clixml::encode::base64_decode(&sent_public_key(&t)).unwrap();
+        let wrapped = crate::crypto::test_support::server_wrap_session_key(&blob, &aes);
+        t.push_incoming(encrypted_session_key_reply(
+            &crate::clixml::encode::base64_encode(&wrapped),
+        ));
+        pool.request_session_key().await.unwrap();
+        assert!(pool.session_key().is_some());
+        // ... without a second PublicKey.
+        let public_keys = sent_messages(&t)
+            .iter()
+            .filter(|m| m.message_type == MessageType::PublicKey)
+            .count();
+        assert_eq!(public_keys, 1);
+        let _ = pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_unsolicited_session_key_is_ignored() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        t.push_incoming(encrypted_session_key_reply("AAAA"));
+        let msg = pool.next_message().await.unwrap();
+        assert_eq!(msg.message_type, MessageType::EncryptedSessionKey);
+        assert!(pool.session_key().is_none());
+        let _ = pool.close().await;
+    }
+
+    #[test]
+    fn secure_strings_are_found_and_encrypted_wherever_they_sit() {
+        let key = crate::crypto::SessionKey::from_bytes([5u8; 32]);
+        let credential = PsValue::Object(
+            PsObject::new()
+                .with("UserName", PsValue::String("alice".into()))
+                .with("Password", PsValue::SecureString("pw".into())),
+        );
+        let value = PsValue::List(vec![
+            PsValue::I32(1),
+            PsValue::Dict(vec![(PsValue::String("k".into()), credential)]),
+        ]);
+        assert!(contains_secure_string(&value));
+        // A SecureString used as a dictionary key is found and encrypted too.
+        let keyed = PsValue::Dict(vec![(PsValue::SecureString("k".into()), PsValue::I32(1))]);
+        assert!(contains_secure_string(&keyed));
+        let PsValue::Dict(entries) = encrypt_secure_strings(&keyed, &key) else {
+            panic!()
+        };
+        assert_ne!(entries[0].0, PsValue::SecureString("k".into()));
+        assert!(!contains_secure_string(&PsValue::List(vec![
+            PsValue::String("pw".into())
+        ])));
+
+        let encrypted = encrypt_secure_strings(&value, &key);
+        assert_ne!(encrypted, value);
+        let PsValue::List(items) = &encrypted else {
+            panic!()
+        };
+        let PsValue::Dict(entries) = &items[1] else {
+            panic!()
+        };
+        let PsValue::Object(cred) = &entries[0].1 else {
+            panic!()
+        };
+        assert_eq!(cred.get("UserName"), Some(&PsValue::String("alice".into())));
+        let Some(PsValue::SecureString(body)) = cred.get("Password") else {
+            panic!()
+        };
+        let sealed = crate::clixml::encode::base64_decode(body).unwrap();
+        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "pw");
     }
 
     #[tokio::test]

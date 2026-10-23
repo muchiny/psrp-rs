@@ -66,9 +66,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   ignored. The `EncryptedSessionKey` is now taken
   by whichever call reads it, not only by `request_session_key`, so a key
   that arrives while a pipeline runs is no longer lost. Host calls still
-  waiting for a key are not carried over `disconnect`/`reconnect`. Not yet reachable
-  against PowerShell: psrp-rs declares a null host, so the server never makes
-  these calls (tracked separately).
+  waiting for a key are not carried over `disconnect`/`reconnect`. Not yet
+  reachable against PowerShell: psrp-rs declares a null host and its
+  host-method ids do not match PowerShell's, so a real server does not make
+  these calls yet (tracked in #52); the encryption and the key handling are
+  tested against the mock transport.
 
 ## [3.1.0] — 2026-10-23
 
