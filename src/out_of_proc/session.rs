@@ -25,7 +25,8 @@
 //! the session ("a send was abandoned between two Data lines") and writes
 //! nothing.
 //!
-//! Every wait for an acknowledgement is bounded by [`ACK_TIMEOUT`]; expiry,
+//! Every wait for an acknowledgement is bounded by the session's
+//! acknowledgement timeout ([`ACK_TIMEOUT`] unless configured); expiry,
 //! end of stream, a server error line or a malformed line break the session
 //! for good. Every later request then fails at once with the same reason,
 //! without writing anything.
@@ -89,6 +90,8 @@ pub(crate) struct OutOfProcSession<P: Pipe> {
     inbound_bytes: usize,
     /// Limit on `inbound_bytes`: [`MAX_QUEUED_BYTES`] outside tests.
     max_queued_bytes: usize,
+    /// Bound on every request, [`ACK_TIMEOUT`] unless configured.
+    ack_timeout: Duration,
     /// The acknowledgement the request in flight waits for.
     awaiting: Option<Packet>,
     /// Set for the duration of [`Pipe::write`]: still set afterwards means
@@ -113,12 +116,19 @@ impl<P: Pipe> OutOfProcSession<P> {
             inbound: VecDeque::new(),
             inbound_bytes: 0,
             max_queued_bytes: MAX_QUEUED_BYTES,
+            ack_timeout: ACK_TIMEOUT,
             awaiting: None,
             write_in_progress: false,
             payload_in_progress: false,
             open_command: None,
             broken: None,
         }
+    }
+
+    /// Bound every request by `timeout` instead of [`ACK_TIMEOUT`].
+    pub(crate) fn with_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.ack_timeout = timeout;
+        self
     }
 
     #[cfg(test)]
@@ -228,14 +238,14 @@ impl<P: Pipe> OutOfProcSession<P> {
         &mut self.pipe
     }
 
-    /// One request: write `packet`, then read until `ack`, within [`ACK_TIMEOUT`].
+    /// One request: write `packet`, then read until `ack`, within the acknowledgement timeout.
     ///
     /// Fails at once, writing nothing, on a broken session.
     async fn request(&mut self, packet: Packet, ack: Packet) -> Result<()> {
         self.usable()?;
         let line = packet.to_line();
         let fallback = ack.clone();
-        match tokio::time::timeout(ACK_TIMEOUT, self.exchange(line.as_bytes(), ack)).await {
+        match tokio::time::timeout(self.ack_timeout, self.exchange(line.as_bytes(), ack)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(self.timed_out(&fallback)),
         }
@@ -261,29 +271,36 @@ impl<P: Pipe> OutOfProcSession<P> {
         Ok(())
     }
 
-    /// [`Self::settle`] within [`ACK_TIMEOUT`], for an acknowledgement left
+    /// [`Self::settle`] within the acknowledgement timeout, for an acknowledgement left
     /// awaited by a dropped request.
     async fn settle_bounded(&mut self) -> Result<()> {
         let Some(pending) = self.awaiting.clone() else {
             return Ok(());
         };
-        match tokio::time::timeout(ACK_TIMEOUT, self.settle()).await {
+        match tokio::time::timeout(self.ack_timeout, self.settle()).await {
             Ok(result) => result,
             Err(_elapsed) => Err(self.timed_out(&pending)),
         }
     }
 
-    /// Breaks the session after [`ACK_TIMEOUT`] elapsed writing a line or
+    /// Breaks the session after the acknowledgement timeout elapsed writing a line or
     /// waiting for an acknowledgement (the awaited one, else `fallback`).
     fn timed_out(&mut self, fallback: &Packet) -> PsrpError {
         let (element, guid) = request_element(self.awaiting.as_ref().unwrap_or(fallback));
-        let secs = ACK_TIMEOUT.as_secs();
+        let limit = describe_duration(self.ack_timeout);
         let reason = if self.write_in_progress {
             format!(
-                "PowerShell did not accept {element} for {guid} within {secs} s: the write did not complete"
+                "PowerShell did not accept {element} for {guid} within {limit}: the write did not complete"
+            )
+        } else if element == "Data" && guid.is_nil() {
+            // The first request of a session is the runspace pool's own
+            // `Data`, acknowledged only once the pool is built.
+            format!(
+                "PowerShell did not acknowledge {element} for {guid} within {limit}: a runspace \
+                 that starts slowly needs a longer `SshConfig::with_ack_timeout`"
             )
         } else {
-            format!("PowerShell did not acknowledge {element} for {guid} within {secs} s")
+            format!("PowerShell did not acknowledge {element} for {guid} within {limit}")
         };
         self.fail(PsrpError::protocol(reason))
     }
@@ -402,6 +419,15 @@ fn queue_cost(payload: &[u8]) -> usize {
 }
 
 /// The element of the request that `ack` acknowledges, and its `PSGuid`.
+/// `60 s`, `1.5 s`: a duration as the timeout messages print it.
+fn describe_duration(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{} s", d.as_secs())
+    } else {
+        format!("{:.3} s", d.as_secs_f64())
+    }
+}
+
 fn request_element(ack: &Packet) -> (&'static str, Uuid) {
     match ack {
         Packet::Data { guid, .. } | Packet::DataAck(guid) => ("Data", *guid),
@@ -844,7 +870,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains(&format!(
-                "PowerShell did not accept Data for {NIL} within 60 s"
+                "PowerShell did not accept Data for {NIL} within 60 s: the write did not complete"
             )),
             "{msg}"
         );
@@ -853,6 +879,41 @@ mod tests {
         let again = s.send(Uuid::nil(), b"b").await.unwrap_err();
         assert_eq!(again.to_string(), msg);
         assert!(h.written().is_empty(), "{:?}", h.written());
+    }
+
+    /// The bound is configurable (#23): the request fails after the
+    /// configured time, which the message states, not after 60 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_acknowledgement_timeout_is_configurable() {
+        let (fake, h) = FakePwsh::new();
+        let mut s = OutOfProcSession::new(fake).with_ack_timeout(Duration::from_secs(5));
+        h.hold_replies(true);
+
+        let started = tokio::time::Instant::now();
+        let err = s.send(Uuid::nil(), b"a").await.unwrap_err();
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_secs(5), "{waited:?}");
+        assert!(waited < Duration::from_secs(60), "{waited:?}");
+        assert!(err.to_string().contains("within 5 s"), "{err}");
+
+        // A sub-second bound is printed as such, not as "0 s".
+        let (fake, h) = FakePwsh::new();
+        let mut s = OutOfProcSession::new(fake).with_ack_timeout(Duration::from_millis(1500));
+        h.hold_replies(true);
+        let err = s.send(Uuid::nil(), b"a").await.unwrap_err();
+        assert!(err.to_string().contains("within 1.500 s"), "{err}");
+    }
+
+    /// The pool's own `Data` is acknowledged once the pool is built: its
+    /// timeout says so, and names the knob.
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_on_the_pool_data_names_the_setting() {
+        let (mut s, h) = session();
+        h.hold_replies(true);
+        let err = s.send(Uuid::nil(), b"a").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("SshConfig::with_ack_timeout"), "{msg}");
+        assert!(msg.contains(&format!("did not acknowledge Data for {NIL} within 60 s")));
     }
 
     #[tokio::test(start_paused = true)]

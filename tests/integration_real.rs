@@ -446,6 +446,30 @@ async fn ssh_pool() -> Option<RunspacePool<psrp_rs::SshPsrpTransport>> {
     )
 }
 
+/// `pwsh` acknowledges the pool's first message only once the pool is built
+/// (about a second): a 1 ms bound fails there, with a message that names the
+/// setting, and the default (60 s) is what every other test uses.
+#[cfg(feature = "ssh")]
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]
+async fn live_ssh_short_ack_timeout_is_reported() {
+    let Some(config) = ssh_config().await else {
+        return;
+    };
+    let transport = psrp_rs::SshPsrpTransport::connect(
+        config.with_ack_timeout(std::time::Duration::from_millis(1)),
+    )
+    .await
+    .expect("SSH connect");
+    let err = RunspacePool::open_with_transport(transport)
+        .await
+        .map(|_| ())
+        .expect_err("opening the pool cannot be acknowledged within 1 ms");
+    let message = err.to_string();
+    assert!(message.contains("did not acknowledge"), "{message}");
+    assert!(message.contains("with_ack_timeout"), "{message}");
+}
+
 #[cfg(feature = "ssh")]
 #[tokio::test]
 #[ignore = "requires PSRP_INTEGRATION_SSH_HOST"]

@@ -6,6 +6,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`SshConfig::with_ack_timeout`** sets how long to wait for `pwsh` to
+  acknowledge a request over SSH (default 60 s, as before). `pwsh`
+  acknowledges the runspace pool's first message only once the pool is
+  built, which a heavy session configuration, an antivirus scan on a cold
+  start or an overloaded host can delay past 60 s; the error for that
+  request now names the setting. A zero timeout is refused by
+  `SshPsrpTransport::connect`.
+
 ### Changed
 
 - **`sha1` 0.10 and `rsa`'s `sha1` feature are gone from the dependency
