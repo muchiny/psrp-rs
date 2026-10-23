@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use russh::ChannelMsg;
 use russh::keys::PublicKeyOrCertificate;
 use russh::keys::key::PrivateKeyWithHashAlg;
@@ -51,7 +51,8 @@ use russh::keys::ssh_key::{
     self, HashAlg,
     known_hosts::{Entry, HostPatterns, KnownHosts, Marker},
 };
-use sha1::Sha1;
+pub use secrecy::{ExposeSecret, SecretString};
+use sha1_hmac::Sha1;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -75,7 +76,16 @@ pub enum HostKeyPolicy {
     /// and hashed (`|1|`) entries are supported. Lines marked
     /// `@cert-authority` are ignored (this transport does not currently
     /// implement certificate-authority validation); `@revoked` entries
-    /// always cause the connection to be refused.
+    /// always cause the connection to be refused. Keys are compared
+    /// without their comment, and fields may be separated by any run of
+    /// spaces and tabs.
+    ///
+    /// The host is looked up as ssh(1) does: as `ssh -G` prints it (lower
+    /// case, a numeric address in canonical form: `127.1` is `127.0.0.1`)
+    /// on port 22, and as `[host]:port` on any other port. So `*` covers
+    /// every port, `[host]:*` every port but 22, and `*.example.com` port
+    /// 22 only. Unlike ssh(1) in some setups, nothing is retried under the
+    /// bare name when no entry matches `[host]:port`: the key is refused.
     KnownHosts(PathBuf),
     /// Accept any host key. **Disables MITM protection.** Only use for
     /// throwaway test environments where you control the network path.
@@ -114,7 +124,9 @@ impl Default for HostKeyPolicy {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SshConfig {
-    /// Remote hostname or IP.
+    /// Remote hostname or IP. [`SshPsrpTransport::connect`] refuses a host
+    /// that ssh(1) refuses: empty, starting with `-`, or holding
+    /// whitespace, a control character or one of ``'`"$\;&<>|(){},``.
     pub host: String,
     /// SSH port (default 22).
     pub port: u16,
@@ -197,17 +209,43 @@ impl SshConfig {
 }
 
 /// SSH authentication method.
-#[derive(Debug, Clone)]
+///
+/// The password and the passphrase are [`SecretString`]s: the copy each
+/// `SshAuth` (and each clone of it) holds is wiped when it is dropped, and
+/// reading one back takes an explicit [`ExposeSecret::expose_secret`].
+/// Build them with `.into()` from a `&str` or a `String`. The value you
+/// build one from stays yours to wipe; converting a `String` with spare
+/// capacity reallocates it and leaves the old buffer as it was. During
+/// [`SshPsrpTransport::connect`], russh wipes the copy of the password it
+/// sends; the copies its key loader makes are outside this crate's reach.
+/// `Debug` never prints them, so a config can be logged safely.
+#[derive(Clone)]
 pub enum SshAuth {
     /// Password authentication.
-    Password(String),
+    Password(SecretString),
     /// Private key file with optional passphrase.
     PrivateKey {
+        /// OpenSSH private key file.
         path: PathBuf,
-        passphrase: Option<String>,
+        /// Passphrase of an encrypted key file; `None` for a plain one.
+        passphrase: Option<SecretString>,
     },
     /// Use the running SSH agent.
     Agent,
+}
+
+impl std::fmt::Debug for SshAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password(_) => f.debug_tuple("Password").field(&"<redacted>").finish(),
+            Self::PrivateKey { path, passphrase } => f
+                .debug_struct("PrivateKey")
+                .field("path", path)
+                .field("passphrase", &passphrase.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            Self::Agent => f.write_str("Agent"),
+        }
+    }
 }
 
 /// Client handler for russh that enforces a [`HostKeyPolicy`].
@@ -284,6 +322,14 @@ impl SshPsrpTransport {
     /// attempted. A failed validation aborts the connection with a
     /// protocol error and **no credentials are sent**.
     pub async fn connect(config: SshConfig) -> Result<Self> {
+        // Refused before any lookup, so such a name never reaches a
+        // resolver, a log line or a `known_hosts` lookup.
+        if !valid_ssh_host(&config.host) {
+            return Err(PsrpError::protocol(
+                "invalid SSH host: empty, starting with '-', or holding whitespace, \
+                 a control character or one of '`\"$\\;&<>|(){},",
+            ));
+        }
         let ssh_config = russh::client::Config::default();
         let addr = format!("{}:{}", config.host, config.port);
         debug!(%addr, "SSH: connecting");
@@ -304,11 +350,12 @@ impl SshPsrpTransport {
         // Authenticate
         let authenticated = match &config.auth {
             SshAuth::Password(pw) => handle
-                .authenticate_password(&config.username, pw)
+                .authenticate_password(&config.username, pw.expose_secret())
                 .await
                 .map_err(|e| PsrpError::protocol(format!("SSH password auth: {e}")))?,
             SshAuth::PrivateKey { path, passphrase } => {
-                let private_key = russh::keys::load_secret_key(path, passphrase.as_deref())
+                let passphrase = passphrase.as_ref().map(ExposeSecret::expose_secret);
+                let private_key = russh::keys::load_secret_key(path, passphrase)
                     .map_err(|e| PsrpError::protocol(format!("SSH key load: {e}")))?;
                 let key = PrivateKeyWithHashAlg::new(Arc::new(private_key), None);
                 handle
@@ -456,75 +503,192 @@ fn verify_against_known_hosts(
 ) -> std::result::Result<(), String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read known_hosts file {}: {e}", path.display()))?;
-    let mut matched_accept = false;
+    match known_hosts_verdict(&contents, host, port, key) {
+        KnownHostsVerdict::Trusted => Ok(()),
+        KnownHostsVerdict::Revoked => Err(format!(
+            "host key for {host}:{port} explicitly revoked in {}",
+            path.display()
+        )),
+        KnownHostsVerdict::NotTrusted => Err(format!(
+            "no matching entry for {host}:{port} in {} — host key not trusted",
+            path.display()
+        )),
+    }
+}
+
+/// What a `known_hosts` file says about one host key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KnownHostsVerdict {
+    /// An unmarked entry for the host lists the key.
+    Trusted,
+    /// An `@revoked` entry for the host lists the key.
+    Revoked,
+    /// No entry vouches for the key.
+    NotTrusted,
+}
+
+/// Look `key` up for `host:port` in the text of a `known_hosts` file the
+/// way ssh(1) does: every entry, plain or hashed, is matched against the
+/// one name from [`known_hosts_lookup_name`], keys are compared without
+/// their comment, and a revocation wins over any entry that trusts the
+/// key.
+pub(crate) fn known_hosts_verdict(
+    contents: &str,
+    host: &str,
+    port: u16,
+    key: &ssh_key::PublicKey,
+) -> KnownHostsVerdict {
+    let lookup = known_hosts_lookup_name(host, port);
+    let contents = normalize_known_hosts(contents);
+    let mut trusted = false;
     for entry in KnownHosts::new(&contents) {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue, // malformed line — skip silently like ssh(1)
         };
-        if !host_matches_entry(&entry, host, port) {
+        if !host_matches_entry(&entry, &lookup) {
             continue;
         }
+        // `PublicKey`'s `==` also compares the comment, which a line
+        // copied from a `.pub` file carries and the server's key never does.
+        let same_key = entry.public_key().key_data() == key.key_data();
         match entry.marker() {
-            Some(Marker::Revoked) if entry.public_key() == key => {
-                return Err(format!(
-                    "host key for {host} explicitly revoked in {}",
-                    path.display()
-                ));
-            }
+            Some(Marker::Revoked) if same_key => return KnownHostsVerdict::Revoked,
             Some(Marker::Revoked) => continue,
             // Cert-authority entries are not currently honored — see
             // module docs. Treat them as non-matches.
             Some(Marker::CertAuthority) => continue,
-            None => {
-                if entry.public_key() == key {
-                    matched_accept = true;
-                }
-            }
+            None => trusted |= same_key,
         }
     }
-    if matched_accept {
-        Ok(())
+    if trusted {
+        KnownHostsVerdict::Trusted
     } else {
-        Err(format!(
-            "no matching entry for {host}:{port} in {} — host key not trusted",
-            path.display()
-        ))
+        KnownHostsVerdict::NotTrusted
     }
 }
 
-fn host_matches_entry(entry: &Entry, host: &str, port: u16) -> bool {
+/// ssh(1) splits a `known_hosts` line on any run of spaces and tabs; the
+/// `ssh-key` parser wants exactly one space between fields and skips any
+/// other line as malformed, an `@revoked` one included. Rewrite every
+/// line with single spaces first.
+fn normalize_known_hosts(contents: &str) -> String {
+    contents
+        .lines()
+        .map(|line| line.split_ascii_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The name ssh(1) looks a host up under in `known_hosts`: the host for
+/// port 22, `[host]:port` for any other port, with the host as `ssh -G`
+/// prints it (see [`canonical_host`]). It is also the name `ssh-keygen -H`
+/// hashes.
+pub(crate) fn known_hosts_lookup_name(host: &str, port: u16) -> String {
+    let host = canonical_host(host);
+    if port == 22 {
+        host
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+/// A numeric address in its canonical form (`127.1` is `127.0.0.1`,
+/// `[2001:DB8:0::1]` is `2001:db8::1`), as the resolver reads it and
+/// ssh(1) rewrites it; any other host in lower case.
+fn canonical_host(host: &str) -> String {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        return ip.to_string();
+    }
+    if let Some(ip) = parse_inet_aton(host) {
+        return ip.to_string();
+    }
+    host.to_ascii_lowercase()
+}
+
+/// The IPv4 forms `inet_aton(3)` accepts, which the system resolver and
+/// so ssh(1) take as addresses: one to four dot-separated numbers, each
+/// decimal, octal (leading `0`) or hexadecimal (`0x`), the last one
+/// filling every byte the others leave.
+fn parse_inet_aton(s: &str) -> Option<std::net::Ipv4Addr> {
+    let mut parts = Vec::with_capacity(4);
+    for part in s.split('.') {
+        let (digits, radix) =
+            if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+                (hex, 16)
+            } else if part.len() > 1
+                && let Some(octal) = part.strip_prefix('0')
+            {
+                (octal, 8)
+            } else {
+                (part, 10)
+            };
+        // `from_str_radix` would also take a sign.
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+            return None;
+        }
+        parts.push(u32::from_str_radix(digits, radix).ok()?);
+        if parts.len() > 4 {
+            return None;
+        }
+    }
+    let (last, leading) = parts.split_last()?;
+    if leading.iter().any(|&p| p > 0xff) {
+        return None;
+    }
+    // Bits left for the last number: 32, 24, 16 or 8.
+    let free_bits = 32 - 8 * u32::try_from(leading.len()).ok()?;
+    if free_bits < 32 && *last >> free_bits != 0 {
+        return None;
+    }
+    let high = leading
+        .iter()
+        .zip([24u32, 16, 8])
+        .fold(0u32, |acc, (&p, shift)| acc | (p << shift));
+    Some(std::net::Ipv4Addr::from(high | last))
+}
+
+/// ssh(1)'s own check on a host name (`ssh -G` refuses these with
+/// "hostname contains invalid characters"): not empty, no leading `-`,
+/// no whitespace or control character, none of ``'`"$\;&<>|(){}`` nor
+/// the `known_hosts` list separator `,`.
+fn valid_ssh_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with('-')
+        && !host
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "'`\"$\\;&<>|(){},".contains(c))
+}
+
+fn host_matches_entry(entry: &Entry, lookup: &str) -> bool {
     match entry.host_patterns() {
-        HostPatterns::Patterns(patterns) => host_matches_patterns(patterns, host, port),
-        HostPatterns::HashedName { salt, hash } => host_matches_hashed(salt, hash, host),
+        HostPatterns::Patterns(patterns) => host_matches_patterns(patterns, lookup),
+        HostPatterns::HashedName { salt, hash } => host_matches_hashed(salt, hash, lookup),
     }
 }
 
-/// OpenSSH-style host pattern matching.
+/// OpenSSH-style host pattern matching against a name from
+/// [`known_hosts_lookup_name`].
 ///
 /// Supports:
-/// * literal hostnames (`example.com`)
-/// * glob wildcards `*` and `?`
-/// * `[host]:port` syntax for non-default ports
+/// * literal names (`example.com`, `[example.com]:2222`)
+/// * glob wildcards `*` and `?`, which also cover the port
+///   (`*` matches every host on every port, `[example.com]:*` every
+///   non-default port of one host)
 /// * `!pattern` negation — a single negation wins over any positive
 ///   match on the same line, mirroring ssh(1) behaviour
-pub(crate) fn host_matches_patterns(patterns: &[String], host: &str, port: u16) -> bool {
+pub(crate) fn host_matches_patterns(patterns: &[String], lookup: &str) -> bool {
     let mut positive = false;
     for raw in patterns {
         let (negate, pattern) = match raw.strip_prefix('!') {
             Some(rest) => (true, rest),
             None => (false, raw.as_str()),
         };
-        let (pat_host, pat_port) = parse_pattern_host_port(pattern);
-        if let Some(p) = pat_port {
-            if p != port {
-                continue;
-            }
-        } else if port != 22 {
-            // Bare patterns only match the default SSH port.
-            continue;
-        }
-        if !glob_match(pat_host, host) {
+        if !glob_match(pattern, lookup) {
             continue;
         }
         if negate {
@@ -533,17 +697,6 @@ pub(crate) fn host_matches_patterns(patterns: &[String], host: &str, port: u16) 
         positive = true;
     }
     positive
-}
-
-pub(crate) fn parse_pattern_host_port(pattern: &str) -> (&str, Option<u16>) {
-    if let Some(rest) = pattern.strip_prefix('[') {
-        if let Some((host, port_str)) = rest.split_once("]:") {
-            if let Ok(p) = port_str.parse::<u16>() {
-                return (host, Some(p));
-            }
-        }
-    }
-    (pattern, None)
 }
 
 pub(crate) fn glob_match(pattern: &str, target: &str) -> bool {
@@ -607,6 +760,11 @@ fn glob_match_bytes(pattern: &[u8], target: &[u8]) -> bool {
 }
 
 pub(crate) fn host_matches_hashed(salt: &[u8], expected: &[u8; 20], host: &str) -> bool {
+    // OpenSSH refuses a line whose salt is not exactly one SHA-1 digest
+    // long, so it never trusts what that line names.
+    if salt.len() != expected.len() {
+        return false;
+    }
     let mut mac = match Hmac::<Sha1>::new_from_slice(salt) {
         Ok(m) => m,
         Err(_) => return false,
@@ -735,36 +893,29 @@ mod tests {
         );
     }
 
+    fn patterns_match(patterns: &[&str], host: &str, port: u16) -> bool {
+        let patterns: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
+        host_matches_patterns(&patterns, &known_hosts_lookup_name(host, port))
+    }
+
+    fn entry_matches(entry: &Entry, host: &str, port: u16) -> bool {
+        host_matches_entry(entry, &known_hosts_lookup_name(host, port))
+    }
+
     #[test]
     fn pattern_match_respects_port_brackets() {
-        assert!(host_matches_patterns(
-            &["[example.com]:2222".to_string()],
-            "example.com",
-            2222,
-        ));
-        assert!(!host_matches_patterns(
-            &["[example.com]:2222".to_string()],
-            "example.com",
-            22,
-        ));
+        assert!(patterns_match(&["[example.com]:2222"], "example.com", 2222));
+        assert!(!patterns_match(&["[example.com]:2222"], "example.com", 22));
         // bare pattern matches default port only
-        assert!(host_matches_patterns(
-            &["example.com".to_string()],
-            "example.com",
-            22,
-        ));
-        assert!(!host_matches_patterns(
-            &["example.com".to_string()],
-            "example.com",
-            2222,
-        ));
+        assert!(patterns_match(&["example.com"], "example.com", 22));
+        assert!(!patterns_match(&["example.com"], "example.com", 2222));
     }
 
     #[test]
     fn pattern_negation_overrides_positive_match() {
-        let patterns = vec!["*.example.com".to_string(), "!evil.example.com".to_string()];
-        assert!(host_matches_patterns(&patterns, "good.example.com", 22));
-        assert!(!host_matches_patterns(&patterns, "evil.example.com", 22));
+        let patterns = ["*.example.com", "!evil.example.com"];
+        assert!(patterns_match(&patterns, "good.example.com", 22));
+        assert!(!patterns_match(&patterns, "evil.example.com", 22));
     }
 
     #[test]
@@ -779,6 +930,105 @@ mod tests {
         assert!(host_matches_hashed(salt, &expected, host));
         // A different host must not match.
         assert!(!host_matches_hashed(salt, &expected, "other.example.com"));
+    }
+
+    /// The `|1|salt|hash` form `ssh-keygen -H` writes for `name`.
+    fn hashed_name(name: &str) -> String {
+        let salt: Vec<u8> = (1u8..=20).collect();
+        hashed_name_with_salt(name, &salt)
+    }
+
+    fn hashed_name_with_salt(name: &str, salt: &[u8]) -> String {
+        let mut mac = Hmac::<Sha1>::new_from_slice(salt).unwrap();
+        mac.update(name.as_bytes());
+        let hash: [u8; 20] = mac.finalize().into_bytes().into();
+        HostPatterns::HashedName {
+            salt: salt.to_vec(),
+            hash,
+        }
+        .to_string()
+    }
+
+    fn hashed_entry(name: &str) -> Entry {
+        format!("{} {KEY}", hashed_name(name)).parse().unwrap()
+    }
+
+    #[test]
+    fn hashed_entry_for_default_port_does_not_match_other_port() {
+        let entry = hashed_entry("host.example.com");
+        assert!(entry_matches(&entry, "host.example.com", 22));
+        assert!(!entry_matches(&entry, "host.example.com", 2222));
+    }
+
+    #[test]
+    fn hashed_entry_for_non_default_port_uses_bracketed_form() {
+        // OpenSSH hashes `[host]:port` when the port is not 22.
+        let entry = hashed_entry("[host.example.com]:2222");
+        assert!(entry_matches(&entry, "host.example.com", 2222));
+        assert!(!entry_matches(&entry, "host.example.com", 22));
+        assert!(!entry_matches(&entry, "host.example.com", 2223));
+    }
+
+    #[test]
+    fn ssh_auth_debug_redacts_secrets() {
+        let pw = format!("{:?}", SshAuth::Password("hunter2".into()));
+        assert!(!pw.contains("hunter2"), "{pw}");
+        let key = format!(
+            "{:?}",
+            SshAuth::PrivateKey {
+                path: PathBuf::from("/k"),
+                passphrase: Some("hunter2".into()),
+            }
+        );
+        assert!(!key.contains("hunter2"), "{key}");
+        assert!(key.contains("/k"), "{key}");
+        let cfg = SshConfig::new("h", "u", SshAuth::Password("hunter2".into()));
+        assert!(!format!("{cfg:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn ssh_auth_keeps_secrets_in_secret_strings() {
+        // Compiles only while the fields are `SecretString`s (a `String`
+        // has no `expose_secret`), the type that wipes them on drop.
+        let SshAuth::Password(pw) = SshAuth::Password("hunter2".into()) else {
+            unreachable!()
+        };
+        assert_eq!(pw.expose_secret(), "hunter2");
+        let key = SshAuth::PrivateKey {
+            path: PathBuf::from("/k"),
+            passphrase: Some("hunter2".into()),
+        };
+        let SshAuth::PrivateKey { passphrase, .. } = key else {
+            unreachable!()
+        };
+        assert_eq!(
+            passphrase.as_ref().map(ExposeSecret::expose_secret),
+            Some("hunter2")
+        );
+    }
+
+    // Lines produced by `ssh-keygen -H` (OpenSSH) from a plain known_hosts
+    // file; unlike the tests above they do not reuse our own HMAC, so a
+    // regression in the derivation cannot cancel itself out.
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9dG4kjRhQTtWTVzd2t27+t0DEHBPW7iOD23TUiYLio";
+    // `ssh-keygen -F host.example.com` finds this line.
+    const OPENSSH_HASHED_PORT_22: &str =
+        "|1|lYwLrkkXUy8VYdhIoABoFOAIbjw=|mkD0YR/iu/f+3KCw7RERu6gNQ2Y=";
+    // `ssh-keygen -F '[host.example.com]:2222'` finds this line.
+    const OPENSSH_HASHED_PORT_2222: &str =
+        "|1|cozVwoXi94RwYGBCGJ9g1AW6EFc=|Vv+J4nPh4vRAM5fgFqPFI0TlKS8=";
+
+    #[test]
+    fn openssh_generated_hashed_entries_match() {
+        let e22: Entry = format!("{OPENSSH_HASHED_PORT_22} {KEY}").parse().unwrap();
+        assert!(entry_matches(&e22, "host.example.com", 22));
+        assert!(!entry_matches(&e22, "host.example.com", 2222));
+        assert!(!entry_matches(&e22, "other.example.com", 22));
+        let e2222: Entry = format!("{OPENSSH_HASHED_PORT_2222} {KEY}").parse().unwrap();
+        assert!(entry_matches(&e2222, "host.example.com", 2222));
+        assert!(!entry_matches(&e2222, "host.example.com", 22));
+        assert!(!entry_matches(&e2222, "other.example.com", 2222));
     }
 
     #[test]
@@ -876,6 +1126,8 @@ mod tests {
             err.contains("revoked"),
             "expected revoked rejection, got: {err}"
         );
+        // Both rejections name the host and the port.
+        assert!(err.contains("example.com:22"), "{err}");
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -997,5 +1249,188 @@ mod tests {
         let policy = HostKeyPolicy::KnownHosts(tmp.clone());
         verify_host_key(&policy, "example.com", 22, &key).unwrap();
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The verdict of `contents` on `KEY` as russh hands it over: key data
+    /// only, no comment.
+    fn verdict(contents: &str, host: &str, port: u16) -> KnownHostsVerdict {
+        let key: ssh_key::PublicKey = KEY.parse().unwrap();
+        let key = ssh_key::PublicKey::from(key.key_data().clone());
+        known_hosts_verdict(contents, host, port, &key)
+    }
+
+    #[test]
+    fn revoked_wildcard_applies_on_every_port() {
+        // The sshd(8) manual's own example. OpenSSH looks `[host]:2222`
+        // up for port 2222, and `*` matches that too.
+        let file = format!("@revoked * {KEY}\n[host.example.com]:2222 {KEY}\n");
+        assert_eq!(
+            verdict(&file, "host.example.com", 2222),
+            KnownHostsVerdict::Revoked
+        );
+    }
+
+    #[test]
+    fn port_wildcard_pattern_matches_any_non_default_port() {
+        let file = format!("[host.example.com]:* {KEY}\n");
+        assert_eq!(
+            verdict(&file, "host.example.com", 2222),
+            KnownHostsVerdict::Trusted
+        );
+        // Port 22 is looked up as the bare name, which has no brackets.
+        assert_eq!(
+            verdict(&file, "host.example.com", 22),
+            KnownHostsVerdict::NotTrusted
+        );
+    }
+
+    #[test]
+    fn bracketed_default_port_is_not_the_openssh_lookup_name() {
+        // ssh(1) never writes `[host]:22` and never looks it up.
+        let file = format!("[host.example.com]:22 {KEY}\n");
+        assert_eq!(
+            verdict(&file, "host.example.com", 22),
+            KnownHostsVerdict::NotTrusted
+        );
+    }
+
+    #[test]
+    fn hashed_entry_matches_whatever_the_host_name_case() {
+        let file = format!("{} {KEY}\n", hashed_name("host.example.com"));
+        assert_eq!(
+            verdict(&file, "Host.Example.COM", 22),
+            KnownHostsVerdict::Trusted
+        );
+    }
+
+    #[test]
+    fn hashed_revocation_applies_whatever_the_host_name_case() {
+        let file = format!(
+            "@revoked {} {KEY}\n[*.example.com]:2222 {KEY}\n",
+            hashed_name("[host.example.com]:2222")
+        );
+        assert_eq!(
+            verdict(&file, "Host.Example.COM", 2222),
+            KnownHostsVerdict::Revoked
+        );
+    }
+
+    #[test]
+    fn trust_line_with_a_key_comment_still_trusts() {
+        let file = format!("host.example.com {KEY} admin@laptop\n");
+        assert_eq!(
+            verdict(&file, "host.example.com", 22),
+            KnownHostsVerdict::Trusted
+        );
+    }
+
+    #[test]
+    fn revocation_with_a_key_comment_still_revokes() {
+        // A line copied from a `.pub` file carries the key's comment; the
+        // server's key never does.
+        let file = format!("@revoked * {KEY} compromised\nhost.example.com {KEY}\n");
+        assert_eq!(
+            verdict(&file, "host.example.com", 22),
+            KnownHostsVerdict::Revoked
+        );
+    }
+
+    #[test]
+    fn revocation_written_with_tabs_or_extra_spaces_still_revokes() {
+        // ssh(1) splits fields on any run of spaces and tabs.
+        let tabbed = KEY.replace(' ', "\t");
+        for revoked in [
+            format!("@revoked\t*\t{tabbed}"),
+            format!("@revoked  * {KEY}"),
+            format!("  @revoked * {KEY}"),
+            format!("@revoked * {KEY}  \r"),
+        ] {
+            let file = format!("{revoked}\nhost.example.com {KEY}\n");
+            assert_eq!(
+                verdict(&file, "host.example.com", 22),
+                KnownHostsVerdict::Revoked,
+                "{revoked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_line_written_with_tabs_trusts() {
+        let file = format!("host.example.com\t{}\n", KEY.replace(' ', "\t"));
+        assert_eq!(
+            verdict(&file, "host.example.com", 22),
+            KnownHostsVerdict::Trusted
+        );
+    }
+
+    #[test]
+    fn numeric_hosts_are_looked_up_in_canonical_form() {
+        // What `ssh -G <host>` prints as `hostname` (OpenSSH 10.0), except
+        // the bracketed row: ssh(1) takes the port apart and the address
+        // bare, whereas `SshConfig::host` may carry the brackets the
+        // `host:port` connect string needs, so `[addr]` is read as `addr`.
+        for (host, port, lookup) in [
+            ("127.1", 22, "127.0.0.1"),
+            ("0x7f.1", 22, "127.0.0.1"),
+            ("017.0.0.1", 22, "15.0.0.1"),
+            ("2001:DB8:0:0::1", 22, "2001:db8::1"),
+            ("[2001:db8:0::1]", 2222, "[2001:db8::1]:2222"),
+            ("Host.Example.COM", 2222, "[host.example.com]:2222"),
+            // Not addresses: kept as written, in lower case.
+            ("1.2.3.256", 22, "1.2.3.256"),
+            ("256.1", 22, "256.1"),
+            ("1.16777216", 22, "1.16777216"),
+            ("+1", 22, "+1"),
+            ("1.2.3.4.", 22, "1.2.3.4."),
+        ] {
+            assert_eq!(known_hosts_lookup_name(host, port), lookup, "{host}");
+        }
+    }
+
+    #[test]
+    fn revocation_of_an_address_applies_to_its_short_form() {
+        let file = format!("@revoked 127.0.0.1 {KEY}\n127.* {KEY}\n");
+        assert_eq!(verdict(&file, "127.1", 22), KnownHostsVerdict::Revoked);
+    }
+
+    #[test]
+    fn hashed_entry_with_a_salt_that_is_not_20_bytes_is_ignored() {
+        // OpenSSH refuses such a line: the salt is an HMAC-SHA1 key of
+        // exactly the digest's length.
+        let name = hashed_name_with_salt("host.example.com", &[7u8; 16]);
+        let file = format!("{name} {KEY}\n");
+        assert_eq!(
+            verdict(&file, "host.example.com", 22),
+            KnownHostsVerdict::NotTrusted
+        );
+    }
+
+    #[test]
+    fn hosts_ssh_refuses_are_refused() {
+        for host in [
+            "", "-x", "a b", "a\tb", "a\nb", "a\u{1}b", "a,b", "a;b", "a'b", "a`b", "a\"b", "a$b",
+            "a\\b", "a&b", "a<b", "a>b", "a|b", "a(b", "a)b", "a{b", "a}b",
+        ] {
+            assert!(!valid_ssh_host(host), "{host:?} accepted");
+        }
+        for host in [
+            "host.example.com",
+            "a-b",
+            "a*b",
+            "[2001:db8::1]",
+            "2001:db8::1",
+            "fe80::1%eth0",
+            "Host_1",
+        ] {
+            assert!(valid_ssh_host(host), "{host:?} refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_an_invalid_host_before_any_network() {
+        let config =
+            SshConfig::new("a,b", "u", SshAuth::Agent).with_connect_timeout(Duration::from_secs(2));
+        let err = SshPsrpTransport::connect(config).await.unwrap_err();
+        assert!(err.to_string().contains("invalid SSH host"), "{err}");
     }
 }

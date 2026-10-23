@@ -260,6 +260,28 @@ fn main() -> std::io::Result<()> {
         ),
         ("stars.bin", "*a*a*a*a*b\x00aaaaaaaaaaaaaaaa\x00"),
         ("literal.bin", "example.com\x00example.com\x00"),
+        (
+            "revoked.bin",
+            "host.example.com\x00\x08\x00\x00\x00@revoked * ssh-ed25519 \
+             AAAAC3NzaC1lZDI1NTE5AAAAIB9dG4kjRhQTtWTVzd2t27+t0DEHBPW7iOD23TUiYLio\n\
+             [host.example.com]:2222 ssh-ed25519 \
+             AAAAC3NzaC1lZDI1NTE5AAAAIB9dG4kjRhQTtWTVzd2t27+t0DEHBPW7iOD23TUiYLio\n",
+        ),
+        // Hashed lines from `ssh-keygen -H` (port 22 and port 2222), one
+        // with a key comment, a CA line and a revocation of another key:
+        // the shapes a fuzzer does not find on its own.
+        (
+            "hashed.bin",
+            "host.example.com\x00\x16\x00\x00\x00\
+             |1|lYwLrkkXUy8VYdhIoABoFOAIbjw=|mkD0YR/iu/f+3KCw7RERu6gNQ2Y= ssh-ed25519 \
+             AAAAC3NzaC1lZDI1NTE5AAAAIB9dG4kjRhQTtWTVzd2t27+t0DEHBPW7iOD23TUiYLio admin@laptop\n\
+             |1|cozVwoXi94RwYGBCGJ9g1AW6EFc=|Vv+J4nPh4vRAM5fgFqPFI0TlKS8= ssh-ed25519 \
+             AAAAC3NzaC1lZDI1NTE5AAAAIB9dG4kjRhQTtWTVzd2t27+t0DEHBPW7iOD23TUiYLio\n\
+             @cert-authority *.example.com ssh-ed25519 \
+             AAAAC3NzaC1lZDI1NTE5AAAAILRzpKj+f5Lzt8O6XsBRSJZNwZpRm9rA0kRNH4yp1ZxN\n\
+             @revoked host.example.com ssh-ed25519 \
+             AAAAC3NzaC1lZDI1NTE5AAAAILRzpKj+f5Lzt8O6XsBRSJZNwZpRm9rA0kRNH4yp1ZxN\n",
+        ),
     ] {
         write("known_hosts_match", name, text.as_bytes())?;
     }

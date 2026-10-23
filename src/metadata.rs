@@ -400,7 +400,7 @@ mod tests {
             .get_command_metadata(&["None-*"], CommandType::CMDLET)
             .await
             .unwrap();
-        assert!(cmds.is_empty());
+        assert!(cmds.is_empty(), "{cmds:?}");
         let _ = pool.close().await;
     }
 

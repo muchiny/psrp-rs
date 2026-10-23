@@ -171,7 +171,7 @@ async fn live_pipeline_builder_with_parameter() {
         .expect("run_all_streams");
     assert_eq!(result.state, PipelineState::Completed);
     assert_eq!(result.output, vec![PsValue::I32(42)]);
-    assert!(result.errors.is_empty());
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
 
     let _ = pool.close().await;
 }
@@ -295,7 +295,8 @@ async fn live_ssh_one_plus_one() {
         .unwrap_or(22);
 
     let transport = psrp_rs::SshPsrpTransport::connect(
-        psrp_rs::SshConfig::new(host, user, psrp_rs::SshAuth::Password(pass)).with_port(port),
+        psrp_rs::SshConfig::new(host, user, psrp_rs::SshAuth::Password(pass.into()))
+            .with_port(port),
     )
     .await
     .expect("SSH connect");
@@ -323,7 +324,7 @@ async fn live_ssh_multiple_scripts() {
     let transport = psrp_rs::SshPsrpTransport::connect(psrp_rs::SshConfig::new(
         host,
         user,
-        psrp_rs::SshAuth::Password(pass),
+        psrp_rs::SshAuth::Password(pass.into()),
     ))
     .await
     .expect("SSH connect");
