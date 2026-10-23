@@ -8,7 +8,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use psrp_rs::clixml::parse_clixml;
-use psrp_rs::internal::parse::describe_errors;
+use psrp_rs::internal::parse::{describe_errors, failure_message};
 use psrp_rs::records::{
     ErrorRecord, FromPsObject, InformationRecord, ProgressRecord, TraceRecord, WarningRecord,
 };
@@ -36,7 +36,14 @@ fuzz_target!(|data: &[u8]| {
         let _ = TraceRecord::from_ps_object(value);
     }
 
-    // `describe_errors` renders untrusted values into the message of a
-    // `PsrpError`, so it gets the whole batch too.
-    let _ = describe_errors(&values);
+    // `describe_errors` and `failure_message` render untrusted values
+    // (and, for the latter, a `PipelineState` body) into the message of a
+    // `PsrpError`, so they get the whole batch too, and what they write
+    // must never carry a character that could rewrite a terminal.
+    for message in [describe_errors(&values), failure_message(text, &values)] {
+        assert!(
+            !message.chars().any(char::is_control),
+            "unescaped control character in {message:?}"
+        );
+    }
 });
