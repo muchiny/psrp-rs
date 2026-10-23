@@ -446,6 +446,42 @@ async fn live_failed_pipeline_reports_its_reason() {
     let _ = pool.close().await;
 }
 
+/// A .NET enum is an `<Obj>` whose number is a nameless child: it used to be
+/// dropped, so every enum came back as an empty object.
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_enum_value_is_decoded() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    let out = pool
+        .run_script("[DayOfWeek]::Friday, [System.IO.FileAttributes]'ReadOnly, Hidden'")
+        .await
+        .expect("run_script");
+    let values: Vec<_> = out
+        .iter()
+        .map(|v| match v {
+            PsValue::Object(o) => (o.type_names.first().cloned(), o.get("_value").cloned()),
+            other => panic!("not an object: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (Some("System.DayOfWeek".to_string()), Some(PsValue::I32(5))),
+            (
+                Some("System.IO.FileAttributes".to_string()),
+                Some(PsValue::I32(3))
+            ),
+        ]
+    );
+
+    let _ = pool.close().await;
+}
+
 // ---- SSH transport tests ----
 
 /// Build the SSH config from `PSRP_INTEGRATION_SSH_{HOST,PORT,USER,PASS}`.

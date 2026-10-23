@@ -491,7 +491,14 @@ fn parse_obj_body(reader: &mut Reader<&[u8]>, state: &mut DecoderState) -> Resul
                     let entries = parse_dict(reader, state)?;
                     embedded = Some(PsValue::Dict(entries));
                 }
-                _ => skip_to_end(reader)?,
+                // A nameless scalar child: the number of a .NET enum
+                // (`<TN>…System.Enum…</TN><ToString>Monday</ToString>
+                // <I32>1</I32>`). Anything else unknown is skipped.
+                _ => {
+                    if let Some(value) = parse_element(reader, &e, state)? {
+                        embedded.get_or_insert(value);
+                    }
+                }
             },
             Event::Empty(e) => match e.name().as_ref() {
                 "TNRef" => {
@@ -514,9 +521,9 @@ fn parse_obj_body(reader: &mut Reader<&[u8]>, state: &mut DecoderState) -> Resul
         buf.clear();
     }
 
-    // If the object had no <MS> but contained an embedded LST / DCT, expose
-    // it under the synthetic property name "_value" so callers can still
-    // retrieve it easily.
+    // If the object had no <MS> but contained an embedded LST / DCT / scalar,
+    // expose it under the synthetic property name "_value" so callers can
+    // still retrieve it easily.
     if let Some(v) = embedded
         && obj.properties.is_empty()
     {
@@ -1820,5 +1827,84 @@ mod tests {
             panic!("{list:?}");
         };
         assert_eq!(items.len(), 15_000);
+    }
+
+    /// A .NET enum as `PSSerializer` writes it (captured from pwsh over
+    /// WinRM): the number is a nameless child, which used to be dropped, so
+    /// every enum came back as an empty object.
+    #[test]
+    fn enum_value_is_kept_under_value() {
+        let xml = concat!(
+            r#"<Obj RefId="0"><TN RefId="0"><T>System.IO.FileAttributes</T><T>System.Enum</T>"#,
+            r#"<T>System.ValueType</T><T>System.Object</T></TN>"#,
+            r#"<ToString>ReadOnly, Hidden</ToString><I32>3</I32></Obj>"#,
+        );
+        let got = parse_clixml(xml).unwrap();
+        let [PsValue::Object(o)] = got.as_slice() else {
+            panic!("expected one object, got {got:?}");
+        };
+        assert_eq!(o.get("_value"), Some(&PsValue::I32(3)));
+        assert_eq!(o.type_names[0], "System.IO.FileAttributes");
+        assert_eq!(o.type_names[1], "System.Enum");
+    }
+
+    /// Other underlying types, and an enum inside a property, a list and a
+    /// dictionary value (`CommandOrigin` of an `InvocationInfo`).
+    #[test]
+    fn enum_value_survives_inside_containers() {
+        let en = |n: &str, v: &str| {
+            format!(
+                r#"<Obj RefId="9"><TN RefId="9"><T>E</T><T>System.Enum</T></TN><ToString>x</ToString><{n}>{v}</{n}></Obj>"#
+            )
+        };
+        let xml = format!(
+            r#"<Obj RefId="0"><MS>{}</MS></Obj>"#,
+            en("I32", "1").replace("<Obj ", r#"<Obj N="Origin" "#)
+        );
+        let got = parse_clixml(&xml).unwrap();
+        let [PsValue::Object(o)] = got.as_slice() else {
+            panic!("{got:?}");
+        };
+        let Some(PsValue::Object(origin)) = o.get("Origin") else {
+            panic!("{o:?}");
+        };
+        assert_eq!(origin.get("_value"), Some(&PsValue::I32(1)));
+
+        let xml = format!(
+            r#"<Obj RefId="0"><LST>{}{}</LST></Obj>"#,
+            en("By", "7"),
+            en("I64", "9000000000")
+        );
+        let got = parse_clixml(&xml).unwrap();
+        let [PsValue::Object(list)] = got.as_slice() else {
+            panic!("{got:?}");
+        };
+        let Some(PsValue::List(items)) = list.get("_value") else {
+            panic!("{list:?}");
+        };
+        let values: Vec<_> = items
+            .iter()
+            .map(|i| match i {
+                PsValue::Object(o) => o.get("_value").cloned(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![Some(PsValue::U8(7)), Some(PsValue::I64(9_000_000_000))]
+        );
+    }
+
+    /// An object that has properties keeps them: the nameless child only
+    /// fills `_value` when there is no member set (as for `<LST>`).
+    #[test]
+    fn a_member_set_wins_over_a_nameless_scalar() {
+        let xml = r#"<Obj RefId="0"><MS><S N="a">x</S></MS><I32>5</I32></Obj>"#;
+        let got = parse_clixml(xml).unwrap();
+        let [PsValue::Object(o)] = got.as_slice() else {
+            panic!("{got:?}");
+        };
+        assert_eq!(o.get("a"), Some(&PsValue::String("x".into())));
+        assert!(o.get("_value").is_none());
     }
 }
