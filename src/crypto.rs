@@ -21,6 +21,13 @@
 //!    bare CBC, unauthenticated: see
 //!    [`SessionKey::encrypt_secure_string`].
 //!
+//! That AES step only applies because psrp-rs advertises protocol 2.3
+//! ([`PROTOCOL_VERSION`](crate::runspace::state::PROTOCOL_VERSION)): with a
+//! peer at 2.4 or later, PowerShell 7.6.7 skips it and sends the plain
+//! base64 of the UTF-16LE bytes (`utils/CryptoUtils.cs`, both
+//! `EncryptSecureString`/`DecryptSecureString` pairs), so advertising a
+//! newer version means revisiting `SecureString` handling.
+//!
 //! This module implements the **pure-Rust** crypto (no OpenSSL) needed
 //! for that exchange plus a [`SessionKey`] helper that encrypts and
 //! decrypts individual `SecureString` values.
@@ -418,12 +425,13 @@ mod tests {
         SessionKey::from_bytes(key)
     }
 
-    /// `<SS>` bodies produced by PowerShell's own `PSRSACryptoServiceProvider`
-    /// under [`kat_key`], cross-checked with
-    /// `openssl enc -aes-256-cbc -iv 00000000000000000000000000000000`:
-    /// AES-256-CBC of the UTF-16LE plaintext with PKCS#7 padding and a zero
-    /// IV, base64 of the bare ciphertext.
-    const KNOWN_ANSWERS: [(&str, &str); 3] = [
+    /// `<SS>` bodies under [`kat_key`]: AES-256-CBC of the UTF-16LE
+    /// plaintext with PKCS#7 padding and a zero IV, base64 of the bare
+    /// ciphertext. Every one is checked with
+    /// `openssl enc -aes-256-cbc -iv 00000000000000000000000000000000`; the
+    /// first three were also produced by PowerShell's own
+    /// `PSRSACryptoServiceProvider`.
+    const KNOWN_ANSWERS: [(&str, &str); 5] = [
         ("pw", "yi84WiunSgv/41msG+Cefg=="),
         (
             "password123!",
@@ -433,6 +441,10 @@ mod tests {
             "héllo 🌍 world, long secret",
             "GF601hMKzNEwzPbSTwmiUE7PobW5mWNgTt71Lh4Kt0j4yqdn3ZQ7kzq6frECCxwU+GYit26BCXBEU5kLhywvpQ==",
         ),
+        // openssl only: the empty string is one block of padding, and 16
+        // bytes of UTF-16 take a whole extra block of it.
+        ("", "1F18WqJryp1rHV3b9o+e9g=="),
+        ("password", "AtBP5ctXaBlD9lUKXipy0YZvjfvpQen+bEjvw8i9j9I="),
     ];
 
     /// Regression (#21): psrp-rs used a random IV and sent it in front of
@@ -539,7 +551,7 @@ mod tests {
             (
                 "lone surrogate",
                 [[0x00, 0xD8].as_slice(), &[14; 14]].concat(),
-                "UTF-16",
+                "lone surrogate",
             ),
         ];
         for (what, padded, needle) in cases {
@@ -550,12 +562,17 @@ mod tests {
         }
     }
 
+    /// Fixed keys, so the outcome is fixed too: `x` sealed under
+    /// [`kat_key`] decrypts under `[0x11; 32]` to a block ending in `0x59`,
+    /// never a valid PKCS#7 pad (checked with openssl). With random keys a
+    /// wrong key yields a valid-looking plaintext about once in 10^5 runs.
     #[test]
     fn wrong_key_fails_decrypt() {
-        let k1 = SessionKey::random();
-        let k2 = SessionKey::random();
-        let ct = k1.encrypt_secure_string("x");
-        assert!(k2.decrypt_secure_string(&ct).is_err());
+        let ct = kat_key().encrypt_secure_string("x");
+        let err = SessionKey::from_bytes([0x11; 32])
+            .decrypt_secure_string(&ct)
+            .unwrap_err();
+        assert!(err.to_string().contains("PKCS#7"), "{err}");
     }
 
     #[test]
@@ -594,24 +611,32 @@ mod tests {
         assert_eq!(&blob[20..], n.as_slice());
     }
 
+    /// A valid ciphertext followed by stray bytes is not a whole number of
+    /// blocks: rejected on its length, before any decryption.
     #[test]
     fn decrypt_misaligned_payload() {
-        let key = SessionKey::random();
-        // Not a whole number of AES blocks.
-        for len in [17, 31, 33] {
-            assert!(key.decrypt_secure_string(&vec![0u8; len]).is_err(), "{len}");
+        let key = kat_key();
+        let valid = base64_decode(KNOWN_ANSWERS[0].1).unwrap();
+        assert_eq!(key.decrypt_secure_string(&valid).unwrap(), "pw");
+        for extra in 1..=15u8 {
+            let mut payload = valid.clone();
+            payload.extend(0..extra);
+            let err = key.decrypt_secure_string(&payload).unwrap_err();
+            assert!(err.to_string().contains("malformed"), "+{extra}: {err}");
         }
     }
 
+    /// Fixed key, so the outcome is fixed too: flipping the last byte of
+    /// `x`'s single block garbles the whole block, which then ends in
+    /// `0x73`, never a valid PKCS#7 pad (checked with openssl).
     #[test]
     fn decrypt_bad_pkcs7_padding() {
-        let key = SessionKey::random();
-        // Encrypt something valid, then tamper with the last byte (padding)
-        let ct = key.encrypt_secure_string("x");
-        let mut tampered = ct.clone();
-        let len = tampered.len();
-        tampered[len - 1] ^= 0xFF; // flip last byte
-        assert!(key.decrypt_secure_string(&tampered).is_err());
+        let key = kat_key();
+        let mut tampered = key.encrypt_secure_string("x");
+        let last = tampered.last_mut().unwrap();
+        *last ^= 0xFF;
+        let err = key.decrypt_secure_string(&tampered).unwrap_err();
+        assert!(err.to_string().contains("PKCS#7"), "{err}");
     }
 
     #[test]

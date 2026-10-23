@@ -285,15 +285,19 @@ async fn live_pool_survives_multiple_pipelines() {
 async fn secure_string_round_trip<T: psrp_rs::PsrpTransport>(pool: &mut RunspacePool<T>) {
     pool.request_session_key().await.expect("session key");
 
-    // One block, and several blocks with a character outside the BMP.
-    for secret in ["p@ss", "héllo 🌍 world, long secret"] {
+    // One block, several blocks with a character outside the BMP, and the
+    // empty string (one block of padding; `ConvertTo-SecureString` refuses
+    // an empty string, hence the constructor).
+    for (secret, make) in [
+        ("p@ss", "ConvertTo-SecureString 'p@ss' -AsPlainText -Force"),
+        (
+            "héllo 🌍 world, long secret",
+            "ConvertTo-SecureString 'héllo 🌍 world, long secret' -AsPlainText -Force",
+        ),
+        ("", "[securestring]::new()"),
+    ] {
         // Server -> client: PowerShell encrypts the SecureString it outputs.
-        let out = pool
-            .run_script(&format!(
-                "ConvertTo-SecureString '{secret}' -AsPlainText -Force"
-            ))
-            .await
-            .expect("run_script");
+        let out = pool.run_script(make).await.expect("run_script");
         let [PsValue::SecureString(body)] = out.as_slice() else {
             panic!("expected one SecureString, got {out:?}");
         };
