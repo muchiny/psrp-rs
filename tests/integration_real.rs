@@ -482,6 +482,47 @@ async fn live_enum_value_is_decoded() {
     let _ = pool.close().await;
 }
 
+/// Cancelling a running pipeline over WinRM: the stop signal must reach the
+/// PowerShell `ResourceURI` with the PSRP code (winrm-rs 1.4.1), the Receive in
+/// flight must survive the dropped `select!` branch, and the pool must be
+/// usable afterwards. Before, the signal faulted with "shell not found".
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_winrm_cancel_then_reuse() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    for round in 1..=2 {
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            canceller.cancel();
+        });
+        let started = std::time::Instant::now();
+        let res = Pipeline::new("Start-Sleep -Seconds 60")
+            .run_with_cancel(&mut pool, token)
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(res, Err(psrp_rs::PsrpError::Cancelled)),
+            "round {round}: expected Cancelled, got {res:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "round {round}: cancel took {elapsed:?}"
+        );
+
+        let out = pool.run_script("7").await.expect("pool reusable");
+        assert_eq!(out, vec![PsValue::I32(7)]);
+    }
+
+    let _ = pool.close().await;
+}
+
 // ---- SSH transport tests ----
 
 /// Build the SSH config from `PSRP_INTEGRATION_SSH_{HOST,PORT,USER,PASS}`.

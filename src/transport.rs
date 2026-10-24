@@ -5,9 +5,13 @@
 //! pipeline) talks to the transport through the [`PsrpTransport`] trait so
 //! it can be mocked in tests without standing up a fake SOAP server.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use tracing::{debug, warn};
-use winrm_rs::{RESOURCE_URI_PSRP, Shell, SoapError, WinrmClient, WinrmError};
+use winrm_rs::{RESOURCE_URI_PSRP, ReceiveOutput, Shell, SoapError, WinrmClient, WinrmError};
 
 use crate::error::{PsrpError, Result};
 
@@ -81,10 +85,63 @@ pub trait PsrpTransport: Send {
     }
 }
 
+/// One future that survives its caller giving up.
+///
+/// A WS-Man Receive is a long poll: the server holds the request until it has
+/// output, and the response, once the server has produced it, is lost if the
+/// client drops the request (hyper closes the connection). `recv_chunk` is
+/// dropped by `select!` when a pipeline is cancelled, so the Receive it was
+/// polling is kept here instead and resumed by the next call.
+struct Parked<'c, T> {
+    /// In a `Mutex` only to make the transport `Sync` (the trait's `&self`
+    /// methods need it, a boxed future is not): it is only ever reached
+    /// through `&mut self`, with `get_mut`.
+    in_flight: std::sync::Mutex<Option<Pin<Box<dyn Future<Output = T> + Send + 'c>>>>,
+}
+
+impl<'c, T> Parked<'c, T> {
+    const fn new() -> Self {
+        Self {
+            in_flight: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn slot(&mut self) -> &mut Option<Pin<Box<dyn Future<Output = T> + Send + 'c>>> {
+        self.in_flight
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Drive the parked future, starting `start()` first if there is none.
+    ///
+    /// Cancel-safe: dropping this call leaves the future parked, and the next
+    /// call polls the same one. It is forgotten only once it has completed.
+    async fn drive<F>(&mut self, start: impl FnOnce() -> F) -> T
+    where
+        F: Future<Output = T> + Send + 'c,
+    {
+        let in_flight = self.slot().get_or_insert_with(|| Box::pin(start()));
+        let output = in_flight.as_mut().await;
+        *self.slot() = None;
+        output
+    }
+
+    /// Give up the parked future (its response, if any, is lost).
+    fn discard(&mut self) {
+        *self.slot() = None;
+    }
+}
+
 /// Transport backed by a live `winrm_rs::Shell`.
 pub struct WinrmPsrpTransport<'c> {
-    shell: Option<Shell<'c>>,
+    shell: Option<Arc<Shell<'c>>>,
+    /// The Receive in flight for `command_id`, if a `recv_chunk` was dropped.
+    receive: Parked<'c, std::result::Result<ReceiveOutput, WinrmError>>,
     command_id: String,
+    /// A stop signal was accepted for `command_id`. The server then deletes
+    /// the command, and answers the Receive in flight with `InvalidSelectors`
+    /// instead of a final `PipelineState`: that fault means "stopped".
+    stop_signalled: std::sync::atomic::AtomicBool,
     done: bool,
     /// True after a pipeline command has been started via Execute.
     /// Before this, Receive/Send use the PSRP-no-commandid path.
@@ -123,7 +180,9 @@ impl<'c> WinrmPsrpTransport<'c> {
         let command_id = shell.shell_id().to_string();
         debug!(command_id, "PSRP transport started (no command yet)");
         Ok(Self {
-            shell: Some(shell),
+            shell: Some(Arc::new(shell)),
+            receive: Parked::new(),
+            stop_signalled: std::sync::atomic::AtomicBool::new(false),
             command_id,
             done: false,
             has_command: false,
@@ -138,7 +197,9 @@ impl<'c> WinrmPsrpTransport<'c> {
         let command_id = shell.shell_id().to_string();
         debug!(command_id, "PSRP transport reconnected");
         Ok(Self {
-            shell: Some(shell),
+            shell: Some(Arc::new(shell)),
+            receive: Parked::new(),
+            stop_signalled: std::sync::atomic::AtomicBool::new(false),
             command_id,
             done: false,
             has_command: false,
@@ -153,6 +214,9 @@ impl<'c> WinrmPsrpTransport<'c> {
         let shell = self.shell()?;
         let cmd_id = shell.start_command("", &[]).await?;
         debug!(cmd_id, "PSRP pipeline command started");
+        self.receive.discard();
+        self.stop_signalled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.command_id = cmd_id;
         self.has_command = true;
         Ok(())
@@ -160,8 +224,72 @@ impl<'c> WinrmPsrpTransport<'c> {
 
     fn shell(&self) -> Result<&Shell<'c>> {
         self.shell
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| PsrpError::protocol("transport closed"))
+    }
+
+    /// Take the shell out to consume it (`close`, `disconnect`). A Receive
+    /// still parked holds a second handle on it: it is dropped first.
+    fn take_shell(&mut self) -> Result<Option<Shell<'c>>> {
+        self.receive.discard();
+        let Some(shell) = self.shell.take() else {
+            return Ok(None);
+        };
+        Arc::try_unwrap(shell)
+            .map(Some)
+            .map_err(|_| PsrpError::protocol("transport busy: the shell is still shared"))
+    }
+}
+
+/// What one finished Receive means for `recv_chunk`.
+enum Poll {
+    /// Nothing to read yet (the long poll timed out): ask again.
+    Retry,
+    Chunk(ReceiveOutput),
+}
+
+/// Sort the outcome of one Receive.
+///
+/// `stop_signalled`: a stop signal was accepted for the command. The server
+/// then deletes the command and answers the Receive with `InvalidSelectors`
+/// instead of a final `PipelineState`, so that fault, and only then, is the
+/// end of the stop: `Err(Stopped)`. It is the same fault as "the shell is
+/// gone" (WinRM has one code for an unknown resource), so a shell reaped
+/// right after a stop also reads as stopped; the next command then fails
+/// with the real error.
+fn classify_receive(
+    polled: std::result::Result<ReceiveOutput, WinrmError>,
+    stop_signalled: bool,
+) -> Result<Poll> {
+    match polled {
+        Ok(out) => Ok(Poll::Chunk(out)),
+        Err(WinrmError::Timeout(_)) => Ok(Poll::Retry),
+        Err(WinrmError::Soap(SoapError::Fault {
+            ref code,
+            ref reason,
+        })) if code.contains("TimedOut") => {
+            // PSRP long-polling: the WinRM server returns a SOAP fault with
+            // code `w:TimedOut` when there's nothing to read yet. This is the
+            // normal long-poll cycle and MUST be retried (briefing §5 P7).
+            // Only fatal SOAP faults (e.g. shell died, access denied) should
+            // propagate.
+            debug!(%code, %reason, "PSRP recv_chunk: w:TimedOut — retrying");
+            Ok(Poll::Retry)
+        }
+        Err(WinrmError::Soap(SoapError::Fault { ref code, .. }))
+            if stop_signalled && code.contains("InvalidSelectors") =>
+        {
+            debug!(%code, "PSRP recv_chunk: command gone after the stop signal");
+            Err(PsrpError::Stopped)
+        }
+        Err(WinrmError::Soap(SoapError::Fault { code, reason })) => {
+            warn!(%code, %reason, "PSRP transport SOAP fault — shell likely dead");
+            Err(PsrpError::Winrm(WinrmError::Soap(SoapError::Fault {
+                code,
+                reason,
+            })))
+        }
+        Err(e) => Err(PsrpError::Winrm(e)),
     }
 }
 
@@ -176,9 +304,24 @@ impl PsrpTransport for WinrmPsrpTransport<'_> {
 
     async fn recv_chunk(&mut self) -> Result<Vec<u8>> {
         loop {
-            let shell = self.shell()?;
-            match shell.receive_next(&self.command_id).await {
-                Ok(out) => {
+            let polled = {
+                let shell = self
+                    .shell
+                    .as_ref()
+                    .ok_or_else(|| PsrpError::protocol("transport closed"))?;
+                let (shell, command_id) = (Arc::clone(shell), self.command_id.clone());
+                // Cancel-safe: a dropped call leaves this Receive parked for
+                // the next one (see `Parked`).
+                self.receive
+                    .drive(move || async move { shell.receive_next(&command_id).await })
+                    .await
+            };
+            let stop_signalled = self
+                .stop_signalled
+                .load(std::sync::atomic::Ordering::SeqCst);
+            match classify_receive(polled, stop_signalled)? {
+                Poll::Retry => continue,
+                Poll::Chunk(out) => {
                     if out.done {
                         self.done = true;
                     }
@@ -187,27 +330,6 @@ impl PsrpTransport for WinrmPsrpTransport<'_> {
                     }
                     return Ok(out.stdout);
                 }
-                Err(WinrmError::Timeout(_)) => continue,
-                Err(WinrmError::Soap(SoapError::Fault {
-                    ref code,
-                    ref reason,
-                })) if code.contains("TimedOut") => {
-                    // PSRP long-polling: the WinRM server returns a SOAP
-                    // fault with code `w:TimedOut` when there's nothing to
-                    // read yet. This is the normal long-poll cycle and MUST
-                    // be retried (briefing §5 P7). Only fatal SOAP faults
-                    // (e.g. shell died, access denied) should propagate.
-                    debug!(%code, %reason, "PSRP recv_chunk: w:TimedOut — retrying");
-                    continue;
-                }
-                Err(WinrmError::Soap(SoapError::Fault { code, reason })) => {
-                    warn!(%code, %reason, "PSRP transport SOAP fault — shell likely dead");
-                    return Err(PsrpError::Winrm(WinrmError::Soap(SoapError::Fault {
-                        code,
-                        reason,
-                    })));
-                }
-                Err(e) => return Err(PsrpError::Winrm(e)),
             }
         }
     }
@@ -226,6 +348,10 @@ impl PsrpTransport for WinrmPsrpTransport<'_> {
             .start_command_with_id("", &[&b64], &pipeline_id.hyphenated().to_string())
             .await?;
         debug!(cmd_id, "PSRP pipeline Execute started");
+        // A Receive still parked belongs to the previous command.
+        self.receive.discard();
+        self.stop_signalled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.command_id = cmd_id;
         self.has_command = true;
         Ok(())
@@ -233,11 +359,13 @@ impl PsrpTransport for WinrmPsrpTransport<'_> {
 
     async fn signal_stop(&self) -> Result<()> {
         self.shell()?.signal_ctrl_c(&self.command_id).await?;
+        self.stop_signalled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
     async fn close_shell(&mut self) -> Result<()> {
-        if let Some(shell) = self.shell.take() {
+        if let Some(shell) = self.take_shell()? {
             shell.close().await?;
         }
         Ok(())
@@ -245,8 +373,7 @@ impl PsrpTransport for WinrmPsrpTransport<'_> {
 
     async fn disconnect_shell(&mut self) -> Result<String> {
         let shell = self
-            .shell
-            .take()
+            .take_shell()?
             .ok_or_else(|| PsrpError::protocol("transport closed"))?;
         let id = shell.disconnect().await?;
         Ok(id)
@@ -372,5 +499,161 @@ pub mod mock {
         let t = MockTransport::new();
         *t.fail_send.lock().unwrap() = true;
         assert!(t.send_fragment(b"x").await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod parked_tests {
+    use super::Parked;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    /// Sets a flag when it is dropped, to tell a parked future that was kept
+    /// from one that was dropped.
+    struct DropFlag(Arc<AtomicUsize>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The point of `Parked` (#27): a call dropped while its Receive is in
+    /// flight, as `select!` does when a pipeline is cancelled, must not drop
+    /// the Receive. The next call resumes it, and the response is not lost.
+    #[tokio::test]
+    async fn a_dropped_call_leaves_the_future_parked_and_the_next_resumes_it() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Notify::new());
+        let mut parked: Parked<'_, &'static str> = Parked::new();
+
+        let start = || {
+            started.fetch_add(1, Ordering::SeqCst);
+            let (gate, flag) = (Arc::clone(&gate), DropFlag(Arc::clone(&dropped)));
+            async move {
+                let _flag = flag;
+                gate.notified().await;
+                "response"
+            }
+        };
+
+        // The caller gives up while the Receive is still waiting.
+        tokio::select! {
+            _ = parked.drive(start) => panic!("nothing was ready"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "the Receive was dropped");
+
+        // The server answers meanwhile; the next call gets that answer and
+        // does not start a second Receive.
+        gate.notify_one();
+        assert_eq!(parked.drive(start).await, "response");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "a second Receive was sent"
+        );
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "a finished future is released"
+        );
+    }
+
+    /// Once a future has completed, the next call starts a new one.
+    #[tokio::test]
+    async fn a_completed_future_is_not_replayed() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut parked: Parked<'_, usize> = Parked::new();
+        for expected in 1..=3 {
+            let n = parked
+                .drive(|| {
+                    let n = started.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move { n }
+                })
+                .await;
+            assert_eq!(n, expected);
+        }
+    }
+
+    /// A new command makes the parked Receive of the old one meaningless:
+    /// `discard` drops it.
+    #[tokio::test]
+    async fn discard_drops_the_parked_future() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut parked: Parked<'_, ()> = Parked::new();
+        tokio::select! {
+            () = parked.drive(|| {
+                let flag = DropFlag(Arc::clone(&dropped));
+                async move {
+                    let _flag = flag;
+                    std::future::pending::<()>().await;
+                }
+            }) => panic!("never ready"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        parked.discard();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::{Poll, classify_receive};
+    use crate::error::PsrpError;
+    use winrm_rs::{ReceiveOutput, SoapError, WinrmError};
+
+    fn fault(code: &str) -> WinrmError {
+        WinrmError::Soap(SoapError::Fault {
+            code: code.into(),
+            reason: "r".into(),
+        })
+    }
+
+    fn output() -> ReceiveOutput {
+        ReceiveOutput {
+            stdout: b"x".to_vec(),
+            stderr: Vec::new(),
+            exit_code: None,
+            done: false,
+        }
+    }
+
+    #[test]
+    fn data_and_long_poll_timeouts() {
+        assert!(matches!(
+            classify_receive(Ok(output()), false),
+            Ok(Poll::Chunk(c)) if c.stdout == b"x"
+        ));
+        assert!(matches!(
+            classify_receive(Err(fault("w:TimedOut")), false),
+            Ok(Poll::Retry)
+        ));
+        assert!(matches!(
+            classify_receive(Err(fault("w:TimedOut")), true),
+            Ok(Poll::Retry)
+        ));
+    }
+
+    /// The fault that follows an accepted stop signal is the stop (#27); the
+    /// same fault with no signal of ours is a dead shell, and any other
+    /// fault stays fatal either way.
+    #[test]
+    fn invalid_selectors_means_stopped_only_after_our_stop_signal() {
+        assert!(matches!(
+            classify_receive(Err(fault("w:InvalidSelectors")), true),
+            Err(PsrpError::Stopped)
+        ));
+        assert!(matches!(
+            classify_receive(Err(fault("w:InvalidSelectors")), false),
+            Err(PsrpError::Winrm(WinrmError::Soap(SoapError::Fault { .. })))
+        ));
+        assert!(matches!(
+            classify_receive(Err(fault("w:AccessDenied")), true),
+            Err(PsrpError::Winrm(WinrmError::Soap(SoapError::Fault { .. })))
+        ));
     }
 }

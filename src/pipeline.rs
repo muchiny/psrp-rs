@@ -390,7 +390,14 @@ impl Pipeline {
                     cancel_signalled = true;
                     continue;
                 }
-                msg = pool.next_message() => msg?,
+                msg = pool.next_message() => match msg {
+                    // The transport saw the command disappear after the
+                    // stop signal (WinRM): that is the end of the stop.
+                    Err(PsrpError::Stopped) if cancel_signalled => {
+                        return Err(PsrpError::Cancelled);
+                    }
+                    other => other?,
+                },
             };
             // Drop messages that don't belong to this pipeline. A
             // malicious or buggy server can otherwise smuggle output,
@@ -614,7 +621,14 @@ impl<T: PsrpTransport> PipelineHandle<'_, T> {
                     cancel_signalled = true;
                     continue;
                 }
-                msg = self.pool.next_message() => msg?,
+                msg = self.pool.next_message() => match msg {
+                    // The transport saw the command disappear after the
+                    // stop signal (WinRM): that is the end of the stop.
+                    Err(PsrpError::Stopped) if cancel_signalled => {
+                        return Err(PsrpError::Cancelled);
+                    }
+                    other => other?,
+                },
             };
             if msg.pid != self.pid || msg.rpid != self.rpid {
                 tracing::debug!(
@@ -1234,6 +1248,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PsrpError::Cancelled));
+        let _ = pool.close().await;
+    }
+
+    /// Over WinRM the server deletes a stopped command and answers the
+    /// Receive in flight with a fault instead of a final `Stopped`: the
+    /// transport reports that as `Stopped`, which after our own stop signal
+    /// is the cancellation we asked for (#27).
+    #[tokio::test]
+    async fn a_command_gone_after_the_stop_signal_is_a_cancellation() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        *t.fail_recv.lock().unwrap() = Some(PsrpError::Stopped);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let err = Pipeline::new("slow")
+            .run_with_cancel(&mut pool, token.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Cancelled), "{err:?}");
+        assert!(*t.stopped.lock().unwrap(), "the stop signal was sent");
+
+        let _ = pool.close().await;
+    }
+
+    /// The same for the handle's own loop (`start` then `collect_with_cancel`).
+    #[tokio::test]
+    async fn a_command_gone_after_the_stop_signal_cancels_a_collected_handle() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        let handle = Pipeline::new("slow").start(&mut pool).await.unwrap();
+        *t.fail_recv.lock().unwrap() = Some(PsrpError::Stopped);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let err = handle.collect_with_cancel(token).await.unwrap_err();
+        assert!(matches!(err, PsrpError::Cancelled), "{err:?}");
+        assert!(*t.stopped.lock().unwrap(), "the stop signal was sent");
+        let _ = pool.close().await;
+    }
+
+    /// Without a stop signal of ours, `Stopped` stays what it was.
+    #[tokio::test]
+    async fn stopped_without_our_signal_is_still_stopped() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with(&t).await;
+        *t.fail_recv.lock().unwrap() = Some(PsrpError::Stopped);
+        let err = Pipeline::new("slow").run(&mut pool).await.unwrap_err();
+        assert!(matches!(err, PsrpError::Stopped), "{err:?}");
         let _ = pool.close().await;
     }
 

@@ -355,10 +355,12 @@ impl<T: PsrpTransport> RunspacePool<T> {
     ///
     /// # No timeout
     ///
-    /// A server that never answers keeps the call waiting. Wrapping it in
-    /// `tokio::time::timeout` is not safe over WinRM: dropping the call
-    /// mid-Receive loses the response that Receive returned. After a
-    /// timeout expires, close the pool; do not reuse it.
+    /// A server that never answers keeps the call waiting. The WinRM
+    /// transport keeps a dropped Receive and resumes it, so a
+    /// `tokio::time::timeout` around the call does not lose what the server
+    /// sent; but the pool may be in the middle of answering a host call or
+    /// sending a parked answer when the call is dropped, so after a timeout
+    /// expires, close the pool rather than reuse it.
     pub async fn request_session_key(&mut self) -> Result<()> {
         if self.session_key.is_some() {
             return Ok(());
@@ -425,9 +427,10 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// carrying the server's reason. Host calls are answered by
     /// `next_message` itself, and so is the `EncryptedSessionKey`.
     ///
-    /// No timeout bounds this wait: `WinrmPsrpTransport::recv_chunk` is
-    /// not cancel-safe (dropping it mid-Receive loses the bytes that
-    /// Receive returned), so timing out could corrupt the pool.
+    /// No timeout bounds this wait. Dropping it is safe for the WinRM
+    /// Receive (the transport parks it), not for a host call the pool is
+    /// answering at that moment, so a caller that gives up should close the
+    /// pool.
     async fn await_session_key(&mut self) -> Result<()> {
         while self.session_key.is_none() {
             let msg = self.next_message().await?;
