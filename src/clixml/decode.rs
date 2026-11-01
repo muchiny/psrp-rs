@@ -1592,6 +1592,39 @@ mod tests {
     }
 
     #[test]
+    fn unknown_element_is_skipped_with_its_known_children() {
+        // A known element inside an unknown one belongs to it: it must not
+        // surface as a value of its own.
+        let xml = "<FutureTag><I32>1</I32><S>leak</S></FutureTag><I32>42</I32>";
+        assert_eq!(parse_clixml(xml).unwrap(), vec![PsValue::I32(42)]);
+    }
+
+    #[test]
+    fn unknown_element_cut_short_ends_the_parse() {
+        // The input ends inside the unknown element: the skip must stop at
+        // the end of the input instead of reading it again forever.
+        assert_eq!(parse_clixml("<FutureTag><I32>1</I32>").unwrap(), vec![]);
+        assert_eq!(
+            parse_clixml("<I32>2</I32><FutureTag><S>x").unwrap(),
+            vec![PsValue::I32(2)]
+        );
+    }
+
+    #[test]
+    fn tnref_with_an_end_tag_keeps_the_rest_of_the_object() {
+        let xml = r#"
+          <Obj RefId="0"><TN RefId="0"><T>Foo</T></TN><MS/></Obj>
+          <Obj RefId="1"><TNRef RefId="0"></TNRef><MS><I32 N="n">7</I32></MS></Obj>
+        "#;
+        let got = parse_clixml(xml).unwrap();
+        let PsValue::Object(o) = &got[1] else {
+            panic!("{got:?}");
+        };
+        assert_eq!(o.type_names, vec!["Foo".to_string()]);
+        assert_eq!(o.get("n"), Some(&PsValue::I32(7)));
+    }
+
+    #[test]
     fn unknown_self_closing_element_skipped() {
         let xml = "<UnknownThing/><I32>7</I32>";
         let got = parse_clixml(xml).unwrap();

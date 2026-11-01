@@ -1109,6 +1109,16 @@ mod tests {
     }
 
     #[test]
+    fn underscore_is_escaped_only_before_x() {
+        // Only `_x` / `_X` could open an escape; any other `_` stays as is,
+        // as PowerShell writes it.
+        assert_eq!(escape("snake_case_name_"), "snake_case_name_");
+        assert_eq!(escape_attr("a_b"), "a_b");
+        assert_eq!(escape("_x"), "_x005F_x");
+        assert_eq!(escape("a_Xb"), "a_x005F_Xb");
+    }
+
+    #[test]
     fn space_is_not_escaped() {
         let xml = to_clixml(&PsValue::String("a b".into()));
         assert!(!xml.contains("_x0020_"));
