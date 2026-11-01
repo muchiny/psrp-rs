@@ -21,6 +21,13 @@ concurrency:
   group: fuzz-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Dated nightly, not the floating one: nightly-2026-11-01 (rustc f9ceb4a4d,
+  # 2026-10-31) fails to compile russh with "cycle detected when computing
+  # when ssh_key::public::key_data::KeyData needs async drop"
+  # (rust-lang/rust#165263). Raise it once that issue is fixed.
+  FUZZ_TOOLCHAIN: nightly-2026-10-30
+
 jobs:
   build:
     # A fuzz target that no longer compiles is the most common way for
@@ -28,13 +35,15 @@ jobs:
     name: build targets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ". -> target\nfuzz -> fuzz/target"
       - run: cargo install cargo-fuzz --locked
-      - run: cargo +nightly fuzz build
+      - run: cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz build
       # The seed corpus is generated from the crate's own encoders, so a
       # wire-format change must regenerate it.
       - run: cargo run --example generate_fuzz_corpus
@@ -71,14 +80,16 @@ jobs:
           - known_hosts_match
           - out_of_proc_lines
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ". -> target\nfuzz -> fuzz/target"
       - run: cargo install cargo-fuzz --locked
       - run: MODE=smoke SMOKE_DURATION=60 TARGETS="${{ matrix.target }}" ./fuzz/run.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: fuzz-artifacts-${{ matrix.target }}
@@ -114,15 +125,17 @@ jobs:
           - records_decode
           - runspace_state_machine
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ". -> target\nfuzz -> fuzz/target"
       - run: cargo install cargo-fuzz --locked
       # Carry the corpus across nightly runs so coverage compounds
       # instead of restarting from the seeds every time.
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -130,7 +143,7 @@ jobs:
       - run: |
           DURATION="${{ github.event.inputs.duration || '900' }}" \
           JOBS=2 TARGETS="${{ matrix.target }}" ./fuzz/run.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: fuzz-artifacts-${{ matrix.target }}

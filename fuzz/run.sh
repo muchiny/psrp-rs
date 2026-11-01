@@ -11,6 +11,7 @@
 #   MODE=list ./fuzz/run.sh             # print the target list and exit
 #   SANITIZER=none ./fuzz/run.sh        # no ASan (much faster, less coverage)
 #   VALUE_PROFILE=0 ./fuzz/run.sh       # disable value profiling
+#   FUZZ_TOOLCHAIN=nightly-2026-10-30 ./fuzz/run.sh   # pin the nightly (CI does)
 #
 # Targets are discovered from `cargo fuzz list`, so adding a `[[bin]]` to
 # fuzz/Cargo.toml is enough — this script needs no edit.
@@ -27,6 +28,9 @@ MODE="${MODE:-run}"
 DURATION="${DURATION:-60}"
 JOBS="${JOBS:-1}"
 SANITIZER="${SANITIZER:-address}"
+# Toolchain handed to `cargo +<toolchain>`. Plain `nightly` locally; the fuzz
+# workflow pins a dated nightly through this variable.
+FUZZ_TOOLCHAIN="${FUZZ_TOOLCHAIN:-nightly}"
 # libFuzzer defaults to 4096, which is too small to reach the deeply
 # nested CLIXML documents that used to overflow the stack.
 MAX_LEN="${MAX_LEN:-16384}"
@@ -50,10 +54,10 @@ die() { echo "error: $*" >&2; exit 1; }
 
 command -v cargo-fuzz >/dev/null 2>&1 \
   || die "cargo-fuzz not installed. Run: cargo install cargo-fuzz"
-rustup toolchain list | grep -q nightly \
-  || die "nightly toolchain missing. Run: rustup toolchain install nightly"
+rustup toolchain list | grep -q "^$FUZZ_TOOLCHAIN" \
+  || die "toolchain '$FUZZ_TOOLCHAIN' missing. Run: rustup toolchain install $FUZZ_TOOLCHAIN"
 
-ALL_TARGETS="$(cargo +nightly fuzz list)"
+ALL_TARGETS="$(cargo "+$FUZZ_TOOLCHAIN" fuzz list)"
 TARGETS="${TARGETS:-$ALL_TARGETS}"
 
 if [ "$MODE" = "list" ]; then
@@ -109,7 +113,7 @@ for target in $TARGETS; do
     cmin)
       echo "=== minimising corpus for $target ==="
       # `cmin` keeps the smallest set of inputs with the same coverage.
-      cargo +nightly fuzz cmin "$target" -- "${libfuzzer_args[@]}" || failed+=("$target")
+      cargo "+$FUZZ_TOOLCHAIN" fuzz cmin "$target" -- "${libfuzzer_args[@]}" || failed+=("$target")
       continue
       ;;
     run|smoke)
@@ -124,7 +128,7 @@ for target in $TARGETS; do
       ;;
   esac
 
-  if ! cargo +nightly fuzz run "${args[@]}" "$target" -- "${libfuzzer_args[@]}"; then
+  if ! cargo "+$FUZZ_TOOLCHAIN" fuzz run "${args[@]}" "$target" -- "${libfuzzer_args[@]}"; then
     failed+=("$target")
     echo "!!! $target FAILED — artifacts in fuzz/artifacts/$target/" >&2
   fi
@@ -133,7 +137,7 @@ done
 echo
 if [ ${#failed[@]} -ne 0 ]; then
   echo "FAILED targets: ${failed[*]}" >&2
-  echo "Reproduce with: cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>" >&2
+  echo "Reproduce with: cargo +$FUZZ_TOOLCHAIN fuzz run <target> fuzz/artifacts/<target>/<file>" >&2
   exit 1
 fi
 if [ "$MODE" = "cmin" ]; then

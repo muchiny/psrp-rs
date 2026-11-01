@@ -371,6 +371,8 @@ SSH `known_hosts` matcher and the SSH OutOfProc line codec.
 ```sh
 rustup toolchain install nightly
 cargo install cargo-fuzz
+# CI pins the nightly (FUZZ_TOOLCHAIN in .github/workflows/fuzz.yml);
+# both scripts take the same variable, e.g. FUZZ_TOOLCHAIN=nightly-2026-10-30
 
 ./fuzz/run.sh                           # every target, 60s each
 DURATION=900 ./fuzz/run.sh              # 15 minutes per target
