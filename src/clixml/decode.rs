@@ -83,9 +83,16 @@ const REF_BUDGET_FLOOR: u64 = 1 << 20;
 const REF_BUDGET_CEILING: u64 = 8 << 20;
 const REF_BUDGET_PER_BYTE: u64 = 8;
 
+/// A length as a weight. `usize` fits `u64` on every supported target; the
+/// saturation only makes the conversion total, and a saturated weight just
+/// exhausts the budget sooner.
+fn weight_of_len(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
 fn ref_budget(xml_len: usize) -> u64 {
     REF_BUDGET_FLOOR
-        .saturating_add((xml_len as u64).saturating_mul(REF_BUDGET_PER_BYTE))
+        .saturating_add(weight_of_len(xml_len).saturating_mul(REF_BUDGET_PER_BYTE))
         .min(REF_BUDGET_CEILING)
 }
 
@@ -224,25 +231,39 @@ fn measure(v: &PsValue) -> (u64, u32) {
         | PsValue::Uri(s)
         | PsValue::Xml(s)
         | PsValue::ScriptBlock(s)
-        | PsValue::SecureString(s) => (1 + s.len() as u64, 0),
-        PsValue::Bytes(b) => (1 + b.len() as u64, 0),
+        | PsValue::SecureString(s) => (weight_of_len(s.len()).saturating_add(1), 0),
+        PsValue::Bytes(b) => (weight_of_len(b.len()).saturating_add(1), 0),
         PsValue::List(items) => items.iter().fold((1, 1), |(w, h), i| {
             let (iw, ih) = measure(i);
-            (w + iw, h.max(1 + ih))
+            (w.saturating_add(iw), h.max(ih.saturating_add(1)))
         }),
         PsValue::Dict(entries) => entries.iter().fold((1, 1), |(w, h), (k, val)| {
             let (kw, kh) = measure(k);
             let (vw, vh) = measure(val);
-            (w + kw + vw, h.max(1 + kh.max(vh)))
+            (
+                w.saturating_add(kw).saturating_add(vw),
+                h.max(kh.max(vh).saturating_add(1)),
+            )
         }),
         PsValue::Object(o) => {
-            let mut weight = 1 + o.to_string.as_ref().map_or(0, |s| s.len() as u64);
-            weight += o.type_names.iter().map(|t| 1 + t.len() as u64).sum::<u64>();
-            let mut height = 1;
+            let mut weight = o
+                .to_string
+                .as_ref()
+                .map_or(0, |s| weight_of_len(s.len()))
+                .saturating_add(1);
+            for t in &o.type_names {
+                weight = weight
+                    .saturating_add(weight_of_len(t.len()))
+                    .saturating_add(1);
+            }
+            let mut height: u32 = 1;
             for (name, val) in &o.properties {
                 let (vw, vh) = measure(val);
-                weight += 1 + name.len() as u64 + vw;
-                height = height.max(1 + vh);
+                weight = weight
+                    .saturating_add(weight_of_len(name.len()))
+                    .saturating_add(1)
+                    .saturating_add(vw);
+                height = height.max(vh.saturating_add(1));
             }
             (weight, height)
         }
@@ -301,9 +322,11 @@ fn parse_element(
             "CLIXML nested deeper than {MAX_NESTING_DEPTH} levels"
         )));
     }
-    state.depth += 1;
+    // The guard above keeps `depth` below MAX_NESTING_DEPTH, so neither step
+    // can saturate; saturating ops just keep the arithmetic total.
+    state.depth = state.depth.saturating_add(1);
     let result = parse_element_inner(reader, e, state);
-    state.depth -= 1;
+    state.depth = state.depth.saturating_sub(1);
     result
 }
 
@@ -353,7 +376,10 @@ fn parse_element_inner(
             let text = read_text(reader, "Sg")?;
             let v =
                 parse_float(text.trim()).map_err(|err| PsrpError::clixml(format!("Sg: {err}")))?;
-            Ok(Some(PsValue::F32(v as f32)))
+            // `f64` -> `f32` has no `From`/`TryFrom`; rounding to the nearest
+            // `f32` (out-of-range magnitudes become infinity) is the intent.
+            let narrowed = v as f32;
+            Ok(Some(PsValue::F32(narrowed)))
         }
         "SB" => Ok(Some(PsValue::I8(parse_int(reader, "SB")?))),
         "By" => Ok(Some(PsValue::U8(parse_int(reader, "By")?))),
@@ -747,7 +773,9 @@ fn skip_to_end(reader: &mut Reader<&[u8]>) -> Result<()> {
         {
             Event::Start(_) => depth = depth.saturating_add(1),
             Event::End(_) => {
-                depth -= 1;
+                // `depth` starts at 1 and the loop exits at 0, so it is never
+                // 0 here; saturating keeps the subtraction total.
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     break;
                 }
@@ -1526,6 +1554,24 @@ mod tests {
         assert!(matches!(got[0], PsValue::F32(v) if v.is_nan()));
         let got = parse_clixml("<Sg>Infinity</Sg>").unwrap();
         assert!(matches!(got[0], PsValue::F32(v) if v.is_infinite()));
+    }
+
+    #[test]
+    fn single_float_out_of_range_becomes_infinity() {
+        // f64 magnitudes beyond f32 narrow to infinity, never panic.
+        let got = parse_clixml("<Sg>1e300</Sg>").unwrap();
+        assert!(matches!(got[0], PsValue::F32(v) if v.is_infinite() && v > 0.0));
+        let got = parse_clixml("<Sg>-1e300</Sg>").unwrap();
+        assert!(matches!(got[0], PsValue::F32(v) if v.is_infinite() && v < 0.0));
+    }
+
+    #[test]
+    fn measure_is_total_on_large_values() {
+        let v = PsValue::List(vec![
+            PsValue::String("abc".into()),
+            PsValue::Bytes(vec![0; 5]),
+        ]);
+        assert_eq!(measure(&v), (1 + 4 + 6, 1));
     }
 
     #[test]
