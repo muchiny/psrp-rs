@@ -62,7 +62,9 @@ impl Fragment {
     /// Serialize this fragment to its wire representation.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(FRAGMENT_HEADER_LEN + self.blob.len());
+        // Capacity hint only: a saturated value is never reached (a `Vec`
+        // length is bounded by `isize::MAX`).
+        let mut out = Vec::with_capacity(FRAGMENT_HEADER_LEN.saturating_add(self.blob.len()));
         out.extend_from_slice(&self.object_id.to_be_bytes());
         out.extend_from_slice(&self.fragment_id.to_be_bytes());
         out.push(self.flags());
@@ -92,14 +94,18 @@ pub fn split_message(object_id: u64, payload: &[u8]) -> Vec<Fragment> {
     }
 
     let mut out = Vec::new();
-    let chunks: Vec<&[u8]> = payload.chunks(MAX_FRAGMENT_PAYLOAD).collect();
-    let last = chunks.len() - 1;
-    for (i, chunk) in chunks.into_iter().enumerate() {
+    let mut chunks = payload.chunks(MAX_FRAGMENT_PAYLOAD).peekable();
+    // `fragment_id` is a `u64` counter, so no `usize` -> `u64` cast is needed
+    // and `end` is "no chunk left" rather than an index compared to a length.
+    for fragment_id in 0u64.. {
+        let Some(chunk) = chunks.next() else {
+            break;
+        };
         out.push(Fragment {
             object_id,
-            fragment_id: i as u64,
-            start: i == 0,
-            end: i == last,
+            fragment_id,
+            start: fragment_id == 0,
+            end: chunks.peek().is_none(),
             blob: chunk.to_vec(),
         });
     }
@@ -111,10 +117,11 @@ pub fn split_message(object_id: u64, payload: &[u8]) -> Vec<Fragment> {
 #[must_use]
 pub fn encode_message(object_id: u64, payload: &[u8]) -> Vec<u8> {
     let frags = split_message(object_id, payload);
+    // Capacity hint only: the sum of in-memory `Vec` lengths cannot overflow.
     let total: usize = frags
         .iter()
-        .map(|f| FRAGMENT_HEADER_LEN + f.blob.len())
-        .sum();
+        .map(|f| FRAGMENT_HEADER_LEN.saturating_add(f.blob.len()))
+        .fold(0, usize::saturating_add);
     let mut out = Vec::with_capacity(total);
     for f in frags {
         out.extend_from_slice(&f.encode());
@@ -129,6 +136,44 @@ struct InFlight {
     buf: Vec<u8>,
     next_fragment_id: u64,
     started: bool,
+}
+
+/// Decode the first fragment of `buf`, if it is complete.
+///
+/// Returns `Ok(None)` while the header or the blob is still incomplete (a
+/// normal condition: the caller waits for more bytes), otherwise the fragment
+/// and the number of bytes it occupies in `buf` (header included).
+fn decode_one(buf: &[u8]) -> Result<Option<(Fragment, usize)>> {
+    let Some((object_id, rest)) = buf.split_first_chunk::<8>() else {
+        return Ok(None);
+    };
+    let Some((fragment_id, rest)) = rest.split_first_chunk::<8>() else {
+        return Ok(None);
+    };
+    let Some((&[flags], rest)) = rest.split_first_chunk::<1>() else {
+        return Ok(None);
+    };
+    let Some((blob_len, rest)) = rest.split_first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let blob_len = usize::try_from(u32::from_be_bytes(*blob_len))
+        .map_err(|_| PsrpError::fragment("fragment length exceeds the address space"))?;
+    let Some(blob) = rest.get(..blob_len) else {
+        return Ok(None); // need more bytes
+    };
+    // Cannot saturate: `blob_len <= rest.len()`, so the sum is at most
+    // `buf.len()`.
+    let consumed = FRAGMENT_HEADER_LEN.saturating_add(blob_len);
+    Ok(Some((
+        Fragment {
+            object_id: u64::from_be_bytes(*object_id),
+            fragment_id: u64::from_be_bytes(*fragment_id),
+            start: flags & FLAG_START != 0,
+            end: flags & FLAG_END != 0,
+            blob: blob.to_vec(),
+        },
+        consumed,
+    )))
 }
 
 /// Stateful reassembler for incoming PSRP fragments.
@@ -156,28 +201,15 @@ impl Reassembler {
         self.buffer.extend_from_slice(bytes);
         let mut completed = Vec::new();
 
-        loop {
-            if self.buffer.len() < FRAGMENT_HEADER_LEN {
-                break;
-            }
-            let header = &self.buffer[..FRAGMENT_HEADER_LEN];
-            let object_id = u64::from_be_bytes(header[0..8].try_into().unwrap());
-            let fragment_id = u64::from_be_bytes(header[8..16].try_into().unwrap());
-            let flags = header[16];
-            let blob_len = u32::from_be_bytes(header[17..21].try_into().unwrap()) as usize;
-
-            if self.buffer.len() < FRAGMENT_HEADER_LEN + blob_len {
-                break; // need more bytes
-            }
-
-            let start = flags & FLAG_START != 0;
-            let end = flags & FLAG_END != 0;
-
-            let blob_start = FRAGMENT_HEADER_LEN;
-            let blob_end = blob_start + blob_len;
-            // Use drain to keep allocation patterns simple.
-            let blob: Vec<u8> = self.buffer[blob_start..blob_end].to_vec();
-            self.buffer.drain(..blob_end);
+        while let Some((fragment, consumed)) = decode_one(&self.buffer)? {
+            self.buffer.drain(..consumed);
+            let Fragment {
+                object_id,
+                fragment_id,
+                start,
+                end,
+                blob,
+            } = fragment;
 
             let entry = self.in_flight.entry(object_id).or_default();
 
@@ -206,11 +238,14 @@ impl Reassembler {
                     entry.next_fragment_id
                 )));
             }
-            entry.next_fragment_id += 1;
+            entry.next_fragment_id = fragment_id.checked_add(1).ok_or_else(|| {
+                PsrpError::fragment(format!("fragment id overflow for object {object_id}"))
+            })?;
             entry.buf.extend_from_slice(&blob);
 
             if end {
-                let done = self.in_flight.remove(&object_id).unwrap().buf;
+                let done = std::mem::take(&mut entry.buf);
+                self.in_flight.remove(&object_id);
                 completed.push(done);
                 self.completed_order.push(object_id);
             }
@@ -445,6 +480,54 @@ mod tests {
         };
         let bytes = f.encode();
         assert_eq!(bytes[16], 0x00);
+    }
+
+    #[test]
+    fn end_flag_on_last_chunk_when_payload_is_exact_multiple() {
+        let payload = vec![1u8; MAX_FRAGMENT_PAYLOAD * 2];
+        let frags = split_message(3, &payload);
+        assert_eq!(frags.len(), 2);
+        assert!(frags[0].start && !frags[0].end);
+        assert!(!frags[1].start && frags[1].end);
+        assert_eq!(frags[1].fragment_id, 1);
+    }
+
+    #[test]
+    fn hostile_huge_length_waits_for_more_bytes() {
+        // Header announcing a 4 GiB - 1 blob with only 3 bytes behind it:
+        // no panic, no overflow, nothing emitted, bytes stay buffered.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&1u64.to_be_bytes());
+        wire.extend_from_slice(&0u64.to_be_bytes());
+        wire.push(FLAG_START | FLAG_END);
+        wire.extend_from_slice(&u32::MAX.to_be_bytes());
+        wire.extend_from_slice(b"abc");
+        let mut r = Reassembler::new();
+        let out = r.feed(&wire).unwrap();
+        assert_eq!(out.len(), 0);
+        assert!(!r.is_idle());
+    }
+
+    #[test]
+    fn rejects_fragment_id_overflow() {
+        let mut r = Reassembler::new();
+        r.in_flight.insert(
+            5,
+            InFlight {
+                buf: Vec::new(),
+                next_fragment_id: u64::MAX,
+                started: true,
+            },
+        );
+        let f = Fragment {
+            object_id: 5,
+            fragment_id: u64::MAX,
+            start: false,
+            end: false,
+            blob: b"x".to_vec(),
+        };
+        let err = r.feed(&f.encode()).unwrap_err();
+        assert!(matches!(err, PsrpError::Fragment(_)), "{err:?}");
     }
 
     #[test]

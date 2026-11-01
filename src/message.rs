@@ -35,6 +35,13 @@ pub enum Destination {
 }
 
 impl Destination {
+    fn to_u32(self) -> u32 {
+        match self {
+            Self::Client => 1,
+            Self::Server => 2,
+        }
+    }
+
     fn from_u32(v: u32) -> Result<Self> {
         match v {
             1 => Ok(Self::Client),
@@ -194,8 +201,8 @@ impl PsrpMessage {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let body = self.data.as_bytes();
-        let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-        out.extend_from_slice(&(self.destination as u32).to_le_bytes());
+        let mut out = Vec::with_capacity(HEADER_LEN.saturating_add(body.len()));
+        out.extend_from_slice(&self.destination.to_u32().to_le_bytes());
         out.extend_from_slice(&self.message_type.to_u32().to_le_bytes());
         out.extend_from_slice(&self.rpid.to_bytes_le());
         out.extend_from_slice(&self.pid.to_bytes_le());
@@ -205,25 +212,19 @@ impl PsrpMessage {
 
     /// Parse a message from the wire format.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_LEN {
-            return Err(PsrpError::protocol(format!(
-                "message too short: {} bytes",
-                bytes.len()
-            )));
-        }
-        let dest = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let mt = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let rpid_bytes: [u8; 16] = bytes[8..24].try_into().unwrap();
-        let pid_bytes: [u8; 16] = bytes[24..40].try_into().unwrap();
-        let destination = Destination::from_u32(dest)?;
-        let message_type = MessageType::from_u32(mt);
-        let rpid = Uuid::from_bytes_le(rpid_bytes);
-        let pid = Uuid::from_bytes_le(pid_bytes);
+        // Every step below fails the same way on a truncated header, so the
+        // 40 bytes are consumed in order without any offset arithmetic.
+        let too_short = || PsrpError::protocol(format!("message too short: {} bytes", bytes.len()));
+        let (dest, rest) = bytes.split_first_chunk::<4>().ok_or_else(too_short)?;
+        let (mt, rest) = rest.split_first_chunk::<4>().ok_or_else(too_short)?;
+        let (rpid_bytes, rest) = rest.split_first_chunk::<16>().ok_or_else(too_short)?;
+        let (pid_bytes, body) = rest.split_first_chunk::<16>().ok_or_else(too_short)?;
+        let destination = Destination::from_u32(u32::from_le_bytes(*dest))?;
+        let message_type = MessageType::from_u32(u32::from_le_bytes(*mt));
+        let rpid = Uuid::from_bytes_le(*rpid_bytes);
+        let pid = Uuid::from_bytes_le(*pid_bytes);
 
-        let mut body = &bytes[HEADER_LEN..];
-        if body.starts_with(BOM) {
-            body = &body[BOM.len()..];
-        }
+        let body = body.strip_prefix(BOM).unwrap_or(body);
         let data = String::from_utf8(body.to_vec())
             .map_err(|e| PsrpError::protocol(format!("invalid UTF-8 in message body: {e}")))?;
 
@@ -294,6 +295,42 @@ mod tests {
         bytes[0] = 1;
         let msg = PsrpMessage::decode(&bytes).unwrap();
         assert_eq!(msg.data, "");
+    }
+
+    #[test]
+    fn decode_every_truncated_header_errors() {
+        for len in 0..HEADER_LEN {
+            let mut bytes = vec![0u8; len];
+            if let Some(first) = bytes.first_mut() {
+                *first = 1;
+            }
+            let err = PsrpMessage::decode(&bytes).unwrap_err();
+            assert!(
+                matches!(&err, PsrpError::Protocol(m) if m.contains("too short")),
+                "len {len}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_wire_values() {
+        assert_eq!(Destination::Client.to_u32(), 1);
+        assert_eq!(Destination::Server.to_u32(), 2);
+        let msg = PsrpMessage::to_server(
+            MessageType::SessionCapability,
+            zero_uuid(),
+            zero_uuid(),
+            String::new(),
+        );
+        assert_eq!(msg.encode().get(..4), Some(&[2u8, 0, 0, 0][..]));
+    }
+
+    #[test]
+    fn decode_bom_only_body_is_empty() {
+        let mut bytes = vec![0u8; HEADER_LEN];
+        bytes[0] = 1;
+        bytes.extend_from_slice(BOM);
+        assert_eq!(PsrpMessage::decode(&bytes).unwrap().data, "");
     }
 
     #[test]
