@@ -8,13 +8,15 @@ Async [PowerShell Remoting Protocol (MS-PSRP)](https://learn.microsoft.com/en-us
 [![MSRV](https://img.shields.io/badge/MSRV-1.98-blue.svg)](https://blog.rust-lang.org/)
 
 ```rust
-use psrp_rs::{RunspacePool, WinrmPsrpTransport};
-use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
+use psrp_rs::{RunspacePool, WinrmClient, WinrmConfig, WinrmCredentials, WinrmPsrpTransport};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // HTTPS on 5986, server certificate validated. A host with only the
+    // stock `Enable-PSRemoting` listener needs `WinrmConfig::http()`
+    // (plain HTTP, trusted networks only).
     let client = WinrmClient::new(
-        WinrmConfig::default(),
+        WinrmConfig::https(),
         WinrmCredentials::new("administrator", "secret", ""),
     )?;
 
@@ -59,18 +61,47 @@ cargo add psrp-rs --features ssh
 cargo add psrp-rs --features serde
 ```
 
+`psrp-rs` re-exports the `winrm-rs` types it takes (`WinrmClient`,
+`WinrmConfig`, `WinrmClientBuilder`, ...), so the common settings need no
+direct dependency on `winrm-rs`. A crate that imports `winrm_rs` itself
+(for `TlsProvider`, `ProxySessionAuth`, or the `kerberos` feature) must
+use the same major: `winrm-rs = "2"` for `psrp-rs` 4.
+
+### Upgrading to 4.0
+
+`psrp-rs` 4.0 moves to `winrm-rs` 2. The main changes callers meet, all
+from `winrm-rs`:
+
+- `WinrmConfig::default()` is HTTPS on port 5986 with the certificate
+  validated. `WinrmConfig::http()` is the old default (plain HTTP on 5985).
+- `WinrmConfig::port` is an `Option<u16>`.
+- Proxies from the environment are read only when asked for
+  (`WinrmClient::builder(config).credentials(creds).use_env_proxy(true).build()`);
+  the operating system's proxy settings are never read.
+- Basic is refused where it would send the password in clear by accident:
+  over plain HTTP unless `encryption: EncryptionMode::Never` says so, and
+  with `accept_invalid_certs`. NTLM works on the same stock listener and
+  seals the messages.
+- The host passed to `WinrmPsrpTransport::open` and `blocking::run_*` must
+  be bare and canonical: no scheme, port or `user@`, a dotted-quad IPv4
+  address, an IPv6 literal in brackets and RFC 5952 form.
+
+The full list is in [CHANGELOG.md](CHANGELOG.md) (*Upgrading from 3.x*) and
+in the `winrm-rs` 2.0.0 changelog (*Upgrading from 1.x*).
+
 ## Usage
 
 ### Run a script and collect output
 
 ```rust
-use psrp_rs::{RunspacePool, WinrmPsrpTransport};
-use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
+use psrp_rs::{
+    AuthMethod, RunspacePool, WinrmClient, WinrmConfig, WinrmCredentials, WinrmPsrpTransport,
+};
 
 let client = WinrmClient::new(
     WinrmConfig {
         auth_method: AuthMethod::Ntlm,
-        ..Default::default()
+        ..WinrmConfig::https()
     },
     WinrmCredentials::new("administrator", "Passw0rd!", "MYDOMAIN"),
 )?;
@@ -159,11 +190,10 @@ match pool.run_script_with_cancel("Start-Sleep -Seconds 300", cancel).await {
 ### Blocking API
 
 ```rust
-use psrp_rs::blocking;
-use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
+use psrp_rs::{WinrmClient, WinrmConfig, WinrmCredentials, blocking};
 
 let client = WinrmClient::new(
-    WinrmConfig::default(),
+    WinrmConfig::https(),
     WinrmCredentials::new("admin", "password", ""),
 )?;
 
@@ -224,9 +254,34 @@ shared.close().await?;
 
 ## Configuration
 
-`psrp-rs` reuses [`WinrmConfig`](https://docs.rs/winrm-rs/latest/winrm_rs/struct.WinrmConfig.html)
-from `winrm-rs` for transport-level settings (auth method, TLS, timeouts, proxy).
-See the [winrm-rs documentation](https://docs.rs/winrm-rs) for the full list of config fields.
+`psrp-rs` reuses [`WinrmConfig`](https://docs.rs/winrm-rs/2/winrm_rs/struct.WinrmConfig.html)
+from `winrm-rs` 2 for transport-level settings (auth method, TLS, timeouts, proxy).
+See the [winrm-rs documentation](https://docs.rs/winrm-rs/2) for the full list of config fields.
+The defaults that matter most:
+
+- **TLS.** `WinrmConfig::default()` and `WinrmConfig::https()` connect over
+  HTTPS on 5986 and validate the server certificate against the built-in
+  Mozilla roots, which a listener certificate issued by an internal CA (AD
+  CS, the usual case for WinRM) does not chain to. Build the client with
+  `WinrmClient::builder(config).credentials(creds)`, then
+  `.platform_roots(true)` (the operating system's store),
+  `.add_root_certificates_pem(..)` or `.pin_server_certificate_sha256(..)`,
+  and `.build()`. `accept_invalid_certs` is for disposable test hosts only.
+  `WinrmConfig::http()` is plain HTTP on 5985: NTLM still seals the
+  messages there, but its handshake can be relayed, or recorded to guess
+  the password offline; trusted networks only.
+- **Port.** `port: None` means 5986 with TLS and 5985 without;
+  `effective_port()` returns the port in use.
+- **Proxy.** Proxies from the environment are read only by a client built
+  with `.use_env_proxy(true)`; the operating system's proxy settings are
+  never read. An explicit `proxy` is a `SecretString`.
+- **Basic.** Over plain HTTP it needs `encryption: EncryptionMode::Never`, and
+  the password and every SOAP body then cross in clear; with
+  `accept_invalid_certs` it is refused. Prefer NTLM, or Basic over HTTPS
+  with a validated or pinned certificate.
+- **Limits.** `WinrmConfig::max_output_bytes` does not bound PSRP: a
+  pipeline's output is collected by psrp-rs, not by winrm-rs's
+  `run_command`.
 
 Pool-level parameters:
 
@@ -257,8 +312,8 @@ Set via `RunspacePool::open_with_options(transport, min, max)` or
 | Host callbacks | pluggable `PsHost` trait | no | `PSHost` |
 | Session-key crypto | RSA + AES (pure Rust) | yes | built-in |
 | SSH transport | `russh` (feature-gated) | yes | built-in |
-| Auth methods | NTLMv2, Basic, Kerberos, Certificate (via winrm-rs) | NTLM, Basic, Kerberos, CredSSP | all |
-| TLS backend | rustls (`ring` crypto provider) | OpenSSL | SChannel / OpenSSL |
+| Auth methods | NTLMv2, Basic, Certificate (via winrm-rs); Kerberos with `winrm-rs`'s `kerberos` feature | NTLM, Basic, Kerberos, CredSSP | all |
+| TLS backend | rustls (`ring`, private to the client unless the application installed a provider) | OpenSSL | SChannel / OpenSSL |
 | Binary size | single static binary | interpreter | runtime |
 | C dependencies | `ring` only (transitive, no system library) | OpenSSL | CLR |
 
@@ -283,9 +338,12 @@ following environment variables and use `--ignored`:
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PSRP_INTEGRATION_HOST` | yes | -- | Hostname or IP of the target Windows box |
+| `PSRP_INTEGRATION_HOST` | yes | -- | Bare hostname or IP of the target Windows box (no scheme, port or `user@`) |
 | `PSRP_INTEGRATION_USER` | no | `vagrant` | Username |
 | `PSRP_INTEGRATION_PASS` | no | `vagrant` | Password |
+| `PSRP_INTEGRATION_TLS` | no | off | `1` or `true` for HTTPS on 5986 (self-signed certificate accepted) |
+| `PSRP_INTEGRATION_PORT` | no | 5985, or 5986 with TLS | Port override |
+| `PSRP_INTEGRATION_AUTH` | no | NTLM | `basic` for Basic over plain HTTP, message encryption off |
 
 A [`Vagrantfile`](Vagrantfile) is provided to spin up a disposable Windows
 Server 2025 Hyper-V VM with WinRM + PSRP pre-configured:
@@ -340,7 +398,7 @@ itself; it is now an iterative `O(n*m)` matcher.
 
 | Feature | Default | Description |
 |---|---|---|
-| *(default)* | -- | WinRM transport with NTLMv2/Basic/Kerberos/Certificate auth (via winrm-rs) |
+| *(default)* | -- | WinRM transport with NTLMv2/Basic/Certificate auth (via winrm-rs). For Kerberos, also depend on `winrm-rs = { version = "2", features = ["kerberos"] }` |
 | `ssh` | no | SSH transport via `russh`, speaking PowerShell's out-of-process protocol (`pwsh -sshs`, PowerShell 7+) |
 | `serde` | no | `Serialize`/`Deserialize` derives on `PsValue` / `PsObject` |
 

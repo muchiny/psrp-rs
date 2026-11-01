@@ -18,14 +18,18 @@
 //! # Example
 //!
 //! ```no_run
-//! use psrp_rs::{RunspacePool, WinrmPsrpTransport};
-//! use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
+//! use psrp_rs::{
+//!     AuthMethod, RunspacePool, WinrmClient, WinrmConfig, WinrmCredentials, WinrmPsrpTransport,
+//! };
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // HTTPS on 5986 with the server certificate validated (the default).
+//! // A host with only the stock `Enable-PSRemoting` listener needs
+//! // `WinrmConfig::http()` (plain HTTP on 5985, trusted networks only).
 //! let client = WinrmClient::new(
 //!     WinrmConfig {
 //!         auth_method: AuthMethod::Ntlm,
-//!         ..Default::default()
+//!         ..WinrmConfig::https()
 //!     },
 //!     WinrmCredentials::new("administrator", "Passw0rd!", ""),
 //! )?;
@@ -97,5 +101,15 @@ pub use shared::SharedRunspacePool;
 pub use transport::{PsrpTransport, WinrmPsrpTransport};
 
 // Re-export the `winrm-rs` types commonly needed by callers so they
-// don't have to depend on `winrm-rs` directly.
-pub use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
+// don't have to depend on `winrm-rs` directly: the client, its
+// configuration and credentials, and what the common 2.x settings need
+// (the builder for proxies and trusted certificates, `EncryptionMode` for
+// Basic over HTTP, `SecretString` for `WinrmConfig::proxy`). The rarer ones
+// (`TlsProvider`, `ProxySessionAuth`, the builder's typestate markers) stay
+// in `winrm-rs`. They are the `winrm-rs` 2.x types; a caller that also
+// imports `winrm_rs` itself must depend on `winrm-rs = "2"`, or it gets a
+// second, distinct set of types.
+pub use winrm_rs::{
+    AuthMethod, EncryptionMode, SecretString, WinrmClient, WinrmClientBuilder, WinrmConfig,
+    WinrmCredentials, WinrmError,
+};

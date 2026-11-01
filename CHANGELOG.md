@@ -6,8 +6,70 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.0.0] — 2026-11-01
+
+`winrm-rs` 2.0.1 or later is now required. The `AuthMethod`,
+`WinrmClient`, `WinrmConfig`, `WinrmCredentials` and `WinrmError` that
+psrp-rs re-exports are the `winrm-rs` 2 types, so this is a major release,
+and it carries the secure defaults of `winrm-rs` 2: HTTPS with the
+certificate validated, environment proxies opt-in, Basic refused where it
+would cross in clear by accident. A client-side timeout no longer makes
+`recv_chunk` retry forever. Read *Upgrading from 3.x* first, then the
+*Upgrading from 1.x* section of the [`winrm-rs` 2.0.0
+changelog](https://github.com/muchiny/winrm-rs/blob/main/CHANGELOG.md).
+
+### Upgrading from 3.x
+
+- A crate that imports `winrm_rs` itself must depend on `winrm-rs = "2"`;
+  with `"1"` it gets a second, distinct `WinrmClient` that
+  `WinrmPsrpTransport::open` does not take. Code that only uses the
+  `psrp_rs` re-exports needs no `winrm-rs` dependency for the common
+  settings; `TlsProvider`, `ProxySessionAuth` and the builder's typestate
+  markers still come from `winrm-rs` itself.
+- `WinrmConfig::default()` is now HTTPS on port 5986 with the server
+  certificate validated. A host with only the stock `Enable-PSRemoting`
+  listener needs `WinrmConfig::http()` (the 3.x default: plain HTTP on
+  5985), as a value or under `..WinrmConfig::http()` in a struct literal.
+- `WinrmConfig::port` is an `Option<u16>`: write `Some(5985)`, or leave
+  `None` (5986 with TLS, 5985 without) and read `effective_port()`. A
+  struct literal on `..WinrmConfig::http()` that sets `use_tls: true` must
+  set `port` too, or it keeps 5985.
+- Proxies from the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY`) are read only by a client built with
+  `WinrmClient::builder(config).credentials(creds).use_env_proxy(true).build()`;
+  the operating system's proxy settings are never read. An explicit
+  `WinrmConfig::proxy` is now a `SecretString`.
+- Basic is refused where it would send the password and every SOAP body in
+  clear by accident: over plain HTTP unless `encryption:
+  EncryptionMode::Never` says so, and over HTTPS with
+  `accept_invalid_certs`. Prefer NTLM, which works on the same stock
+  listener and seals the messages, or Basic over HTTPS with a validated or
+  pinned certificate. `EncryptionMode::Always` with Basic, Certificate or
+  CredSSP is refused too. Each fails when the client is built
+  (`WinrmError::AuthFailed`), where 3.x only warned.
+- The host given to `WinrmPsrpTransport::open`, `WinrmPsrpTransport::reconnect`
+  and `blocking::run_script` / `run_pipeline` must be bare and canonical: a
+  host name, a dotted-quad IPv4 address, or a bracketed IPv6 literal in
+  RFC 5952 form. A `host:port`, a URL, a `user@host` or a shortened IPv4
+  form (`10.1`) now fails with `PsrpError::Winrm(WinrmError::AuthFailed)`
+  before any request, where `winrm-rs` 1.x stripped or accepted it.
+- `WinrmClient::new` no longer installs `ring` as the process-wide rustls
+  provider. An application that built other rustls clients and relied on
+  that side effect must install a provider itself; the WinRM client uses
+  the provider the application installed, or a private `ring` one
+  (`WinrmClientBuilder::tls_provider` chooses; its `TlsProvider` takes a
+  direct `winrm-rs = "2"` dependency).
+- `WinrmPsrpTransport::recv_chunk` returns the third `WinrmError::Timeout`
+  in a row instead of retrying it (see Fixed).
+
 ### Added
 
+- **More `winrm-rs` types are re-exported**: `WinrmClientBuilder`,
+  `EncryptionMode` and `SecretString`, next to the five already there.
+  They are what the common `winrm-rs` 2 settings need: the builder for
+  `use_env_proxy`, `platform_roots`, `add_root_certificates_pem` and
+  `pin_server_certificate_sha256`, `EncryptionMode` for Basic over HTTP,
+  `SecretString` for `WinrmConfig::proxy`.
 - **`SshConfig::with_ack_timeout`** sets how long to wait for `pwsh` to
   acknowledge a request over SSH (default 60 s, as before). `pwsh`
   acknowledges the runspace pool's first message only once the pool is
@@ -18,6 +80,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`winrm-rs` requirement raised to `"2.0.1"`** (from `"1.3.0"`). Besides
+  the defaults listed under *Upgrading from 3.x*, psrp-rs users inherit
+  from `winrm-rs` 2: SOAP bodies are no longer traced by default (they can
+  hold `SecureString` and `PSCredential` fragments; `log_soap_bodies(true)`
+  on the builder restores them, under the target `winrm_rs::wire`), NTLM
+  over plain HTTP logs a WARN (target `winrm_rs::ntlm_over_http`), and the
+  sealed-connection race noted under *Known* in 3.0.0 is fixed. See the
+  `winrm-rs` 2.0.0 changelog for the full list; psrp-rs uses none of the
+  file-transfer or `run_powershell` changes.
 - **`sha1` 0.10 and `rsa`'s `sha1` feature are gone from the dependency
   tree.** The session-key exchange has been RSAES-PKCS1-v1_5 since 3.0.0,
   which takes no hash, so `psrp-rs` no longer needed them. The tree also
@@ -27,6 +98,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The crate's `repository` and `homepage` name the right GitHub
+  account.** They pointed at `github.com/muchini/psrp-rs`, an account that
+  has nothing to do with this project, so the links on crates.io and docs.rs
+  led to someone else's namespace; they now point at
+  `github.com/muchiny/psrp-rs`. The pages of the versions already published
+  keep the old link.
+- **`recv_chunk` no longer retries a client-side timeout forever.**
+  `WinrmPsrpTransport::recv_chunk` read every `WinrmError::Timeout` as an
+  empty long poll and asked again, with no limit. `winrm-rs` raises it when
+  the request budget (`operation_timeout_secs` plus 10 s) runs out: from 2.0
+  also during an authentication handshake and while waiting for a Kerberos
+  KDC, so an unreachable KDC or a handshake that never completes made
+  `RunspacePool` calls and `blocking::run_script` hang. The third
+  `Timeout` in a row is now returned as `PsrpError::Winrm`, after at most
+  3 × (`operation_timeout_secs` + 10 s), 210 s with the defaults; the first
+  two are logged at WARN. Any answer from the server, an empty long poll
+  included, starts the count over, and the server's own long-poll timeout
+  (`w:TimedOut`) is still retried without limit. A client that runs more
+  long polls at once against one host than winrm-rs has connection slots
+  for (32 per host, 128 per client) can now see a slot wait fail after that
+  time, where it used to wait.
 - **Cancelling a pipeline over WinRM no longer loses the server's reply.** A
   WS-Man Receive is a long poll, and dropping it (which `run_with_cancel`
   does when the token fires) closes the connection and discards whatever
@@ -37,10 +129,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   final `Stopped` (the same fault also means "the shell is gone", which the
   next command then reports); it is now read as the end of the stop, and
   `run_with_cancel` returns `Cancelled` with the pool usable, instead of a
-  SOAP error. **The stop signal itself needs `winrm-rs` 1.4.1**: 1.4.0 and
+  SOAP error. The stop signal itself needed `winrm-rs` 1.4.1 (1.4.0 and
   earlier addressed a PSRP shell with the `cmd` `ResourceURI` and code, so
-  the server refused it (#35); with them, cancelling over WinRM still fails
-  at the signal.
+  the server refused it, #35); the `winrm-rs` 2 requirement includes it.
 - **The value of a .NET enum is no longer dropped.** PowerShell writes an
   enum as an `<Obj>` with its type names, a `<ToString>` and the number as
   a nameless child (`<I32>1</I32>`); the decoder skipped that child, so every

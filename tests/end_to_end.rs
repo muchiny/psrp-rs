@@ -221,10 +221,12 @@ async fn live_run_get_date() {
         .unwrap_or(5985);
 
     let client = psrp_rs::WinrmClient::new(
+        // Plain HTTP: the Vagrant box only has the stock 5985 listener.
+        // `WinrmConfig::default()` is HTTPS since winrm-rs 2.
         psrp_rs::WinrmConfig {
             auth_method: psrp_rs::AuthMethod::Ntlm,
-            port,
-            ..Default::default()
+            port: Some(port),
+            ..psrp_rs::WinrmConfig::http()
         },
         psrp_rs::WinrmCredentials::new(user, pass, ""),
     )
