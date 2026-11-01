@@ -450,6 +450,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_host_captures_partial_verbose_and_debug_writes() {
+        let h = BufferedHost::new();
+        h.write("partial").await;
+        h.write_verbose_line("verbose").await;
+        h.write_debug_line("debug").await;
+        assert_eq!(h.lines(), vec!["partial".to_string()]);
+        // Verbose and debug have no public snapshot: read the buffers.
+        let inner = h.inner.lock().unwrap();
+        assert_eq!(inner.verbose, vec!["verbose".to_string()]);
+        assert_eq!(inner.debug, vec!["debug".to_string()]);
+    }
+
+    #[tokio::test]
     async fn buffered_host_survives_a_poisoned_lock() {
         let h = BufferedHost::new();
         let clone = h.clone();
