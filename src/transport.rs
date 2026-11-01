@@ -170,6 +170,13 @@ impl<'c> WinrmPsrpTransport<'c> {
     /// `SessionCapability + InitRunspacePool` PSRP messages, already
     /// fragment-encoded. They get base64-wrapped and embedded in the
     /// WS-Man Create Shell body.
+    ///
+    /// `host` is bare and canonical: a host name, a dotted-quad IPv4 address
+    /// or a bracketed IPv6 literal in RFC 5952 form, with no scheme,
+    /// `user@`, path or port. The port, TLS and authentication come from the
+    /// `client`'s [`WinrmConfig`](winrm_rs::WinrmConfig). Any other form
+    /// (`host:5985`, `10.1`, ...) is refused before a request is sent, with
+    /// [`PsrpError::Winrm`] (`AuthFailed`).
     pub async fn open(
         client: &'c WinrmClient,
         host: &str,
@@ -194,7 +201,8 @@ impl<'c> WinrmPsrpTransport<'c> {
         })
     }
 
-    /// Reconnect to a previously-disconnected PSRP shell.
+    /// Reconnect to a previously-disconnected PSRP shell. `host` takes the
+    /// same bare form as in [`Self::open`].
     pub async fn reconnect(client: &'c WinrmClient, host: &str, shell_id: &str) -> Result<Self> {
         let shell = client
             .reconnect_shell(host, shell_id, RESOURCE_URI_PSRP)

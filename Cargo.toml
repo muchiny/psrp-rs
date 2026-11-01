@@ -24,17 +24,17 @@ include = [
 ]
 
 [dependencies]
-# 1.3.0 is a floor, not a convenience. 1.2 carries the fix for the XML
-# injection in the SOAP `ResourceURI` header and raises winrm-rs's MSRV
-# to 1.98 to match ours; 1.2.1 makes `Shell::close` address Delete under
-# the shell's own ResourceURI, without which every PSRP pool this crate
-# closes leaves its runspace running on the server; 1.2.2 makes the PSRP
-# shell disconnectable. 1.3.0 makes NTLM sealing work and fail closed
-# (under 1.2.x every NTLM SOAP body over HTTP ended up crossing in
-# plaintext) and builds TLS on `ring` only, which takes `aws-lc-sys`
-# out of the tree. Allowing anything older would let a consumer resolve a
-# build that leaks or sends NTLM traffic in clear.
-winrm-rs = "1.3.0"
+# The winrm-rs major is part of the psrp-rs API: `lib.rs` re-exports its
+# client, configuration and error types, so moving to another major is a
+# psrp-rs major too. The 2.x line keeps everything the old 1.3.0 floor was
+# for (the `ResourceURI` injection fix, `Shell::close` and `disconnect` on
+# a PSRP shell, NTLM sealing that fails closed, TLS on `ring` only, so no
+# `aws-lc-sys`) and the 1.4.1 fixes (the PSRP stop signal, the handshake
+# signature checked under `accept_invalid_certs`). What psrp-rs users
+# inherit from 2.x: HTTPS on 5986 with the certificate validated by
+# default, environment proxies opt-in, Basic refused over plain HTTP
+# unless encryption is off, and no process-wide rustls provider installed.
+winrm-rs = "2.0.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"

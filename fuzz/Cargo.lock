@@ -501,6 +501,7 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -2950,23 +2951,29 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "winrm-rs"
-version = "1.4.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "face054431ca7263ad0f24dfb0bf13cbc963fc20dd50d0582ed9223f311be6f9"
+checksum = "e8e3b3f6502972fc076a11c851914c7d3a7f1b9b369811693723a1104d00d6bb"
 dependencies = [
  "base64",
  "hmac",
+ "http",
+ "hyper-util",
+ "idna",
  "md-5",
  "md4",
  "rand 0.10.3",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "secrecy",
  "sha2",
  "subtle",
  "thiserror",
  "tokio",
  "tokio-util",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "uuid",
  "webpki-roots",

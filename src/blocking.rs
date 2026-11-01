@@ -27,7 +27,8 @@ fn runtime() -> &'static Runtime {
 
 /// Run a single PowerShell script against `host` via a freshly-opened pool.
 ///
-/// The pool is closed cleanly before returning.
+/// `host` is bare, as in [`WinrmPsrpTransport::open`]. The pool is closed
+/// cleanly before returning.
 pub fn run_script(client: &WinrmClient, host: &str, script: &str) -> Result<Vec<PsValue>> {
     runtime().block_on(async move {
         let (rpid, creation) =
@@ -41,7 +42,8 @@ pub fn run_script(client: &WinrmClient, host: &str, script: &str) -> Result<Vec<
 }
 
 /// Run a pre-built [`Pipeline`] against `host` via a freshly-opened pool,
-/// returning every stream.
+/// returning every stream. `host` is bare, as in
+/// [`WinrmPsrpTransport::open`].
 pub fn run_pipeline(
     client: &WinrmClient,
     host: &str,

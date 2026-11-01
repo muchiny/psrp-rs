@@ -52,7 +52,9 @@ Vagrant.configure("2") do |config|
     # Provisioning: configure WinRM + PSRP
     win.vm.provision "shell", inline: <<-SHELL
       # Basic auth + unencrypted (for offline-dev HTTP testing).
-      # For production you'd want HTTPS + NTLM/Kerberos.
+      # For production you'd want HTTPS + NTLM/Kerberos. A winrm-rs 2 client
+      # (psrp-rs 4) uses NTLM on this HTTP listener; Basic needs
+      # `EncryptionMode::Never` (PSRP_INTEGRATION_AUTH=basic).
       Set-Item -Path WSMan:\\localhost\\Service\\Auth\\Basic -Value $true
       Set-Item -Path WSMan:\\localhost\\Service\\AllowUnencrypted -Value $true
 

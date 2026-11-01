@@ -15,13 +15,16 @@
 //! ```
 //!
 //! Set `PSRP_INTEGRATION_TLS=1` to use HTTPS on port 5986, or the env var
-//! `PSRP_INTEGRATION_PORT` to override the port.
+//! `PSRP_INTEGRATION_PORT` to override the port. `PSRP_INTEGRATION_HOST`
+//! is a bare host name or address (no scheme, port or `user@`). The tests
+//! authenticate with NTLM; `PSRP_INTEGRATION_AUTH=basic` switches to Basic
+//! over plain HTTP, with message encryption off.
 
 use std::env;
 
 use psrp_rs::{
-    AuthMethod, Command, Pipeline, PipelineState, PsValue, RunspacePool, WinrmClient, WinrmConfig,
-    WinrmCredentials, WinrmPsrpTransport,
+    AuthMethod, Command, EncryptionMode, Pipeline, PipelineState, PsValue, RunspacePool,
+    WinrmClient, WinrmConfig, WinrmCredentials, WinrmPsrpTransport,
 };
 
 struct LiveConfig {
@@ -55,27 +58,36 @@ impl LiveConfig {
 }
 
 fn build_client(cfg: &LiveConfig) -> WinrmClient {
-    // Use the auth method specified by env, defaulting to Basic for HTTP
-    // (works through WSL → Hyper-V proxies) and NTLM for HTTPS.
-    let auth_method = match std::env::var("PSRP_INTEGRATION_AUTH").ok().as_deref() {
-        Some("ntlm") => AuthMethod::Ntlm,
-        Some("basic") => AuthMethod::Basic,
-        _ => {
-            if cfg.tls {
-                AuthMethod::Ntlm
-            } else {
-                AuthMethod::Basic
-            }
-        }
+    // NTLM by default, over HTTP and HTTPS: it seals the messages on plain
+    // HTTP. `PSRP_INTEGRATION_AUTH=basic` opts into Basic, which winrm-rs 2
+    // only accepts over HTTP with message encryption off
+    // (`EncryptionMode::Never`: the password and every SOAP body then cross
+    // in clear), and refuses over HTTPS with `accept_invalid_certs`.
+    let basic = match std::env::var("PSRP_INTEGRATION_AUTH").ok() {
+        None => false,
+        Some(a) if a.eq_ignore_ascii_case("ntlm") => false,
+        Some(a) if a.eq_ignore_ascii_case("basic") => true,
+        Some(other) => panic!("PSRP_INTEGRATION_AUTH={other:?}: expected `ntlm` or `basic`"),
+    };
+    assert!(
+        !(basic && cfg.tls),
+        "PSRP_INTEGRATION_AUTH=basic with PSRP_INTEGRATION_TLS: winrm-rs 2 refuses Basic \
+         with accept_invalid_certs (the eval box's certificate is self-signed); use NTLM"
+    );
+    let (auth_method, encryption) = if basic {
+        (AuthMethod::Basic, EncryptionMode::Never)
+    } else {
+        (AuthMethod::Ntlm, EncryptionMode::Auto)
     };
     WinrmClient::new(
         WinrmConfig {
             auth_method,
-            port: cfg.port,
+            encryption,
+            port: Some(cfg.port),
             use_tls: cfg.tls,
             accept_invalid_certs: cfg.tls, // eval box, self-signed
             operation_timeout_secs: 20,
-            ..Default::default()
+            ..WinrmConfig::http()
         },
         WinrmCredentials::new(cfg.user.clone(), cfg.pass.clone(), ""),
     )
