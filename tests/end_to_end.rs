@@ -4,6 +4,18 @@
 //! `run_script`, `Pipeline::run_all_streams`) without any network I/O, by
 //! feeding pre-built PSRP messages into a test-only transport.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    reason = "test code"
+)]
+
 use psrp_rs::fragment::encode_message;
 use psrp_rs::message::{Destination, MessageType, PsrpMessage};
 use psrp_rs::pipeline::PipelineState;

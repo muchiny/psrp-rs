@@ -95,6 +95,21 @@ changelog](https://github.com/muchiny/winrm-rs/blob/main/CHANGELOG.md).
   loses `block-buffer` 0.10 and `cpufeatures` 0.2. No API or behaviour
   change; the `ssh` feature keeps `sha1` 0.11 for hashed `known_hosts`
   entries.
+- **The library code is held to the restriction lints.** `Cargo.toml` sets
+  `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`,
+  `indexing_slicing`, `arithmetic_side_effects` and `as_conversions` to
+  `warn`, and CI denies warnings, so a hidden panic or a silent overflow or
+  truncation in library code fails the build. The parsers of server input
+  (fragment and message headers, CLIXML, the session-key blob, the
+  SecureString padding, `known_hosts`) now read by checked slices and
+  conversions; the two exceptions are `#[expect]`ed with the invariant that
+  makes them safe. No API change, and the bytes on the wire are unchanged.
+- **`russh` 0.65** (from 0.64), under the `ssh` feature, for its client-side
+  fixes against a hostile server: unbounded `EXT_INFO` messages
+  (GHSA-4p9f-7p9m-5vfg), a zero maximum packet size that stalled the channel
+  (GHSA-fw5c-8223-6h42), nested host certificates that exhausted the stack
+  (GHSA-3hm4-p7h4-rvwp). No psrp-rs API exposes a `russh` type, so nothing
+  changes for callers.
 
 ### Fixed
 
@@ -104,6 +119,17 @@ changelog](https://github.com/muchiny/winrm-rs/blob/main/CHANGELOG.md).
   led to someone else's namespace; they now point at
   `github.com/muchiny/psrp-rs`. The pages of the versions already published
   keep the old link.
+- **`blocking::run_script`, `run_pipeline` and `run_script_ssh` no longer
+  panic when the Tokio runtime cannot be built** (threads or file
+  descriptors exhausted): they return `PsrpError::Protocol`, and the next
+  call tries again.
+- **`BufferedHost` survives a panic in a thread that held its lock.** A
+  poisoned lock made every later `lines`, `warnings` or `errors` call panic;
+  the recorded output is now read as it was.
+- **Counters that only overflow after 2³² or 2⁶⁴ steps no longer panic in
+  debug builds or wrap in release.** A fragment id past `u64::MAX` is a
+  `PsrpError::Fragment`, an exhausted object id a `PsrpError::Protocol`, and
+  `RefIdAllocator::next` stays at `u32::MAX`. None is reachable in practice.
 - **`recv_chunk` no longer retries a client-side timeout forever.**
   `WinrmPsrpTransport::recv_chunk` read every `WinrmError::Timeout` as an
   empty long poll and asked again, with no limit. `winrm-rs` raises it when

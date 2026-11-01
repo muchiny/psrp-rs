@@ -142,41 +142,77 @@ impl BufferedHost {
     /// Snapshot of everything written to the "write line" stream.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
-        self.inner.lock().unwrap().lines.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lines
+            .clone()
     }
 
     /// Snapshot of warnings.
     #[must_use]
     pub fn warnings(&self) -> Vec<String> {
-        self.inner.lock().unwrap().warnings.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .warnings
+            .clone()
     }
 
     /// Snapshot of errors.
     #[must_use]
     pub fn errors(&self) -> Vec<String> {
-        self.inner.lock().unwrap().errors.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .errors
+            .clone()
     }
 }
 
 #[async_trait]
 impl PsHost for BufferedHost {
     async fn write_line(&self, text: &str) {
-        self.inner.lock().unwrap().lines.push(text.to_string());
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lines
+            .push(text.to_string());
     }
     async fn write(&self, text: &str) {
-        self.inner.lock().unwrap().lines.push(text.to_string());
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lines
+            .push(text.to_string());
     }
     async fn write_error_line(&self, text: &str) {
-        self.inner.lock().unwrap().errors.push(text.to_string());
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .errors
+            .push(text.to_string());
     }
     async fn write_warning_line(&self, text: &str) {
-        self.inner.lock().unwrap().warnings.push(text.to_string());
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .warnings
+            .push(text.to_string());
     }
     async fn write_verbose_line(&self, text: &str) {
-        self.inner.lock().unwrap().verbose.push(text.to_string());
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verbose
+            .push(text.to_string());
     }
     async fn write_debug_line(&self, text: &str) {
-        self.inner.lock().unwrap().debug.push(text.to_string());
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .debug
+            .push(text.to_string());
     }
 }
 
@@ -411,6 +447,19 @@ mod tests {
         assert_eq!(h.lines(), vec!["hello".to_string()]);
         assert_eq!(h.warnings(), vec!["warn".to_string()]);
         assert_eq!(h.errors(), vec!["err".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn buffered_host_survives_a_poisoned_lock() {
+        let h = BufferedHost::new();
+        let clone = h.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = clone.inner.lock().unwrap();
+            panic!("poison the buffer");
+        })
+        .join();
+        h.write_line("after").await;
+        assert_eq!(h.lines(), vec!["after".to_string()]);
     }
 
     #[tokio::test]

@@ -39,12 +39,25 @@ fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for group in bytes.chunks(3) {
-        let n = group
-            .iter()
-            .enumerate()
-            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
-        for i in 0..=group.len() {
-            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 0x3F) as usize]));
+        let mut padded = [0u8; 3];
+        for (slot, byte) in padded.iter_mut().zip(group) {
+            *slot = *byte;
+        }
+        let [b0, b1, b2] = padded;
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        // One output char per input byte, plus one: 2, 3 or 4 of the four
+        // sextets. `n & 0x3F` is always below 64, so `find_map` always hits.
+        for shift in [18u32, 12, 6, 0]
+            .into_iter()
+            .take(group.len().saturating_add(1))
+        {
+            let sextet = (n >> shift) & 0x3F;
+            out.extend(
+                ALPHABET
+                    .iter()
+                    .zip(0u32..)
+                    .find_map(|(c, i)| (i == sextet).then_some(char::from(*c))),
+            );
         }
         for _ in group.len()..3 {
             out.push('=');
@@ -240,9 +253,16 @@ fn main() -> std::io::Result<()> {
     let a_frags = split_message(100, &a_payload);
     let b_frags = split_message(200, &b_payload);
     let mut interleaved = Vec::new();
-    interleaved.extend(a_frags[0].encode());
-    interleaved.extend(b_frags[0].encode());
-    interleaved.extend(a_frags[1].encode());
+    let (Some(a_first), Some(a_second), Some(b_first)) =
+        (a_frags.first(), a_frags.get(1), b_frags.first())
+    else {
+        return Err(std::io::Error::other(
+            "split_message returned too few fragments for the interleaved seed",
+        ));
+    };
+    interleaved.extend(a_first.encode());
+    interleaved.extend(b_first.encode());
+    interleaved.extend(a_second.encode());
     frag_seed("interleaved.bin", 0xFF, &interleaved)?;
 
     // Exactly on the split boundary — the arithmetic most likely to be

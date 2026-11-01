@@ -13,12 +13,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # Hardened lints (rust-hardening.md): counted by `hardening`, imported into
-  # SonarQube Cloud by `sonar`. One list, so the two jobs cannot drift apart.
-  HARDENING_LINTS: >-
-    -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic -W clippy::todo
-    -W clippy::unimplemented -W clippy::indexing_slicing -W clippy::arithmetic_side_effects
-    -W clippy::as_conversions
 
 jobs:
   test:
@@ -29,21 +23,26 @@ jobs:
       matrix:
         features: ["", "--all-features", "--features ssh", "--features serde"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --locked ${{ matrix.features }}
 
   coverage:
     name: coverage (seuil 92 % lignes)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
         with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-llvm-cov
       # Mesuré le 2026-10-19 : 94,07 % (--lib). Seuil à 92 pour garder 2 points de marge.
       - run: cargo llvm-cov --locked --lib --summary-only --fail-under-lines 92
       # Report for SonarQube Cloud: --all-features so that src/out_of_proc/
@@ -51,7 +50,7 @@ jobs:
       # features, where the 92 % was calibrated.
       - run: cargo llvm-cov --locked --lib --all-features --cobertura --output-path cobertura.xml
       - name: Keep cobertura.xml for the sonar job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-cobertura
           path: cobertura.xml
@@ -81,18 +80,19 @@ jobs:
           persist-credentials: false
           # Full history: Sonar needs blame data to tell new code from old.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage-cobertura
+      # `--lib` only: the restriction lints of Cargo.toml target production
+      # code, and with `--all-targets` the lib is checked twice (plain and test
+      # harness), so every warning would reach SonarQube twice.
       - name: Clippy report (JSON)
-        run: |
-          # shellcheck disable=SC2086 # HARDENING_LINTS is a list of flags
-          cargo clippy --locked --all-features --message-format=json -- $HARDENING_LINTS > clippy-report.json
+        run: cargo clippy --locked --all-features --lib --message-format=json > clippy-report.json
       - name: SonarQube scan
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         env:
@@ -102,46 +102,32 @@ jobs:
     name: fmt + clippy + docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
-  hardening:
-    # Informatif : compte les violations des lints durcis (rust-hardening.md) et
-    # vérifie la baseline cargo-vet. Ne bloque jamais ; à rendre bloquant
-    # quand les compteurs sont à zéro.
-    name: Hardening (informatif)
+  vet:
+    # Informatif : vérifie la baseline cargo-vet (supply-chain/). Ne bloque
+    # jamais. Les lints durcis ne sont plus comptés ici : Cargo.toml les met à
+    # `warn`, donc les jobs `lint` et `sonar` les portent.
+    name: cargo vet (informatif)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-vet@0.10.2
-      - name: Lints durcis (comptage)
-        run: |
-          # shellcheck disable=SC2086 # HARDENING_LINTS is a list of flags
-          cargo clippy --locked --all-features --message-format=short -- \
-            $HARDENING_LINTS 2> hardening.txt || true
-          {
-            echo '### Lints durcis (non bloquant)'
-            echo '```'
-            sed -nE 's/^[^ ]+ (warning|error): //p' hardening.txt | sort | uniq -c | sort -rn
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
       - name: cargo vet (baseline d'exemptions)
         run: cargo vet --locked
 
@@ -151,13 +137,13 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: msrv
         run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # `rust-toolchain.toml` pins `stable`, which would silently defeat
       # the whole point of this job.
       - run: rm -f rust-toolchain.toml
@@ -167,8 +153,10 @@ jobs:
     name: advisories + licences
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check

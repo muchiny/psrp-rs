@@ -51,7 +51,11 @@ rand = "0.8"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 serde = { version = "1", features = ["derive"], optional = true }
 # `ring` instead of the default `aws-lc-rs`: keeps `aws-lc-sys` out of the tree.
-russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"], optional = true }
+# 0.65 for the client-side fixes against a hostile server: unbounded
+# EXT_INFO (GHSA-4p9f-7p9m-5vfg), a zero max packet size stalling the
+# channel (GHSA-fw5c-8223-6h42), nested host certificates exhausting the
+# stack (GHSA-3hm4-p7h4-rvwp).
+russh = { version = "0.65.0", default-features = false, features = ["ring", "rsa", "flate2"], optional = true }
 hmac = { version = "0.13", optional = true }
 # HMAC-SHA1 for hashed `known_hosts` entries. Aliased because `sha1` was a
 # direct dependency on the 0.10 line until `rsa`'s `sha1` feature went away
@@ -108,3 +112,15 @@ match_wildcard_for_single_variants = "allow"
 missing_fields_in_debug = "allow"
 unused_async = "allow"
 no_effect_underscore_binding = "allow"
+# Hidden panics and silent overflow or truncation, mostly on server input.
+# Production code only: test code is exempt (clippy.toml, the
+# `cfg_attr(test, ...)` at the top of src/lib.rs, a header in each file of
+# tests/). A justified exception is a `#[expect(..., reason = "...")]`.
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"

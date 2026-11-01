@@ -495,7 +495,7 @@ impl Drop for WinrmPsrpTransport<'_> {
 pub mod mock {
     use super::{PsrpError, PsrpTransport, Result, async_trait};
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, PoisonError};
     use uuid::Uuid;
 
     /// In-memory transport used by the test suite.
@@ -517,39 +517,63 @@ pub mod mock {
         }
 
         pub fn push_incoming(&self, bytes: Vec<u8>) {
-            self.inbox.lock().unwrap().push_back(bytes);
+            self.inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_back(bytes);
         }
 
         pub fn sent(&self) -> Vec<Vec<u8>> {
-            self.outbox.lock().unwrap().clone()
+            self.outbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
 
         pub fn pipeline_sends(&self) -> Vec<Uuid> {
-            self.pipeline_sends.lock().unwrap().clone()
+            self.pipeline_sends
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
     }
 
     #[async_trait]
     impl PsrpTransport for MockTransport {
         async fn send_fragment(&self, bytes: &[u8]) -> Result<()> {
-            if *self.fail_send.lock().unwrap() {
+            if *self
+                .fail_send
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+            {
                 return Err(PsrpError::protocol("mock send failure"));
             }
-            self.outbox.lock().unwrap().push(bytes.to_vec());
+            self.outbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(bytes.to_vec());
             Ok(())
         }
 
         async fn send_pipeline_fragment(&mut self, bytes: &[u8], pipeline_id: Uuid) -> Result<()> {
             self.send_fragment(bytes).await?;
-            self.pipeline_sends.lock().unwrap().push(pipeline_id);
+            self.pipeline_sends
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(pipeline_id);
             Ok(())
         }
 
         async fn recv_chunk(&mut self) -> Result<Vec<u8>> {
-            if let Some(e) = self.fail_recv.lock().unwrap().take() {
+            if let Some(e) = self
+                .fail_recv
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
                 return Err(e);
             }
-            let mut inbox = self.inbox.lock().unwrap();
+            let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(bytes) = inbox.pop_front() {
                 Ok(bytes)
             } else {
@@ -558,17 +582,17 @@ pub mod mock {
         }
 
         async fn signal_stop(&self) -> Result<()> {
-            *self.stopped.lock().unwrap() = true;
+            *self.stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
             Ok(())
         }
 
         async fn close_shell(&mut self) -> Result<()> {
-            *self.closed.lock().unwrap() = true;
+            *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
             Ok(())
         }
 
         async fn disconnect_shell(&mut self) -> Result<String> {
-            *self.closed.lock().unwrap() = true;
+            *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
             Ok("MOCK-SHELL-ID".into())
         }
     }

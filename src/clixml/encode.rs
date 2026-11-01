@@ -48,7 +48,10 @@ impl RefIdAllocator {
     /// Allocate the next id.
     pub fn next(&self) -> u32 {
         let v = self.next.get();
-        self.next.set(v + 1);
+        // Saturate rather than wrap: a document needing 2^32 ids is tens of
+        // gigabytes of XML, so this is unreachable in practice, and a repeated
+        // id is the safer failure than a panic (debug) or a restart at 0.
+        self.next.set(v.saturating_add(1));
         v
     }
 }
@@ -78,7 +81,7 @@ pub(crate) fn write_value_with(
         PsValue::U32(v) => write_simple(out, "U32", &v.to_string(), name, false),
         PsValue::I64(v) => write_simple(out, "I64", &v.to_string(), name, false),
         PsValue::U64(v) => write_simple(out, "U64", &v.to_string(), name, false),
-        PsValue::F32(v) => write_simple(out, "Sg", &format_float(*v as f64), name, false),
+        PsValue::F32(v) => write_simple(out, "Sg", &format_float(f64::from(*v)), name, false),
         PsValue::Double(v) => write_simple(out, "Db", &format_float(*v), name, false),
         PsValue::Decimal(s) => write_simple(out, "D", &escape(s), name, false),
         // A `[char]` is one UTF-16 unit (`ToUInt16` on the other side), which a
@@ -324,9 +327,9 @@ pub fn escape_attr(s: &str) -> String {
 }
 
 fn escape_inner(s: &str, attribute: bool) -> String {
-    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
-    for (i, c) in s.char_indices() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
@@ -345,15 +348,15 @@ fn escape_inner(s: &str, attribute: bool) -> String {
             // character after it (`"_x0041\r"` in an attribute). `X` is
             // covered because PowerShell decodes with
             // `XmlConvert.DecodeName`, which accepts `_X` too.
-            '_' if matches!(bytes.get(i + 1), Some(b'x' | b'X')) => out.push_str("_x005F_"),
+            '_' if matches!(chars.peek(), Some('x' | 'X')) => out.push_str("_x005F_"),
             // Tab and LF survive element text, not attribute values.
             '\t' | '\n' if attribute => {
-                out.push_str(&format!("_x{:04X}_", c as u32));
+                out.push_str(&format!("_x{:04X}_", u32::from(c)));
             }
             // Every other control character, CR included: end-of-line
             // normalisation turns a literal CR into LF even in text.
-            c if (c as u32) < 0x20 && c != '\t' && c != '\n' => {
-                out.push_str(&format!("_x{:04X}_", c as u32));
+            c if u32::from(c) < 0x20 && c != '\t' && c != '\n' => {
+                out.push_str(&format!("_x{:04X}_", u32::from(c)));
             }
             c => out.push(c),
         }
@@ -361,39 +364,45 @@ fn escape_inner(s: &str, attribute: bool) -> String {
     out
 }
 
+/// Alphabet character for the low six bits of `sextet`.
+fn base64_char(sextet: u8) -> char {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the index is masked with 0x3F, so it is at most 63 on a 64-entry table"
+    )]
+    char::from(ALPHABET[usize::from(sextet & 0x3F)])
+}
+
 /// Minimal, allocation-conscious base64 encoder (standard alphabet).
 #[must_use]
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    // Capacity is only a hint: 0 on the (unreachable) overflow.
+    let capacity = bytes.len().div_ceil(3).checked_mul(4).unwrap_or(0);
+    let mut out = String::with_capacity(capacity);
     let (chunks, rem) = bytes.as_chunks::<3>();
-    for chunk in chunks {
-        let b0 = chunk[0] as usize;
-        let b1 = chunk[1] as usize;
-        let b2 = chunk[2] as usize;
-        out.push(ALPHABET[b0 >> 2] as char);
-        out.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-        out.push(ALPHABET[((b1 & 0x0F) << 2) | (b2 >> 6)] as char);
-        out.push(ALPHABET[b2 & 0x3F] as char);
+    for &[b0, b1, b2] in chunks {
+        out.push(base64_char(b0 >> 2));
+        out.push(base64_char(((b0 & 0x03) << 4) | (b1 >> 4)));
+        out.push(base64_char(((b1 & 0x0F) << 2) | (b2 >> 6)));
+        out.push(base64_char(b2));
     }
-    match rem.len() {
-        0 => {}
-        1 => {
-            let b0 = rem[0] as usize;
-            out.push(ALPHABET[b0 >> 2] as char);
-            out.push(ALPHABET[(b0 & 0x03) << 4] as char);
+    match *rem {
+        [] => {}
+        [b0] => {
+            out.push(base64_char(b0 >> 2));
+            out.push(base64_char((b0 & 0x03) << 4));
             out.push('=');
             out.push('=');
         }
-        2 => {
-            let b0 = rem[0] as usize;
-            let b1 = rem[1] as usize;
-            out.push(ALPHABET[b0 >> 2] as char);
-            out.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-            out.push(ALPHABET[(b1 & 0x0F) << 2] as char);
+        [b0, b1] => {
+            out.push(base64_char(b0 >> 2));
+            out.push(base64_char(((b0 & 0x03) << 4) | (b1 >> 4)));
+            out.push(base64_char((b1 & 0x0F) << 2));
             out.push('=');
         }
-        _ => unreachable!(),
+        // `as_chunks::<3>` leaves a remainder of fewer than three bytes.
+        [_, _, _, ..] => unreachable!(),
     }
     out
 }
@@ -560,18 +569,25 @@ pub(crate) fn build_create_pipeline_xml(
         } else {
             ("None", 0)
         };
-        for (name, label, val) in [
+        let merge_fields = [
             ("MergeMyResult", merge_my_name, merge_my_val),
             ("MergeToResult", merge_to_name, merge_to_val),
             ("MergePreviousResults", "None", 0i32),
-        ] {
-            if let Some(tn_ref) = first_prt_tn {
+        ];
+        let tn_ref = if let Some(tn_ref) = first_prt_tn {
+            for (name, label, val) in merge_fields {
                 write_enum_with_tnref(&mut o, Some(name), tn_ref, label, val, &a);
-            } else {
-                let tn_id = write_enum_first_in_group(&mut o, Some(name), prt, label, val, &a);
-                first_prt_tn = Some(tn_id);
             }
-        }
+            tn_ref
+        } else {
+            let [(name, label, val), rest @ ..] = merge_fields;
+            let tn_ref = write_enum_first_in_group(&mut o, Some(name), prt, label, val, &a);
+            for (name, label, val) in rest {
+                write_enum_with_tnref(&mut o, Some(name), tn_ref, label, val, &a);
+            }
+            tn_ref
+        };
+        first_prt_tn = Some(tn_ref);
 
         // Args (uses TNRef to cmds_tn)
         o.push_str(&format!(
@@ -600,7 +616,6 @@ pub(crate) fn build_create_pipeline_xml(
         o.push_str("</LST></Obj>"); // close Args
 
         // Remaining Merge fields (MergeError..MergeInformation)
-        let tn_ref = first_prt_tn.expect("at least one merge field emitted");
         for name in [
             "MergeError",
             "MergeWarning",
@@ -653,25 +668,31 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     if padding > 2 {
         return None;
     }
-    let data = &symbols[..symbols.len() - padding];
-    let mut out = Vec::with_capacity(symbols.len() / 4 * 3);
+    let mut out = Vec::with_capacity((symbols.len() / 4).saturating_mul(3));
+    // `padding` counts trailing elements of `symbols`, so this never clamps.
+    symbols.truncate(symbols.len().saturating_sub(padding));
     let mut buf = 0u32;
     let mut bits = 0u32;
-    for &b in data {
+    for &b in &symbols {
+        // The `wrapping_*` calls sit behind range arms: `b` is at least the
+        // subtracted bound and the sum stays below 64, so they never wrap.
         let v = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
+            b'A'..=b'Z' => b.wrapping_sub(b'A'),
+            b'a'..=b'z' => b.wrapping_sub(b'a').wrapping_add(26),
+            b'0'..=b'9' => b.wrapping_sub(b'0').wrapping_add(52),
             b'+' => 62,
             b'/' => 63,
             // Includes a `=` that is not part of the final padding.
             _ => return None,
         };
         buf = (buf << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buf >> bits) & 0xFF) as u8);
+        // `bits` stays below 14: at most 6 are added to a value under 8.
+        bits = bits.saturating_add(6);
+        if let Some(left) = bits.checked_sub(8) {
+            bits = left;
+            // Low byte of the accumulator (the mask of the former `as u8`).
+            let [byte, ..] = (buf >> bits).to_le_bytes();
+            out.push(byte);
         }
     }
     Some(out)
@@ -1028,6 +1049,25 @@ mod tests {
             "Zm9\u{e9}",    // non-ASCII
         ] {
             assert!(base64_decode(text).is_none(), "{text:?} was accepted");
+        }
+    }
+
+    // The id counter used to overflow (panic in debug) past `u32::MAX`.
+    #[test]
+    fn ref_id_allocator_saturates_instead_of_overflowing() {
+        let a = RefIdAllocator::starting_at(u32::MAX - 1);
+        assert_eq!(a.next(), u32::MAX - 1);
+        assert_eq!(a.next(), u32::MAX);
+        assert_eq!(a.next(), u32::MAX);
+    }
+
+    #[test]
+    fn base64_roundtrips_every_remainder_length() {
+        for len in 0..=9u8 {
+            let data: Vec<u8> = (0..len)
+                .map(|i| i.wrapping_mul(37).wrapping_add(200))
+                .collect();
+            assert_eq!(base64_decode(&base64_encode(&data)), Some(data));
         }
     }
 

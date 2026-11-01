@@ -209,7 +209,10 @@ fn build_get_command_metadata_body(patterns: &[&str], command_type: CommandType)
     );
     let obj = PsObject::new()
         .with("Name", names)
-        .with("CommandType", PsValue::I32(command_type.bits() as i32))
+        .with(
+            "CommandType",
+            PsValue::I32(command_type.bits().cast_signed()),
+        )
         .with("Namespace", PsValue::List(Vec::new()))
         .with("ArgumentList", PsValue::List(Vec::new()));
     to_clixml(&PsValue::Object(obj))

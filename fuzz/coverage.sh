@@ -13,12 +13,15 @@
 #
 # Requires nightly, `cargo install cargo-fuzz` and the `llvm-tools`
 # component (`rustup component add llvm-tools --toolchain nightly`).
+# FUZZ_TOOLCHAIN picks the nightly, as in run.sh (default `nightly`; CI pins
+# one in .github/workflows/fuzz.yml).
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 FORMAT="${FORMAT:-summary}"
+FUZZ_TOOLCHAIN="${FUZZ_TOOLCHAIN:-nightly}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -28,12 +31,12 @@ command -v cargo-fuzz >/dev/null 2>&1 \
 # `cargo fuzz coverage` needs the llvm-tools that ship with the nightly
 # toolchain; find the matching llvm-cov rather than whatever is on PATH,
 # since a mismatched version refuses to read the profdata.
-SYSROOT="$(rustc +nightly --print sysroot)"
+SYSROOT="$(rustc "+$FUZZ_TOOLCHAIN" --print sysroot)"
 LLVM_COV="$(find "$SYSROOT" -name 'llvm-cov' -type f 2>/dev/null | head -n1)"
 [ -n "$LLVM_COV" ] \
-  || die "llvm-cov not found. Run: rustup component add llvm-tools --toolchain nightly"
+  || die "llvm-cov not found. Run: rustup component add llvm-tools --toolchain $FUZZ_TOOLCHAIN"
 
-TARGETS="${TARGETS:-$(cargo +nightly fuzz list)}"
+TARGETS="${TARGETS:-$(cargo "+$FUZZ_TOOLCHAIN" fuzz list)}"
 TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 
 # `cargo fuzz coverage` and `cargo fuzz run` both build into
@@ -45,7 +48,7 @@ COVERAGE_TARGET_DIR="fuzz/coverage-target"
 objects=()
 for target in $TARGETS; do
   echo "=== collecting coverage for $target ==="
-  cargo +nightly fuzz coverage --target-dir "$COVERAGE_TARGET_DIR" "$target"
+  cargo "+$FUZZ_TOOLCHAIN" fuzz coverage --target-dir "$COVERAGE_TARGET_DIR" "$target"
   object="$COVERAGE_TARGET_DIR/$TRIPLE/release/$target"
   [ -x "$object" ] || die "instrumented binary not found: $object"
   objects+=(-object "$object")

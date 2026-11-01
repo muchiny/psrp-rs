@@ -14,6 +14,18 @@ use crate::transport::PsrpTransport;
 
 use super::state::{Action, RunspacePoolState, RunspacePoolStateMachine};
 
+/// Hand out the next fragment object id and advance the counter.
+///
+/// Ids must be unique per pool (MS-PSRP section 2.2.4): wrapping or
+/// saturating would reuse one, so exhausting the `u64` space is an error.
+fn take_object_id(counter: &mut u64) -> Result<u64> {
+    let id = *counter;
+    *counter = id
+        .checked_add(1)
+        .ok_or_else(|| PsrpError::protocol("fragment object id space exhausted"))?;
+    Ok(id)
+}
+
 /// A runspace pool.
 ///
 /// Generic over the transport so tests can drive the state machine with an
@@ -130,8 +142,8 @@ impl<T: PsrpTransport> RunspacePool<T> {
                         data: body,
                     };
                     let encoded = msg.encode();
-                    buf.extend_from_slice(&encode_message(next_oid, &encoded));
-                    next_oid += 1;
+                    let oid = take_object_id(&mut next_oid)?;
+                    buf.extend_from_slice(&encode_message(oid, &encoded));
                 }
             }
         }
@@ -544,8 +556,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
             data: body,
         };
         let encoded = msg.encode();
-        let oid = self.next_object_id;
-        self.next_object_id += 1;
+        let oid = take_object_id(&mut self.next_object_id)?;
         let frag_bytes = encode_message(oid, &encoded);
         self.transport.send_fragment(&frag_bytes).await
     }
@@ -691,10 +702,8 @@ impl<T: PsrpTransport> RunspacePool<T> {
             .await
     }
 
-    pub(crate) fn allocate_object_id(&mut self) -> u64 {
-        let id = self.next_object_id;
-        self.next_object_id += 1;
-        id
+    pub(crate) fn allocate_object_id(&mut self) -> Result<u64> {
+        take_object_id(&mut self.next_object_id)
     }
 
     pub(crate) async fn signal_transport_stop(&mut self) -> Result<()> {
@@ -715,7 +724,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
             data: body,
         };
         let encoded = msg.encode();
-        let oid = self.allocate_object_id();
+        let oid = self.allocate_object_id()?;
         let frag_bytes = encode_message(oid, &encoded);
 
         // For CreatePipeline: the first fragment must go via Execute
@@ -931,6 +940,20 @@ impl<T: PsrpTransport> Drop for RunspacePool<T> {
 mod tests {
     use super::*;
     use crate::clixml::{PsObject, to_clixml};
+
+    #[test]
+    fn take_object_id_advances_then_refuses_to_wrap() {
+        let mut counter = 1u64;
+        assert_eq!(take_object_id(&mut counter).unwrap(), 1);
+        assert_eq!(counter, 2);
+        let mut last = u64::MAX;
+        assert!(matches!(
+            take_object_id(&mut last),
+            Err(PsrpError::Protocol(_))
+        ));
+        assert_eq!(last, u64::MAX);
+    }
+
     use crate::transport::mock::MockTransport;
 
     fn state_message_bytes(state: RunspacePoolState) -> Vec<u8> {
