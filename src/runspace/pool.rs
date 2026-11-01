@@ -987,6 +987,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipeline_messages_get_distinct_object_ids() {
+        let t = MockTransport::new();
+        t.push_incoming(wire(100, &state_message_bytes(RunspacePoolState::Opened)));
+        let mut pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
+        let pid = Uuid::new_v4();
+        pool.send_pipeline_message(MessageType::PipelineInput, pid, String::new())
+            .await
+            .unwrap();
+        pool.send_pipeline_message(MessageType::EndOfPipelineInput, pid, String::new())
+            .await
+            .unwrap();
+        // Each message is one fragment here; its object id is the first
+        // eight bytes, big-endian. MS-PSRP 2.2.4: unique per pool.
+        let ids: Vec<u64> = t
+            .sent()
+            .iter()
+            .map(|f| u64::from_be_bytes(f[..8].try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            ids.len(),
+            4,
+            "SessionCapability, InitRunspacePool, two pipeline messages"
+        );
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+    }
+
+    #[tokio::test]
     async fn broken_state_during_open_errors() {
         let t = MockTransport::new();
         t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Broken)));
