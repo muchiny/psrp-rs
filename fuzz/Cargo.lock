@@ -1640,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "psrp-rs"
-version = "3.1.0"
+version = "4.0.0"
 dependencies = [
  "aes",
  "async-trait",
@@ -2951,12 +2951,11 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "winrm-rs"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8e3b3f6502972fc076a11c851914c7d3a7f1b9b369811693723a1104d00d6bb"
+checksum = "fa4e9b6b41cfbb3bcf41b6a6ab4ee157ed4bdd94fdbf9404eda86fb409b70c88"
 dependencies = [
  "base64",
- "hmac",
  "http",
  "hyper-util",
  "idna",

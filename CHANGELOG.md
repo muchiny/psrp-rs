@@ -6,7 +6,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-`winrm-rs` 2.0.0 or later is now required. The `AuthMethod`,
+## [4.0.0] — 2026-11-01
+
+`winrm-rs` 2.0.1 or later is now required. The `AuthMethod`,
 `WinrmClient`, `WinrmConfig`, `WinrmCredentials` and `WinrmError` that
 psrp-rs re-exports are the `winrm-rs` 2 types, so this is a major release,
 and it carries the secure defaults of `winrm-rs` 2: HTTPS with the
@@ -78,7 +80,7 @@ changelog](https://github.com/muchiny/winrm-rs/blob/main/CHANGELOG.md).
 
 ### Changed
 
-- **`winrm-rs` requirement raised to `"2.0.0"`** (from `"1.3.0"`). Besides
+- **`winrm-rs` requirement raised to `"2.0.1"`** (from `"1.3.0"`). Besides
   the defaults listed under *Upgrading from 3.x*, psrp-rs users inherit
   from `winrm-rs` 2: SOAP bodies are no longer traced by default (they can
   hold `SecureString` and `PSCredential` fragments; `log_soap_bodies(true)`

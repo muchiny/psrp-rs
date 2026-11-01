@@ -4,12 +4,13 @@
 
 | Version | Supported |
 |---------|-----------|
-| 3.1.x   | Yes       |
-| 3.0.x   | Yes       |
-| < 3.0   | No        |
+| 4.0.x   | Yes       |
+| < 4.0   | No        |
 
-2.0.x ignores some `known_hosts` revocations (see the 3.0.0 entry of
-`CHANGELOG.md`); upgrade rather than wait for a fix there.
+3.x depends on `winrm-rs` 1.x, which `winrm-rs` no longer supports, so a
+fix in the WinRM layer only reaches 4.0.x; upgrade rather than wait for a
+3.x release. 2.0.x also ignores some `known_hosts` revocations (see the
+3.0.0 entry of `CHANGELOG.md`).
 
 ## Reporting a Vulnerability
 
