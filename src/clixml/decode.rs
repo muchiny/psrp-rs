@@ -378,6 +378,10 @@ fn parse_element_inner(
                 parse_float(text.trim()).map_err(|err| PsrpError::clixml(format!("Sg: {err}")))?;
             // `f64` -> `f32` has no `From`/`TryFrom`; rounding to the nearest
             // `f32` (out-of-range magnitudes become infinity) is the intent.
+            #[expect(
+                clippy::as_conversions,
+                reason = "intentional f64 to f32 narrowing: no lossless conversion exists and `as` is saturating/rounding, never UB"
+            )]
             let narrowed = v as f32;
             Ok(Some(PsValue::F32(narrowed)))
         }

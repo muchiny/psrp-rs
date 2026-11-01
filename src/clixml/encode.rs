@@ -367,6 +367,10 @@ fn escape_inner(s: &str, attribute: bool) -> String {
 /// Alphabet character for the low six bits of `sextet`.
 fn base64_char(sextet: u8) -> char {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the index is masked with 0x3F, so it is at most 63 on a 64-entry table"
+    )]
     char::from(ALPHABET[usize::from(sextet & 0x3F)])
 }
 

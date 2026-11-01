@@ -20,6 +20,18 @@
 //! authenticate with NTLM; `PSRP_INTEGRATION_AUTH=basic` switches to Basic
 //! over plain HTTP, with message encryption off.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    reason = "test code"
+)]
+
 use std::env;
 
 use psrp_rs::{
