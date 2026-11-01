@@ -1076,6 +1076,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inet_aton_accepts_one_and_three_parts() {
+        use std::net::Ipv4Addr;
+        // One number fills all 32 bits.
+        assert_eq!(parse_inet_aton("2130706433"), Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(parse_inet_aton("0x7f000001"), Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(parse_inet_aton("4294967295"), Some(Ipv4Addr::BROADCAST));
+        // Three numbers: the last one fills the low 16 bits.
+        assert_eq!(
+            parse_inet_aton("1.2.65535"),
+            Some(Ipv4Addr::new(1, 2, 255, 255))
+        );
+        assert_eq!(parse_inet_aton("1.2.65536"), None);
+        assert_eq!(parse_inet_aton("127.0.1"), Some(Ipv4Addr::LOCALHOST));
+    }
+
     /// Regression: the previous recursive matcher explored every way of
     /// splitting the target across the stars, so this pattern took
     /// exponential time and hung host-key verification. Found by the
