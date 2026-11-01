@@ -27,6 +27,21 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`recv_chunk` no longer retries a client-side timeout forever.**
+  `WinrmPsrpTransport::recv_chunk` read every `WinrmError::Timeout` as an
+  empty long poll and asked again, with no limit. `winrm-rs` raises it when
+  the request budget (`operation_timeout_secs` plus 10 s) runs out: from 2.0
+  also during an authentication handshake and while waiting for a Kerberos
+  KDC, so an unreachable KDC or a handshake that never completes made
+  `RunspacePool` calls and `blocking::run_script` hang. The third
+  `Timeout` in a row is now returned as `PsrpError::Winrm`, after at most
+  3 × (`operation_timeout_secs` + 10 s), 210 s with the defaults; the first
+  two are logged at WARN. Any answer from the server, an empty long poll
+  included, starts the count over, and the server's own long-poll timeout
+  (`w:TimedOut`) is still retried without limit. A client that runs more
+  long polls at once against one host than winrm-rs has connection slots
+  for (32 per host, 128 per client) can now see a slot wait fail after that
+  time, where it used to wait.
 - **Cancelling a pipeline over WinRM no longer loses the server's reply.** A
   WS-Man Receive is a long poll, and dropping it (which `run_with_cancel`
   does when the token fires) closes the connection and discards whatever

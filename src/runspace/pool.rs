@@ -355,7 +355,10 @@ impl<T: PsrpTransport> RunspacePool<T> {
     ///
     /// # No timeout
     ///
-    /// A server that never answers keeps the call waiting. The WinRM
+    /// A server that never answers keeps the call waiting (over WinRM, three
+    /// client-side timeouts in a row end it with
+    /// `PsrpError::Winrm(WinrmError::Timeout)`, but a server that keeps
+    /// answering with empty polls does not). The WinRM
     /// transport keeps a dropped Receive and resumes it, so a
     /// `tokio::time::timeout` around the call does not lose what the server
     /// sent; but the pool may be in the middle of answering a host call or

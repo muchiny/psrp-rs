@@ -23,10 +23,10 @@ use crate::error::{PsrpError, Result};
 /// [`WinrmPsrpTransport`] writes them in a single `send_input` call; the
 /// SSH transport (`ssh` feature) writes them in `<Data>` lines of at most
 /// 32 KiB, each acknowledged before the next. `recv_chunk` MUST
-/// transparently retry on `WinrmError::Timeout` (long-polling is expected)
-/// but propagate every other error — in particular SOAP faults, which
-/// usually mean the server-side shell has died and the pool must be
-/// recreated.
+/// transparently retry an empty long poll (long-polling is expected), MUST
+/// NOT wait without bound on client-side timeouts, and propagates every
+/// other error — in particular SOAP faults, which usually mean the
+/// server-side shell has died and the pool must be recreated.
 ///
 /// A transport that wraps or forwards to another one MUST forward
 /// `send_pipeline_fragment` too, not only `send_fragment`. Its default
@@ -133,6 +133,11 @@ impl<'c, T> Parked<'c, T> {
 }
 
 /// Transport backed by a live `winrm_rs::Shell`.
+///
+/// `recv_chunk` retries an empty long poll without limit, and a
+/// client-side `WinrmError::Timeout` at most twice in a row: the third is
+/// returned, after at most 3 × (`operation_timeout_secs` + 10 s), 210 s
+/// with the default settings.
 pub struct WinrmPsrpTransport<'c> {
     shell: Option<Arc<Shell<'c>>>,
     /// The Receive in flight for `command_id`, if a `recv_chunk` was dropped.
@@ -243,9 +248,103 @@ impl<'c> WinrmPsrpTransport<'c> {
 
 /// What one finished Receive means for `recv_chunk`.
 enum Poll {
-    /// Nothing to read yet (the long poll timed out): ask again.
+    /// The server's `w:TimedOut` fault: nothing to read yet, ask again.
+    /// winrm-rs (1.4 and 2.x) normally folds that fault into an empty
+    /// [`Poll::Chunk`] before psrp-rs sees it (`Shell::receive_next`); this
+    /// arm is kept for a fault that reaches us anyway.
     Retry,
+    /// The client gave up waiting for this Receive (`WinrmError::Timeout`):
+    /// ask again, at most [`MAX_CONSECUTIVE_TIMEOUTS`] times in a row.
+    TimedOut(WinrmError),
     Chunk(ReceiveOutput),
+}
+
+/// How many `WinrmError::Timeout` in a row `recv_chunk` absorbs before it
+/// returns the last one.
+///
+/// winrm-rs raises it when the request budget (`operation_timeout_secs`
+/// plus 10 s) runs out before an answer: while waiting for a connection
+/// slot, during an authentication handshake, or for a Kerberos KDC. A long
+/// poll that ends normally never raises it (the server answers `TimedOut`
+/// first, an empty poll), so one in a row is a slow server and three is a
+/// stuck one: an unreachable KDC, or a handshake that never completes,
+/// which `recv_chunk` used to retry forever. The wait before giving up is
+/// therefore at most 3 × (`operation_timeout_secs` + 10 s), 210 s with the
+/// defaults.
+///
+/// With winrm-rs's `credssp` feature, a CredSSP exchange that runs out of
+/// time is a `Timeout` too, and the last one of its handshake may have
+/// left the Receive running on the server: the retry then cannot get that
+/// answer back, and the pool fails on the next message instead.
+const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+
+/// The client-side timeouts `recv_chunk` met in a row.
+#[derive(Debug, Default)]
+struct TimeoutStreak(u32);
+
+impl TimeoutStreak {
+    /// Count one more timeout: the streak so far while it stays under
+    /// [`MAX_CONSECUTIVE_TIMEOUTS`], the error itself once it reaches it.
+    fn record(&mut self, err: WinrmError) -> Result<u32> {
+        self.0 = self.0.saturating_add(1);
+        if self.0 >= MAX_CONSECUTIVE_TIMEOUTS {
+            return Err(PsrpError::Winrm(err));
+        }
+        Ok(self.0)
+    }
+
+    /// An answer arrived: the server is alive, the streak starts over.
+    fn reset(&mut self) {
+        self.0 = 0;
+    }
+}
+
+/// What `recv_chunk` does after one Receive.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Nothing for the caller yet: send the next Receive.
+    Again,
+    /// Return these bytes (possibly empty, once the command is done).
+    Deliver(Vec<u8>),
+}
+
+/// One turn of the `recv_chunk` loop without the I/O: sort the outcome of a
+/// Receive, keep the timeout streak and the command's `done` flag, and say
+/// whether to ask again. Every server answer resets the streak, an empty
+/// long poll included (that is how winrm-rs delivers `w:TimedOut`).
+fn receive_step(
+    polled: std::result::Result<ReceiveOutput, WinrmError>,
+    stop_signalled: bool,
+    timeouts: &mut TimeoutStreak,
+    done: &mut bool,
+) -> Result<Step> {
+    match classify_receive(polled, stop_signalled)? {
+        Poll::Retry => {
+            timeouts.reset();
+            Ok(Step::Again)
+        }
+        Poll::TimedOut(e) => {
+            let reason = e.to_string();
+            let streak = timeouts.record(e)?;
+            warn!(
+                %reason,
+                streak,
+                limit = MAX_CONSECUTIVE_TIMEOUTS,
+                "PSRP recv_chunk: client-side timeout, sending the Receive again"
+            );
+            Ok(Step::Again)
+        }
+        Poll::Chunk(out) => {
+            timeouts.reset();
+            if out.done {
+                *done = true;
+            }
+            if out.stdout.is_empty() && !*done {
+                return Ok(Step::Again);
+            }
+            Ok(Step::Deliver(out.stdout))
+        }
+    }
 }
 
 /// Sort the outcome of one Receive.
@@ -263,14 +362,15 @@ fn classify_receive(
 ) -> Result<Poll> {
     match polled {
         Ok(out) => Ok(Poll::Chunk(out)),
-        Err(WinrmError::Timeout(_)) => Ok(Poll::Retry),
+        Err(e @ WinrmError::Timeout(_)) => Ok(Poll::TimedOut(e)),
         Err(WinrmError::Soap(SoapError::Fault {
             ref code,
             ref reason,
         })) if code.contains("TimedOut") => {
             // PSRP long-polling: the WinRM server returns a SOAP fault with
-            // code `w:TimedOut` when there's nothing to read yet. This is the
-            // normal long-poll cycle and MUST be retried (briefing §5 P7).
+            // code `w:TimedOut` when there's nothing to read yet, and it MUST
+            // be retried (briefing §5 P7). winrm-rs turns it into an empty
+            // poll first; this is the fallback for one that gets through.
             // Only fatal SOAP faults (e.g. shell died, access denied) should
             // propagate.
             debug!(%code, %reason, "PSRP recv_chunk: w:TimedOut — retrying");
@@ -303,6 +403,7 @@ impl PsrpTransport for WinrmPsrpTransport<'_> {
     }
 
     async fn recv_chunk(&mut self) -> Result<Vec<u8>> {
+        let mut timeouts = TimeoutStreak::default();
         loop {
             let polled = {
                 let shell = self
@@ -319,17 +420,10 @@ impl PsrpTransport for WinrmPsrpTransport<'_> {
             let stop_signalled = self
                 .stop_signalled
                 .load(std::sync::atomic::Ordering::SeqCst);
-            match classify_receive(polled, stop_signalled)? {
-                Poll::Retry => continue,
-                Poll::Chunk(out) => {
-                    if out.done {
-                        self.done = true;
-                    }
-                    if out.stdout.is_empty() && !self.done {
-                        continue;
-                    }
-                    return Ok(out.stdout);
-                }
+            if let Step::Deliver(bytes) =
+                receive_step(polled, stop_signalled, &mut timeouts, &mut self.done)?
+            {
+                return Ok(bytes);
             }
         }
     }
@@ -602,7 +696,9 @@ mod parked_tests {
 
 #[cfg(test)]
 mod classify_tests {
-    use super::{Poll, classify_receive};
+    use super::{
+        MAX_CONSECUTIVE_TIMEOUTS, Poll, Step, TimeoutStreak, classify_receive, receive_step,
+    };
     use crate::error::PsrpError;
     use winrm_rs::{ReceiveOutput, SoapError, WinrmError};
 
@@ -636,6 +732,139 @@ mod classify_tests {
             classify_receive(Err(fault("w:TimedOut")), true),
             Ok(Poll::Retry)
         ));
+    }
+
+    /// A client-side timeout is kept, so that `recv_chunk` can return it
+    /// once the streak is over.
+    #[test]
+    fn client_timeout_is_classified_apart_from_the_long_poll() {
+        for stop_signalled in [false, true] {
+            assert!(matches!(
+                classify_receive(Err(WinrmError::Timeout(70)), stop_signalled),
+                Ok(Poll::TimedOut(WinrmError::Timeout(70)))
+            ));
+        }
+    }
+
+    /// The third timeout in a row is returned, as itself; the first two
+    /// are absorbed.
+    #[test]
+    fn timeout_streak_gives_up_at_the_limit() {
+        assert_eq!(MAX_CONSECUTIVE_TIMEOUTS, 3);
+        let mut streak = TimeoutStreak::default();
+        assert!(streak.record(WinrmError::Timeout(1)).is_ok());
+        assert!(streak.record(WinrmError::Timeout(2)).is_ok());
+        assert!(matches!(
+            streak.record(WinrmError::Timeout(3)),
+            Err(PsrpError::Winrm(WinrmError::Timeout(3)))
+        ));
+    }
+
+    /// Any answer in between starts the count over: a slow server that
+    /// keeps answering is never given up on.
+    #[test]
+    fn timeout_streak_resets_on_an_answer() {
+        let mut streak = TimeoutStreak::default();
+        for _ in 0..10 {
+            assert!(matches!(streak.record(WinrmError::Timeout(1)), Ok(1)));
+            assert!(matches!(streak.record(WinrmError::Timeout(1)), Ok(2)));
+            streak.reset();
+        }
+        assert!(matches!(streak.record(WinrmError::Timeout(1)), Ok(1)));
+    }
+
+    fn empty(done: bool) -> ReceiveOutput {
+        ReceiveOutput {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: None,
+            done,
+        }
+    }
+
+    type Answer = std::result::Result<ReceiveOutput, WinrmError>;
+
+    /// Feed `answers` to `receive_step` one after the other, as
+    /// `recv_chunk` does with its Receives, until it delivers or fails.
+    /// Returns the outcome and how many answers it took.
+    fn drive(answers: Vec<Answer>) -> (crate::error::Result<Vec<u8>>, usize) {
+        let mut timeouts = TimeoutStreak::default();
+        let mut done = false;
+        for (taken, polled) in (1..).zip(answers) {
+            match receive_step(polled, false, &mut timeouts, &mut done) {
+                Ok(Step::Again) => {}
+                Ok(Step::Deliver(bytes)) => return (Ok(bytes), taken),
+                Err(e) => return (Err(e), taken),
+            }
+        }
+        panic!("receive_step asked for more Receives than the script holds");
+    }
+
+    /// The third client-side timeout in a row ends the call with that
+    /// error; nothing after it is read.
+    #[test]
+    fn third_timeout_in_a_row_ends_recv_chunk() {
+        let (got, taken) = drive(vec![
+            Err(WinrmError::Timeout(1)),
+            Err(WinrmError::Timeout(2)),
+            Err(WinrmError::Timeout(3)),
+            Ok(output()),
+        ]);
+        assert!(matches!(got, Err(PsrpError::Winrm(WinrmError::Timeout(3)))));
+        assert_eq!(taken, 3);
+    }
+
+    /// An empty long poll is how winrm-rs delivers the server's
+    /// `w:TimedOut`: it is an answer, so it starts the count over.
+    #[test]
+    fn empty_poll_between_timeouts_resets_the_streak() {
+        let (got, taken) = drive(vec![
+            Err(WinrmError::Timeout(1)),
+            Err(WinrmError::Timeout(1)),
+            Ok(empty(false)),
+            Err(WinrmError::Timeout(1)),
+            Err(WinrmError::Timeout(1)),
+            Ok(output()),
+        ]);
+        assert_eq!(got.unwrap(), b"x");
+        assert_eq!(taken, 6);
+    }
+
+    /// The same with a `w:TimedOut` fault that winrm-rs did not fold.
+    #[test]
+    fn long_poll_fault_between_timeouts_resets_the_streak() {
+        let (got, taken) = drive(vec![
+            Err(WinrmError::Timeout(1)),
+            Err(WinrmError::Timeout(1)),
+            Err(fault("w:TimedOut")),
+            Err(WinrmError::Timeout(1)),
+            Err(WinrmError::Timeout(1)),
+            Ok(output()),
+        ]);
+        assert_eq!(got.unwrap(), b"x");
+        assert_eq!(taken, 6);
+    }
+
+    /// Empty polls are retried while the command runs; once it is done, the
+    /// call returns, with no bytes if the last answer carried none.
+    #[test]
+    fn empty_polls_wait_until_data_or_done() {
+        let (got, taken) = drive(vec![Ok(empty(false)), Ok(empty(false)), Ok(output())]);
+        assert_eq!(got.unwrap(), b"x");
+        assert_eq!(taken, 3);
+
+        let mut timeouts = TimeoutStreak::default();
+        let mut done = false;
+        assert_eq!(
+            receive_step(Ok(empty(true)), false, &mut timeouts, &mut done).unwrap(),
+            Step::Deliver(Vec::new())
+        );
+        assert!(done);
+        // Done stays done: a later empty answer is delivered too.
+        assert_eq!(
+            receive_step(Ok(empty(false)), false, &mut timeouts, &mut done).unwrap(),
+            Step::Deliver(Vec::new())
+        );
     }
 
     /// The fault that follows an accepted stop signal is the stop (#27); the
