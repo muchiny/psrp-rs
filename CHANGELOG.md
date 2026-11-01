@@ -96,6 +96,12 @@ changelog](https://github.com/muchiny/winrm-rs/blob/main/CHANGELOG.md).
 
 ### Fixed
 
+- **The crate's `repository` and `homepage` name the right GitHub
+  account.** They pointed at `github.com/muchini/psrp-rs`, an account that
+  has nothing to do with this project, so the links on crates.io and docs.rs
+  led to someone else's namespace; they now point at
+  `github.com/muchiny/psrp-rs`. The pages of the versions already published
+  keep the old link.
 - **`recv_chunk` no longer retries a client-side timeout forever.**
   `WinrmPsrpTransport::recv_chunk` read every `WinrmError::Timeout` as an
   empty long poll and asked again, with no limit. `winrm-rs` raises it when
