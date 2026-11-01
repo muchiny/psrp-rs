@@ -123,8 +123,9 @@ impl ClientSessionKey {
         blob.extend_from_slice(&2048u32.to_le_bytes());
         let e_bytes = public.e().to_bytes_le();
         let mut exp = [0u8; 4];
-        for (i, b) in e_bytes.iter().take(4).enumerate() {
-            exp[i] = *b;
+        // Little-endian, truncated to 4 bytes (the zip stops at the shorter).
+        for (dst, src) in exp.iter_mut().zip(&e_bytes) {
+            *dst = *src;
         }
         blob.extend_from_slice(&exp);
         // Force modulus to exactly 256 bytes (little-endian).
@@ -158,7 +159,8 @@ impl ClientSessionKey {
     pub fn public_blob_hex(&self) -> String {
         use std::fmt::Write as _;
         let blob = self.public_blob();
-        let mut hex = String::with_capacity(blob.len() * 2);
+        // Capacity hint only: saturating is harmless (a 276-byte blob never gets near it).
+        let mut hex = String::with_capacity(blob.len().saturating_mul(2));
         for b in &blob {
             let _ = write!(hex, "{b:02X}");
         }
@@ -257,8 +259,10 @@ impl SessionKey {
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect();
-        let pad = 16 - (padded.len() % 16);
-        padded.extend(std::iter::repeat_n(pad as u8, pad));
+        // `len % 16` is below 16, so it fits a `u8` and `pad` is 1..=16.
+        let rem = u8::try_from(padded.len() % 16).unwrap_or_default();
+        let pad = 16u8.saturating_sub(rem);
+        padded.extend(std::iter::repeat_n(pad, usize::from(pad)));
 
         let cipher = Aes256::new(&Array::from(self.key));
 
@@ -267,9 +271,9 @@ impl SessionKey {
         let mut out = Vec::with_capacity(padded.len());
         let mut prev: [u8; 16] = SECURE_STRING_IV;
         for chunk in padded.as_chunks::<16>().0 {
-            let mut block = [0u8; 16];
-            for i in 0..16 {
-                block[i] = chunk[i] ^ prev[i];
+            let mut block = *chunk;
+            for (b, p) in block.iter_mut().zip(&prev) {
+                *b ^= *p;
             }
             let mut ga = Array::from(block);
             cipher.encrypt_block(&mut ga);
@@ -303,27 +307,29 @@ impl SessionKey {
         for chunk in payload.as_chunks::<16>().0 {
             let mut ga = Array::from(*chunk);
             cipher.decrypt_block(&mut ga);
-            let mut block = [0u8; 16];
-            for i in 0..16 {
-                block[i] = ga[i] ^ prev[i];
+            let mut block: [u8; 16] = ga.into();
+            for (b, p) in block.iter_mut().zip(&prev) {
+                *b ^= *p;
             }
             pt.extend_from_slice(&block);
             prev.copy_from_slice(chunk);
         }
 
         // Strip PKCS#7 padding.
-        let pad = *pt
+        let bad_padding = || PsrpError::protocol("invalid PKCS#7 padding");
+        let pad_byte = *pt
             .last()
-            .ok_or_else(|| PsrpError::protocol("empty plaintext"))? as usize;
-        if pad == 0 || pad > 16 || pad > pt.len() {
-            return Err(PsrpError::protocol("invalid PKCS#7 padding"));
+            .ok_or_else(|| PsrpError::protocol("empty plaintext"))?;
+        let pad = usize::from(pad_byte);
+        if pad_byte == 0 || pad > 16 {
+            return Err(bad_padding());
         }
-        for &b in &pt[pt.len() - pad..] {
-            if b as usize != pad {
-                return Err(PsrpError::protocol("invalid PKCS#7 padding"));
-            }
+        let body_len = pt.len().checked_sub(pad).ok_or_else(bad_padding)?;
+        let (_, padding) = pt.split_at_checked(body_len).ok_or_else(bad_padding)?;
+        if padding.iter().any(|&b| b != pad_byte) {
+            return Err(bad_padding());
         }
-        pt.truncate(pt.len() - pad);
+        pt.truncate(body_len);
 
         if pt.len() % 2 != 0 {
             return Err(PsrpError::protocol(
@@ -594,6 +600,16 @@ mod tests {
         assert_eq!(b64, crate::clixml::encode::base64_encode(&k.public_blob()));
         let blob = crate::clixml::encode::base64_decode(&b64).expect("valid base64");
         assert_eq!(blob.len(), 8 + 12 + 256);
+        // The deprecated hex form: the same bytes, two upper-case digits each.
+        #[expect(deprecated, reason = "the hex form stays for 3.x callers")]
+        let hex = k.public_blob_hex();
+        assert!(!hex.bytes().any(|c| c.is_ascii_lowercase()));
+        let decoded: Vec<u8> = hex
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(decoded, blob);
         // BLOBHEADER, "RSA1", bitlen 2048 -- the bytes of the spec example
         // (`BgIAAACkAABSU0ExAAgAAAEAAQ...`).
         assert_eq!(
