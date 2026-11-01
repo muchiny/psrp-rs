@@ -803,8 +803,14 @@ fn parse_inet_aton(s: &str) -> Option<std::net::Ipv4Addr> {
         return None;
     }
     // Bits left for the last number: 32, 24, 16 or 8.
-    let free_bits = 32 - 8 * u32::try_from(leading.len()).ok()?;
-    if free_bits < 32 && *last >> free_bits != 0 {
+    let free_bits: u32 = match leading.len() {
+        0 => 32,
+        1 => 24,
+        2 => 16,
+        3 => 8,
+        _ => return None,
+    };
+    if free_bits < 32 && last.checked_shr(free_bits)? != 0 {
         return None;
     }
     let high = leading
@@ -880,34 +886,32 @@ pub(crate) fn glob_match(pattern: &str, target: &str) -> bool {
 /// pattern language with only `*` and `?`. Worst case is `O(n * m)`
 /// with no recursion at all.
 fn glob_match_bytes(pattern: &[u8], target: &[u8]) -> bool {
-    let mut p = 0usize;
-    let mut t = 0usize;
-    // Position just past the last `*` seen, and how far the target had
-    // advanced when we saw it.
-    let mut star: Option<usize> = None;
-    let mut star_target = 0usize;
+    let mut pat = pattern;
+    let mut tgt = target;
+    // The pattern just past the last `*` seen, and the target from where
+    // that star started consuming.
+    let mut star: Option<(&[u8], &[u8])> = None;
 
-    while t < target.len() {
-        match pattern.get(p) {
-            Some(b'*') => {
-                p += 1;
-                star = Some(p);
-                star_target = t;
+    while let Some((&byte, tgt_rest)) = tgt.split_first() {
+        match pat.split_first() {
+            Some((b'*', rest)) => {
+                pat = rest;
+                star = Some((rest, tgt));
             }
-            Some(b'?') => {
-                p += 1;
-                t += 1;
+            Some((b'?', rest)) => {
+                pat = rest;
+                tgt = tgt_rest;
             }
-            Some(c) if c.eq_ignore_ascii_case(&target[t]) => {
-                p += 1;
-                t += 1;
+            Some((c, rest)) if c.eq_ignore_ascii_case(&byte) => {
+                pat = rest;
+                tgt = tgt_rest;
             }
             // Mismatch: let the last `*` swallow one more target byte.
-            _ => match star {
-                Some(resume) => {
-                    p = resume;
-                    star_target += 1;
-                    t = star_target;
+            _ => match star.and_then(|(resume, from)| Some((resume, from.get(1..)?))) {
+                Some((resume, after)) => {
+                    pat = resume;
+                    tgt = after;
+                    star = Some((resume, after));
                 }
                 None => return false,
             },
@@ -915,10 +919,7 @@ fn glob_match_bytes(pattern: &[u8], target: &[u8]) -> bool {
     }
 
     // The target is exhausted; only trailing `*`s may remain.
-    while pattern.get(p) == Some(&b'*') {
-        p += 1;
-    }
-    p == pattern.len()
+    pat.iter().all(|&c| c == b'*')
 }
 
 pub(crate) fn host_matches_hashed(salt: &[u8], expected: &[u8; 20], host: &str) -> bool {
@@ -1053,6 +1054,26 @@ mod tests {
         assert!(!glob_match("", "x"));
         // A `*` must still be able to consume nothing at the very end.
         assert!(glob_match("host*", "host"));
+    }
+
+    #[test]
+    fn glob_backtracks_to_the_last_star() {
+        assert!(glob_match("*ab*c", "aabxabc"));
+        assert!(!glob_match("*ab*c", "aabxab"));
+        assert!(glob_match("a*?b", "axxyb"));
+        assert!(!glob_match("a*?b", "ab"));
+    }
+
+    #[test]
+    fn inet_aton_rejects_overflowing_last_part() {
+        assert_eq!(parse_inet_aton("1.2.3.256"), None);
+        assert_eq!(parse_inet_aton("1.16777216"), None);
+        assert_eq!(parse_inet_aton("4294967296"), None);
+        assert_eq!(parse_inet_aton("1.2.3.4.5"), None);
+        assert_eq!(
+            parse_inet_aton("1.65535"),
+            Some(std::net::Ipv4Addr::new(1, 0, 255, 255))
+        );
     }
 
     /// Regression: the previous recursive matcher explored every way of
